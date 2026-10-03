@@ -32639,6 +32639,10 @@ static int verify_continue_survives_submenus(void)
     }
 
 finish:
+    /*
+     * This guard repoints XDG_DATA_HOME at its own roots several times, so it restores
+     * the caller's on the way out exactly as the rest of the file's I/O guards do.
+     */
     if (saved_ok)
         (void)setenv("XDG_DATA_HOME", saved, 1);
     else
@@ -32697,6 +32701,8 @@ finish:
  *   pointer would make the guard compare the private root against itself, always pass.
  */
 static char *bounce_check_original_xdg = NULL;
+/* The private root the self-test runs against; see main(). */
+static char bounce_check_private_root[64] = { 0 };
 
 static int verify_persistence_flow(void);
 static int verify_persistence_flow_body(void);
@@ -32894,7 +32900,7 @@ static int verify_check_never_touches_the_real_store(void)
          */
         if (current == NULL) {
             fprintf(stderr,
-                    "store guard: --check runs with XDG_DATA_HOME unset, so a"
+                    "store guard: the self-test runs with XDG_DATA_HOME unset, so a"
                     " verifier with no private root of its own would write to the"
                     " default location\n");
             bad++;
@@ -33568,22 +33574,45 @@ int main(int argc, char **argv)
      * with those exact values and had no root of its own; it has one now as well, so the
      * two layers do not depend on each other.
      *
-     * NOT RESTORED ON THE FAILURE PATHS, deliberately. Every store access resolves the
-     * path from the environment, so restoring it part-way through the run would leave
-     * whichever verifier ran next writing to the player's save -- which is the bug. The
-     * environment is restored once, at cleanup, on every exit including the failing ones.
+     * NOT RESTORED PART-WAY THROUGH THE SUITE, deliberately. Every store access resolves
+     * the path from the environment, so restoring it between verifiers would leave
+     * whichever one ran next writing to the player's save -- which is the bug. It is
+     * restored once, at the boundary between the suite and the game, and once more at
+     * cleanup on every exit including the failing ones.
+     *
+     * The suite runs in EVERY mode, not only under --check, so this was not gated on
+     * check_only. That was wrong twice over: `make run` executed the self-test against
+     * the real store, and the isolation guard below reported the missing override as a
+     * failure and refused to start the game.
      */
-    if (check_only) {
+    {
         static const char template[] = "/tmp/bounce-checkrun-XXXXXX";
         char root[sizeof template];
 
+        /*
+         * PUBLISHED FOR EVERY MODE, NOT JUST --check.
+         *
+         * The suite is not gated on check_only: main() runs it, and only afterwards
+         * decides whether to return or carry on into the game. So gating the isolation on
+         * check_only left `make run` -- which is how the game is actually launched --
+         * executing the whole self-test against the player's real store, which is the
+         * defect this was all for. It also broke the launch outright: the isolation guard
+         * read the missing override and failed the run.
+         *
+         * WHICH IS WHY IT IS RESTORED AGAIN BELOW, before the game starts. The override
+         * has to cover the suite and NOT the game: leaving it in place would point the
+         * player's session at a temporary directory and throw away their progress on
+         * exit. Scoped like this, the suite can never reach the store and the game can.
+         */
         memcpy(root, template, sizeof template);
         if (mkdtemp(root) == NULL) {
-            fprintf(stderr, "could not create a private store root for --check\n");
+            fprintf(stderr, "could not create a private store root for the self-test\n");
             goto cleanup;
         }
+        (void)snprintf(bounce_check_private_root,
+                      sizeof bounce_check_private_root, "%s", root);
         if (setenv("XDG_DATA_HOME", root, 1) != 0) {
-            fprintf(stderr, "could not publish the private store root for --check\n");
+            fprintf(stderr, "could not publish the private store root\n");
             goto cleanup;
         }
     }
@@ -34030,6 +34059,64 @@ int main(int argc, char **argv)
     if (verify_level_progression_boundary() != 0) {
         fprintf(stderr, "level progression boundary verification failed\n");
         goto cleanup;
+    }
+
+    /*
+     * STEP PERSIST-ISOLATE -- THE SUITE IS DONE, SO THE PLAYER'S STORE IS BACK.
+     *
+     * This is the other half of the override published before the suite, and it is the
+     * half that makes the first half safe. The self-test must not reach the player's
+     * save; the GAME must, because a session that ran against a temporary directory
+     * would leave the real one untouched and quietly discard everything the player did
+     * in it.
+     *
+     * `--check` never reaches here -- it returns above -- so this only runs when the
+     * game is about to start. cleanup restores it again for the paths that do not get
+     * this far.
+     */
+    {
+        const char *restored;
+
+        if (bounce_check_private_root[0] != '\0') {
+            if (bounce_check_original_xdg != NULL)
+                (void)setenv("XDG_DATA_HOME", bounce_check_original_xdg, 1);
+            else
+                (void)unsetenv("XDG_DATA_HOME");
+        }
+        /*
+         * AND THE RESTORE IS CHECKED FROM OUTSIDE THE BLOCK THAT PERFORMS IT, because
+         * silence here is the worst outcome available.
+         *
+         * If the restore is missing, nothing fails. The game starts against the temporary
+         * root, plays a whole session and exits having saved it -- so the player's real
+         * store is never written and their progress is silently discarded, with no error
+         * anywhere and every check still green. A negative control that deletes the
+         * restore was caught by nothing when the assertion lived inside the same block,
+         * because disabling the block disabled the assertion too. That is the whole
+         * reason this is a sibling and not a child: a check inside the code it checks is
+         * only as removable as the code.
+         *
+         * The value read back must be the caller's when the caller had one and absent when
+         * they did not. Anything else means the game is about to run somewhere the player
+         * cannot find, or that a session is about to be thrown away.
+         */
+        restored = getenv("XDG_DATA_HOME");
+        if (bounce_check_original_xdg != NULL) {
+            if (restored == NULL || strcmp(restored, bounce_check_original_xdg) != 0) {
+                fprintf(stderr,
+                        "the player's store was not restored after the self-test:"
+                        " expected %s, found %s\n",
+                        bounce_check_original_xdg,
+                        restored ? restored : "(unset)");
+                goto cleanup;
+            }
+        } else if (restored != NULL) {
+            fprintf(stderr,
+                    "the player's store was not restored after the self-test:"
+                    " expected unset, found %s\n",
+                    restored);
+            goto cleanup;
+        }
     }
 
     if (check_only
