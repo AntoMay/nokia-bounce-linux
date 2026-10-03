@@ -1,3 +1,31 @@
+⚠️ **Work in Progress**
+
+> This project is an ongoing native Linux reconstruction of Nokia Bounce.
+> It is **not yet complete** and still requires further implementation,
+> verification, bug fixing, and refinement. The current build represents
+> the present state of the reconstruction and should not be considered a
+> final or complete release.
+
+## Screenshots
+
+![Title Screen](screenshots/title-screen.png)
+
+![Main Menu](screenshots/main-menu.png)
+
+![Level Select](screenshots/level-select.png)
+
+![Gameplay on Level 1](screenshots/gameplay-level-1.png)
+
+![Instructions](screenshots/instructions.png)
+
+![High Score](screenshots/high-score.png)
+
+![Settings Menu](screenshots/settings-menu.png)
+
+![Language Selection](screenshots/language-selection.png)
+
+![About](screenshots/about.png)
+
 # Nokia Bounce Decomp
 
 ## Provenance
