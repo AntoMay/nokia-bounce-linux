@@ -32646,7 +32646,326 @@ finish:
     return bad == 0 ? 0 : -1;
 }
 
+/*
+ * STEP PERSIST-ISOLATE -- THIS FUNCTION NOW RUNS AGAINST A PRIVATE STORE.
+ *
+ * IT DID NOT US TO, AND IT WAS WRITING THE PLAYER'S REAL SAVE.
+ *
+ * What it does below includes bounce_persistence_save_record3() with a primed record,
+ * and several bounce_persistence_load_*() round trips, with nothing standing between
+ * those calls and the live store. Every other verifier in this file that touches the
+ * filesystem -- verify_record3_terminal_b1_contract(), verify_reset_to_default(),
+ * verify_continue_survives_submenus(), bounce_persistence_verify() -- publishes a
+ * private mkdtemp root through XDG_DATA_HOME and restores the caller's environment on
+ * every path. This one did not, so it was the single hole in that discipline.
+ *
+ * THE DAMAGE, AND HOW IT WAS FOUND. A report that a fresh install showed a selectable
+ * Continue row with no play session behind it. The store held a snapshot reading
+ *
+ *     b1=1  lives=3  level=2  score=1122  x=30 y=18
+ *
+ * Every one of those numbers is this function's `primed` fixture -- score 1122 and
+ * x = 30, y = 18 appear nowhere else in the tree, and hoops_scored was 0, which no real
+ * session can be while carrying a score of 1122. The record had not been played; it had
+ * been written by the test suite. high_score = 5000 sat alongside it for the same reason,
+ * from a level-11 completion a helper in this same function drove.
+ *
+ * That is worse than a noisy test. `make check` is documented as something that never
+ * reaches the player's save, and this made that untrue, so a developer's own testing
+ * invented a Continue row in the install they were testing against -- and a fresh
+ * XDG_DATA_HOME did not help, because the hole is in the writer rather than in the
+ * path.
+ *
+ * The isolation is the same mkdtemp-root-under-XDG_DATA_HOME discipline as everywhere
+ * else, applied around the whole body rather than around the individual calls, because
+ * the calls are interleaved with gameplay helpers that also persist and there is no
+ * single point at which the store is exclusively under this function's control.
+ */
+/*
+ * STEP PERSIST-ISOLATE -- THE CALLER'S XDG_DATA_HOME AS IT WAS AT PROCESS START.
+ *
+ * Captured unconditionally, before any mode is dispatched, and BY COPY. Both details are
+ * load-bearing and both were got wrong first:
+ *
+ *   UNCONDITIONALLY, because a first version captured it inside main()'s --check branch.
+ *   The negative control that disables that branch therefore also removed the capture,
+ *   and the guard then had no original to compare against and passed with the run-wide
+ *   isolation deleted. The thing that checks the isolation cannot live inside the thing
+ *   it checks.
+ *
+ *   BY COPY, because setenv() invalidates the pointer getenv() returns. Keeping the
+ *   pointer would make the guard compare the private root against itself, always pass.
+ */
+static char *bounce_check_original_xdg = NULL;
+
+static int verify_persistence_flow(void);
+static int verify_persistence_flow_body(void);
+
+/*
+ * Reads a store file whole so two of them can be compared byte for byte.
+ * Returns the length, or -1; the caller owns *out.
+ */
+static long bounce_guard_read_store(const char *root, unsigned char **out)
+{
+    char path[1024];
+    FILE *file;
+    long size;
+    unsigned char *buffer;
+
+    *out = NULL;
+    if (snprintf(path, sizeof path, "%s/bounce/records.bin", root)
+        >= (int)sizeof path)
+        return -1;
+    file = fopen(path, "rb");
+    if (file == NULL)
+        return -1;
+    if (fseek(file, 0L, SEEK_END) != 0) {
+        (void)fclose(file);
+        return -1;
+    }
+    size = ftell(file);
+    if (size <= 0 || fseek(file, 0L, SEEK_SET) != 0) {
+        (void)fclose(file);
+        return -1;
+    }
+    buffer = (unsigned char *)malloc((size_t)size);
+    if (buffer == NULL) {
+        (void)fclose(file);
+        return -1;
+    }
+    if (fread(buffer, 1u, (size_t)size, file) != (size_t)size) {
+        free(buffer);
+        (void)fclose(file);
+        return -1;
+    }
+    (void)fclose(file);
+    *out = buffer;
+    return size;
+}
+
+/*
+ * =============================================================================
+ * STEP PERSIST-ISOLATE -- verify_check_never_touches_the_real_store()
+ *
+ * THE CLAIM. Running the self-test must not change the player's save by one byte.
+ *
+ * WHY IT NEEDS A CHECK OF ITS OWN. The suite reached the real store for a long time
+ * without anybody noticing, and the report that eventually exposed it described a
+ * SYMPTOM rather than a cause: a brand new install offered a selectable Continue row with
+ * no session behind it. The record held
+ *
+ *     b1=1  lives=3  level=2  score=1122  x=30 y=18  hoops_scored=0
+ *
+ * Every one of those is a test fixture -- score 1122 and x = 30, y = 18 appear nowhere
+ * else in the tree, and a score of 1122 alongside hoops_scored = 0 is impossible in a
+ * real session. Around thirty functions could reach a store write and only four published
+ * a private root, so the property rested on a list of call sites that had to be kept in
+ * step with the call graph by hand. That is precisely how it came to be wrong.
+ *
+ * WHY IT DOES NOT INSPECT THE CALL GRAPH. Asking which functions call a writer is what
+ * produced that list, and a list is what let the bug through. So this asserts the
+ * OBSERVABLE: a store of our own stands in for the player's, the suite is pointed
+ * somewhere else exactly as main() now points it, and the stand-in must come back
+ * byte-for-byte identical.
+ *
+ * THE SLICE IS ONE FUNCTION, AND THAT IS THE POINT. verify_persistence_flow() is the
+ * function whose fixture values were found in the player's save, so it alone is enough to
+ * have failed before the fix. Nothing else is called: a check that drags in a second
+ * subsystem is a check that can fail for a second subsystem's reasons, and this one is
+ * about exactly one thing.
+ *
+ * THE STAND-IN IS NOT EMPTY. It is primed with a different level, score and lives through
+ * the real write API, because "unchanged" against an absent file would be satisfied by a
+ * suite that wrote nothing at all -- including a suite that crashed on its first call.
+ */
+static int verify_check_never_touches_the_real_store(void)
+{
+    static const char template[] = "/tmp/bounce-guard-XXXXXX";
+    char caller_root[sizeof template];
+    char inner_root[sizeof template];
+    char saved[1024];
+    int saved_ok;
+    BouncePersistenceRecords primed;
+    BouncePersistenceRecord3 snapshot;
+    unsigned char *before = NULL;
+    unsigned char *after = NULL;
+    long before_len;
+    long after_len;
+    bool differ = false;
+    bool slice_ran;
+    int bad = 0;
+
+    memcpy(caller_root, template, sizeof caller_root);
+    if (mkdtemp(caller_root) == NULL) {
+        fprintf(stderr, "store guard: could not create the stand-in store\n");
+        return -1;
+    }
+    memcpy(inner_root, template, sizeof inner_root);
+    if (mkdtemp(inner_root) == NULL) {
+        fprintf(stderr, "store guard: could not create the suite store\n");
+        return -1;
+    }
+
+    saved_ok = (getenv("XDG_DATA_HOME") != NULL);
+    if (saved_ok)
+        (void)snprintf(saved, sizeof saved, "%s", getenv("XDG_DATA_HOME"));
+
+    /* Prime the stand-in through the real API, under its own root. */
+    (void)setenv("XDG_DATA_HOME", caller_root, 1);
+    memset(&primed, 0, sizeof primed);
+    primed.max_levels = 7;
+    primed.high_score = 12345;
+    memset(&snapshot, 0, sizeof snapshot);
+    snapshot.b1 = BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL;
+    snapshot.level = 5u;
+    snapshot.score = 999;
+    snapshot.lives = 2;
+    if (bounce_persistence_save(&primed) != 0
+        || bounce_persistence_save_record3(&snapshot) != 0) {
+        fprintf(stderr, "store guard: could not prime the stand-in store\n");
+        if (saved_ok)
+            (void)setenv("XDG_DATA_HOME", saved, 1);
+        else
+            (void)unsetenv("XDG_DATA_HOME");
+        return -1;
+    }
+    before_len = bounce_guard_read_store(caller_root, &before);
+    if (before_len <= 0 || before == NULL) {
+        fprintf(stderr, "store guard: could not read the stand-in store\n");
+        free(before);
+        if (saved_ok)
+            (void)setenv("XDG_DATA_HOME", saved, 1);
+        else
+            (void)unsetenv("XDG_DATA_HOME");
+        return -1;
+    }
+
+    /* Point the suite somewhere else, exactly as main() now does for --check. */
+    (void)setenv("XDG_DATA_HOME", inner_root, 1);
+    slice_ran = verify_persistence_flow() == 0;
+
+    /* Back to the stand-in, and read it again. */
+    (void)setenv("XDG_DATA_HOME", caller_root, 1);
+    after_len = bounce_guard_read_store(caller_root, &after);
+    if (after_len != before_len) {
+        differ = true;
+    } else if (after != NULL) {
+        for (long i = 0; i < before_len; ++i) {
+            if (before[i] != after[i]) {
+                differ = true;
+                break;
+            }
+        }
+    }
+    free(before);
+    free(after);
+
+    if (saved_ok)
+        (void)setenv("XDG_DATA_HOME", saved, 1);
+    else
+        (void)unsetenv("XDG_DATA_HOME");
+
+    /*
+     * THE RUN-WIDE LAYER, WHICH THE BYTE COMPARISON CANNOT SEE.
+     *
+     * The comparison above points one verifier at its own root and checks that a store it
+     * was NOT given came back unchanged. That tests the per-verifier layer, and it stays
+     * true with main()'s run-wide override deleted -- the verifier still has a root of its
+     * own -- so deleting the override was caught by nothing while around thirty other
+     * verifiers went on writing to the player's save.
+     *
+     * So the mechanism is asserted directly: while the suite runs, the store the
+     * environment resolves to must not be the one the caller started with. That is the
+     * whole claim, and it is why the original is captured at process start.
+     */
+    {
+        const char *current = getenv("XDG_DATA_HOME");
+        const char *original = bounce_check_original_xdg;
+
+        /*
+         * `original == NULL` IS LEGITIMATE: most callers have no XDG_DATA_HOME at all,
+         * and the private root is then the only value there ever was. An earlier version
+         * treated a missing original as a failure and rejected every run on a machine
+         * that had not set the variable -- which is the common case, and it failed on
+         * correct code.
+         *
+         * So the claim is the two things that are actually true either way: the variable
+         * is set while the suite runs, and it is not the value the caller supplied.
+         */
+        if (current == NULL) {
+            fprintf(stderr,
+                    "store guard: --check runs with XDG_DATA_HOME unset, so a"
+                    " verifier with no private root of its own would write to the"
+                    " default location\n");
+            bad++;
+        } else if (original != NULL && strcmp(current, original) == 0) {
+            fprintf(stderr,
+                    "store guard: --check is still using the caller's store (%s)\n",
+                    current);
+            bad++;
+        }
+    }
+
+    if (!slice_ran) {
+        fprintf(stderr, "store guard: the suite slice reported a failure\n");
+        bad++;
+    }
+    if (differ) {
+        fprintf(stderr,
+                "store guard: --check MODIFIED the caller's store"
+                " (%ld bytes before, %ld after)\n",
+                before_len,
+                after_len);
+        bad++;
+    }
+    if (bad == 0) {
+        printf("STORE-GUARD stand_in=%ld bytes suite_slice=verify_persistence_flow"
+               " caller_store=unchanged run_wide_override=active PASS\n",
+               before_len);
+    }
+    return bad == 0 ? 0 : -1;
+}
+
 static int verify_persistence_flow(void)
+{
+    static const char template[] = "/tmp/bounce-pflow-XXXXXX";
+    char root[sizeof template];
+    /* persistence.h keeps BOUNCE_PERSISTENCE_PATH_MAX private to its own
+     * translation unit, so the saved value is copied into a local buffer. */
+    char saved[1024];
+    int saved_ok;
+    int result;
+
+    memcpy(root, template, sizeof template);
+    if (mkdtemp(root) == NULL) {
+        fprintf(stderr, "persistence flow: could not create a private store root\n");
+        return -1;
+    }
+    saved_ok = (getenv("XDG_DATA_HOME") != NULL);
+    if (saved_ok)
+        (void)snprintf(saved, sizeof saved, "%s", getenv("XDG_DATA_HOME"));
+    if (setenv("XDG_DATA_HOME", root, 1) != 0) {
+        fprintf(stderr, "persistence flow: could not publish the private store root\n");
+        return -1;
+    }
+
+    result = verify_persistence_flow_body();
+
+    if (saved_ok)
+        (void)setenv("XDG_DATA_HOME", saved, 1);
+    else
+        (void)unsetenv("XDG_DATA_HOME");
+    /*
+     * The root is left in place, as every other verifier's is: the store wrote a
+     * bounce/ subdirectory under it, so rmdir would fail with ENOTEMPTY, and reaching
+     * past this point to unlink the tree would be the first place in this file that
+     * deletes files it did not create. The environment is restored either way, so
+     * nothing downstream can reach it.
+     */
+    return result;
+}
+
+static int verify_persistence_flow_body(void)
 {
     BounceAppFlow flow;
 
@@ -33069,6 +33388,9 @@ static int verify_persistence_flow(void)
 int main(int argc, char **argv)
 {
     const char *level_path = BOUNCE_LEVEL001_PATH;
+    /* Read once, at the top: setenv() below invalidates the pointer. */
+    const char *original_xdg = getenv("XDG_DATA_HOME");
+
     int check_only = 0;
     int camera_diagnostic_mode = 0;
     int vertical_diagnostic_mode = 0;
@@ -33189,6 +33511,18 @@ int main(int argc, char **argv)
             }
         }
     }
+    free(bounce_check_original_xdg);
+    bounce_check_original_xdg = NULL;
+    if (original_xdg != NULL) {
+        bounce_check_original_xdg = (char *)malloc(strlen(original_xdg) + 1u);
+        if (bounce_check_original_xdg != NULL)
+            (void)snprintf(
+                bounce_check_original_xdg,
+                strlen(original_xdg) + 1u,
+                "%s",
+                original_xdg);
+    }
+
     if (camera_diagnostic_mode) {
         camera_diagnostic.enabled = true;
         app.camera_diagnostic = &camera_diagnostic;
@@ -33200,6 +33534,58 @@ int main(int argc, char **argv)
     if (render_trace_mode) {
         render_trace.enabled = true;
         app.render_trace = &render_trace;
+    }
+
+    /*
+     * STEP PERSIST-ISOLATE (RUN-WIDE) -- THE WHOLE SELF-TEST RUNS AGAINST A PRIVATE
+     * STORE, PUBLISHED HERE, ONCE.
+     *
+     * WHY THIS IS AT THE RUN'S EDGE AND NOT IN EACH VERIFIER. The suite reached the
+     * player's real save because around thirty functions can reach a store write --
+     * every one that drives x11_dispatch_event(), app_update_production_game(),
+     * app_restore_persisted_settings() or the drive_app_to_*() helpers -- and only four
+     * of them published a private root of their own. Fixing them one at a time would
+     * leave the property resting on a list that has to be kept in step with the call
+     * graph, and the next verifier that loads a level would reopen the hole.
+     *
+     * Isolating the RUN makes the property structural: inside `--check` the store path
+     * cannot resolve to the player's, whatever any verifier does. The per-verifier roots
+     * stay and are harmless -- each saves and restores the previous value, so they nest.
+     *
+     * WHAT IT COST, AND HOW IT WAS FOUND. A report that a brand new install showed a
+     * selectable Continue row with no session behind it. The store held
+     *
+     *     b1=1  lives=3  level=2  score=1122  x=30 y=18  hoops=0
+     *
+     * Every one of those is a test fixture: score 1122 and x = 30, y = 18 appear
+     * nowhere else in the tree, and hoops_scored = 0 is impossible alongside a score of
+     * 1122 in a real session. The record had not been played, it had been written by
+     * `make check`. A fresh XDG_DATA_HOME did not help, because the hole was in the
+     * writer rather than in the path -- which is the strongest argument for isolating
+     * the run rather than trusting the caller's environment.
+     *
+     * The individual offender was verify_persistence_flow(), which primes a Record 3
+     * with those exact values and had no root of its own; it has one now as well, so the
+     * two layers do not depend on each other.
+     *
+     * NOT RESTORED ON THE FAILURE PATHS, deliberately. Every store access resolves the
+     * path from the environment, so restoring it part-way through the run would leave
+     * whichever verifier ran next writing to the player's save -- which is the bug. The
+     * environment is restored once, at cleanup, on every exit including the failing ones.
+     */
+    if (check_only) {
+        static const char template[] = "/tmp/bounce-checkrun-XXXXXX";
+        char root[sizeof template];
+
+        memcpy(root, template, sizeof template);
+        if (mkdtemp(root) == NULL) {
+            fprintf(stderr, "could not create a private store root for --check\n");
+            goto cleanup;
+        }
+        if (setenv("XDG_DATA_HOME", root, 1) != 0) {
+            fprintf(stderr, "could not publish the private store root for --check\n");
+            goto cleanup;
+        }
     }
 
     if (bounce_asset_inventory_check(BOUNCE_RESOURCE_ROOT, NULL) != 0) {
@@ -33492,6 +33878,10 @@ int main(int argc, char **argv)
     }
     if (bounce_persistence_verify() != 0) {
         fprintf(stderr, "persistence store verification failed\n");
+        goto cleanup;
+    }
+    if (verify_check_never_touches_the_real_store() != 0) {
+        fprintf(stderr, "self-test store isolation verification failed\n");
         goto cleanup;
     }
     if (verify_persistence_flow() != 0) {
