@@ -8387,17 +8387,54 @@ static void app_capture_resume_snapshot(
         || app->runtime == NULL
         || !app->player.initialized) {
         /*
-         * NO LIVE SESSION: b1 stays 0 and the payload stays zeroed, which is the
-         * only record state Java can hold with a fresh install (K == 2 at
-         * BounceGame.java:19). Java's own guard at :352-353 cannot be
-         * reproduced here because it never trips -- `this.v` and `this.v.aq` are
-         * both eagerly constructed -- and reproducing Java's fresh-install
-         * payload would mean building a level-1 session native never loaded,
-         * which would be an invention rather than a reproduction. The record is
-         * behaviourally identical either way: BounceGame.java:225 resumes only
-         * when J != 0, so a b1 == 0 record is inert.
+         * STEP SAVE-CONTINUE -- NO LIVE LEVEL, AND THE REMEMBERED SNAPSHOT IS KEPT.
+         *
+         * This used to do `app->resume_record3 = record`, i.e. zero the field and
+         * return. That is what destroyed the save, and it is worth being exact about
+         * why, because the previous comment here argued for it and argued wrong.
+         *
+         * WHAT JAVA WRITES. destroyApp runs WriteToStore(3) at BounceGame.java:355-361,
+         * and the two things it takes the values from are
+         *
+         *     b1    <- this.K          a STICKY field
+         *     lives <- this.v.lives    the LIVE GAME OBJECT
+         *
+         * `this.v` is constructed once and is never discarded when the player walks back
+         * to the main menu; only the game-over and game-complete paths change K, at
+         * :431 and at the ShowLevelComplete call. So after playing a level and pressing
+         * BACK, K is still 1 and `this.v` still holds the run, and destroyApp writes a
+         * perfectly good record. Coming back to the menu does not invalidate anything.
+         *
+         * WHICH JAVA FIELD IS `app->resume_record3`. It is the native stand-in for that
+         * pair -- sticky K plus the live object -- which is exactly why the main-menu
+         * Exit row, which writes this field WITHOUT re-capturing, was right, and this
+         * capture, which re-derives b1 from whether a level happens to be loaded right
+         * now, was wrong.
+         *
+         * THE BUG, REPRODUCED. Play, press Escape, close the window:
+         *
+         *     after Escape   record3 present  b1=1 level=1 lives=3 pos=(30,78)
+         *     window closed  record3 present  b1=0 level=0 lives=0 pos=(0,0)
+         *     relaunch       Continue NOT available
+         *
+         * The save was overwritten with an inert one by the close handler's capture.
+         * Closing the window from the main menu -- the way most players leave -- threw
+         * away the run.
+         *
+         * SO THE FIELD IS LEFT ALONE. A fresh install still yields an inert record,
+         * because `app` is zeroed at boot and nothing has ever captured into it; that is
+         * the "never played" case the old comment was reaching for, and it is reached by
+         * the field being empty rather than by the field being cleared. A confirmed Reset
+         * zeroes it deliberately, in app_apply_reset_to_default(). A game over or a game
+         * end writes b1 == 0 over the top, which is Java's K = 3 and is a real change of
+         * state rather than an absence of one.
+         *
+         * Java's own guard at :352-353 -- `if (this.v == null || this.v.aq == null)
+         * return;` -- skips the write entirely, which is the same outcome this produces
+         * for a session that never existed. It cannot be reproduced literally because
+         * `this.v` and `this.v.aq` are eagerly constructed, so native has no null to
+         * test; keeping the remembered field is the equivalent.
          */
-        app->resume_record3 = record;
         return;
     }
     /*
@@ -24082,6 +24119,7 @@ static int verify_resume_snapshot_capture(void)
     bool deltas_ok;
     bool thorns_ok;
     bool survives_ok;
+    bool preserved_ok = false;
     bool inert_ok;
     uint32_t thorn_level_count = 0u;
     uint32_t thorn_count_expected = 0u;
@@ -24236,15 +24274,49 @@ static int verify_resume_snapshot_capture(void)
         && app.level == NULL
         && app.runtime == NULL;
     /*
-     * 10. With no live session the record is the inert b1 == 0 one, which is how
-     * Java represents "no snapshot": by K, never by absence of the record.
+     * 10. STEP SAVE-CONTINUE -- A CAPTURE WITH NO LIVE LEVEL MUST PRESERVE THE
+     * REMEMBERED SNAPSHOT, NOT CLEAR IT.
+     *
+     * This check asserted the opposite, and it was the last thing standing in the way
+     * of the fix. Its reasoning -- that Java represents "no snapshot" by K rather than
+     * by the absence of a record -- is true and does not imply what it concluded. K is
+     * STICKY: BounceGame.java:355-361 writes b1 from this.K, and nothing between
+     * playing a level and pressing BACK changes it, so a session that is still in the
+     * record is still resumable after a trip to the main menu. Treating "no level loaded
+     * right now" as "no session" is what made the window close overwrite a good save
+     * with an inert one.
+     *
+     * So the property is that the field survives, byte for byte, and that is asserted
+     * against `first` -- the record captured from the live level -- rather than against
+     * a hand-written list of zeroes, which would have let a capture that blanked only
+     * SOME fields pass.
      */
     app_capture_resume_snapshot(&app, BOUNCE_APP_STATE_MENU);
-    inert_ok = app.resume_record3.b1 == BOUNCE_PERSISTENCE_RECORD3_B1_NONE
-        && app.resume_record3.lives == 0u
-        && app.resume_record3.level == 0u
-        && app.resume_record3.tile_delta_count == 0u
-        && app.resume_record3.dyn_thorn_count == 0u;
+    preserved_ok = memcmp(&first, &app.resume_record3, sizeof first) == 0
+        && app.resume_record3.b1 == BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL;
+    if (!preserved_ok)
+        ++bad;
+
+    /*
+     * 10b. AND A FIELD THAT WAS NEVER CAPTURED INTO IS INERT, which is the case the
+     * old check was actually reaching for. app is zeroed at boot and nothing has
+     * captured into it, so b1 is 0 with no payload -- Java's K == 2 state at
+     * BounceGame.java:19, and BounceGame.java:225 resumes only when J != 0. This is a
+     * separate app so that "never captured" is a fact about the fixture rather than a
+     * consequence of the check above having run.
+     */
+    {
+        BounceApp virgin;
+
+        memset(&virgin, 0, sizeof virgin);
+        app_capture_resume_snapshot(&virgin, BOUNCE_APP_STATE_MENU);
+        inert_ok = virgin.resume_record3.b1 == BOUNCE_PERSISTENCE_RECORD3_B1_NONE
+            && virgin.resume_record3.lives == 0
+            && virgin.resume_record3.level == 0u
+            && virgin.resume_record3.score == 0
+            && virgin.resume_record3.tile_delta_count == 0u
+            && virgin.resume_record3.dyn_thorn_count == 0u;
+    }
 
     /*
      * 11. The thorn element check needs a level that actually HAS thorns: level 1
@@ -24325,9 +24397,9 @@ static int verify_resume_snapshot_capture(void)
     printf("RESUME-CAPTURE b1_in_level=%s scalars=%s spawn_tile=%s "
            "not_live_cell=%s timestamp_deferred=%s b1_level_complete=%s "
            "deterministic=%s move_invariant=%s "
-           "deltas=%u/%u thorns=%u/%u survives_release=%s inert_when_absent=%s "
+           "deltas=%u/%u thorns=%u/%u survives_release=%s preserved=%s inert_when_virgin=%s "
            "thorn_level2=%u expected=yes yes yes yes yes yes yes yes "
-           "15 15 0 0 yes yes 6 %s\n",
+           "15 15 0 0 yes yes yes 6 %s\n",
         b1_ok ? "yes" : "no",
         scalars_ok ? "yes" : "no",
         spawn_ok ? "yes" : "no",
@@ -24339,6 +24411,7 @@ static int verify_resume_snapshot_capture(void)
         first.tile_delta_count, expected_deltas,
         first.dyn_thorn_count, thorn_count_expected,
         survives_ok ? "yes" : "no",
+        preserved_ok ? "yes" : "no",
         inert_ok ? "yes" : "no",
         thorn_level_count,
         bad == 0 ? "PASS" : "FAIL");
@@ -33582,6 +33655,324 @@ static int bounce_shot_capture(
     return written;
 }
 
+/*
+ * =============================================================================
+ * STEP SAVE-CONTINUE -- verify_save_and_continue_across_restart()
+ *
+ * THE CLAIM. Play a level, leave, start the program again, and Continue is there and
+ * resumes the run that was saved -- position, level, lives, ball size and all.
+ *
+ * WHY IT NEEDS A CHECK OF ITS OWN, given that the store round trips are already covered.
+ *
+ * verify_reset_to_default() and verify_record3_terminal_b1_contract() both write a
+ * Record 3 and read it back. Neither of them ever left the game. The defect this exists
+ * for lives in the space between a good record on disk and the next process reading it,
+ * and it was invisible to every store test in the tree: closing the window re-captured
+ * the snapshot, the re-capture found no level loaded because the Escape had released
+ * it, and the all-zero result was written over a perfectly good save.
+ *
+ * REPRODUCED, in an isolated store:
+ *
+ *     after Escape    record3 present  b1=1 level=1 lives=3 pos=(30,78)
+ *     window closed   record3 present  b1=0 level=0 lives=0 pos=(0,0)
+ *     relaunch        Continue NOT available
+ *
+ * So the store was correct right up until the moment the program quit, and every test
+ * that stopped at the store said the save was fine.
+ *
+ * BOTH EXITS ARE DRIVEN, because they were different once and nothing guaranteed they
+ * stayed that way. The main-menu Exit row writes app->resume_record3 without
+ * re-capturing, which is the faithful shape -- Java's destroyApp takes b1 from the
+ * sticky K and the payload from the live game object at BounceGame.java:355-361, and
+ * neither is invalidated by walking to the menu. The ClientMessage close used to
+ * re-capture, which is the bug. Asserting only one of them would have let the other
+ * rot, and it was the other one that broke.
+ *
+ * THE RELAUNCH IS A GENUINELY FRESH BounceApp built the way main() builds one --
+ * bounce_game_init(), enter_menu(), app_restore_persisted_settings() -- and then the
+ * menu is read and Continue is pressed through x11_dispatch_event(). It is not a second
+ * look at the same objects, because "the record on disk is still right" and "the next
+ * process offers it" are different claims.
+ *
+ * AND THE EXIT IS A REAL ONE. The window close is the ClientMessage event the X11 loop
+ * handles, and the Exit row is the SELECT that sets pending_action to EXIT. Neither is
+ * simulated by calling the writer directly, because a test that calls the writer cannot
+ * see the caller that surrounds it -- which is where the whole defect was.
+ *
+ * NO INTERACTION. The run is driven through app_update_production_game() until PLAYING
+ * and then ticked, and the menu is driven with key events, so this needs no display and
+ * no human.
+ *
+ * The private-store discipline is the same as everywhere else: a private mkdtemp root
+ * published through XDG_DATA_HOME and restored on every path.
+ */
+static int verify_save_and_continue_across_restart(void)
+{
+    static const char template[] = "/tmp/bounce-saverestart-XXXXXX";
+    char root[sizeof template];
+    char saved[1024];
+    int saved_ok;
+    BouncePersistenceRecord3 first;
+    BouncePersistenceRecord3 after;
+    bool present = false;
+    unsigned int exit_leg;
+    int bad = 0;
+
+    for (exit_leg = 0u; exit_leg < 2u; ++exit_leg) {
+        BounceApp app;
+        X11PresentationContext context;
+        XEvent event;
+        unsigned int guard;
+        bool played = false;
+        bool escaped = false;
+        bool available = false;
+        bool resumed = false;
+
+        memset(&app, 0, sizeof app);
+        memcpy(root, template, sizeof root);
+        if (mkdtemp(root) == NULL) {
+            fprintf(stderr, "save-restart: could not create a private store\n");
+            return -1;
+        }
+        saved_ok = (getenv("XDG_DATA_HOME") != NULL);
+        if (saved_ok)
+            (void)snprintf(saved, sizeof saved, "%s", getenv("XDG_DATA_HOME"));
+        (void)setenv("XDG_DATA_HOME", root, 1);
+
+        /* ---- play ---- */
+        if (drive_app_to_gameplay_entry_start_level(&app) != 0) {
+            bad++;
+            goto leg_done;
+        }
+        for (guard = 0u; guard < 8192u; ++guard) {
+            if (app_update_production_game(&app) != 0)
+                break;
+            if (app.state == BOUNCE_GAME_STATE_PLAYING) {
+                played = true;
+                break;
+            }
+        }
+        if (!played) {
+            fprintf(stderr,
+                    "save-restart leg %u: level 1 never reached PLAYING\n",
+                    exit_leg);
+            bad++;
+            goto leg_done;
+        }
+        for (guard = 0u; guard < 200u; ++guard) {
+            BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+
+            (void)app_timer_callback_dispatch(&app, &branch);
+        }
+        /*
+         * Nothing may be in the store yet. If a snapshot already existed, the rest of
+         * the leg could not tell a save made on exit from one that was there before,
+         * and the comparison below would be meaningless.
+         */
+        if (bounce_persistence_load_record3(&after, &present) != 0 || present) {
+            fprintf(stderr,
+                    "save-restart leg %u: a snapshot existed before the session"
+                    " ended\n",
+                    exit_leg);
+            bad++;
+            goto leg_done;
+        }
+
+        dispatch_fixture_context(&context);
+
+        /* ---- leave gameplay for the menu, the production edge ---- */
+        fill_key_event(&event, KeyPress, 9u, 1u, 100u);
+        if (x11_dispatch_event(&context, &app, &event, XK_Escape) == 0
+            && app.flow.state == BOUNCE_APP_STATE_MENU
+            && app.flow.menu.continue_available) {
+            escaped = true;
+        }
+        if (!escaped) {
+            fprintf(stderr,
+                    "save-restart leg %u: Escape did not reach an offering menu"
+                    " (state=%d continue=%d)\n",
+                    exit_leg,
+                    (int)app.flow.state,
+                    (int)app.flow.menu.continue_available);
+            bad++;
+            goto leg_done;
+        }
+
+        /*
+         * `first` IS THE GOOD SAVE, read from the store after the menu arrival rather
+         * than from app.resume_record3. Reading the field here would have compared the
+         * exit against an empty record -- the field is only written by a capture, and no
+         * capture has run yet at this point -- and the check passed nothing while
+         * reporting every field as changed.
+         *
+         * timestamp is excluded because a capture stamps it, so a re-capture on exit
+         * legitimately moves it while everything else must not.
+         */
+        if (bounce_persistence_load_record3(&first, &present) != 0
+            || !present
+            || first.b1 != BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL) {
+            fprintf(stderr,
+                    "save-restart leg %u: the menu arrival left no resumable"
+                    " snapshot (present=%d b1=%u)\n",
+                    exit_leg,
+                    (int)present,
+                    present ? first.b1 : 0u);
+            bad++;
+            goto leg_done;
+        }
+        first.timestamp_millis = 0u;
+
+        /* ---- quit, by one route or the other ---- */
+        if (exit_leg == 0u) {
+            memset(&event, 0, sizeof event);
+            event.type = ClientMessage;
+            event.xclient.data.l[0] = 0;
+            event.xclient.data.l[1] = 0;
+            event.xany.serial = 1u;
+            (void)x11_dispatch_event(&context, &app, &event, 0);
+        } else {
+            for (guard = 0u; guard < 9u; ++guard)
+                (void)bounce_app_flow_menu_move(
+                    &app.flow, BOUNCE_MENU_DIRECTION_UP);
+            for (guard = 0u; guard < 9u; ++guard)
+                (void)bounce_app_flow_menu_move(
+                    &app.flow, BOUNCE_MENU_DIRECTION_DOWN);
+            fill_key_event(&event, KeyPress, 36u, 1u, 100u);
+            if (x11_dispatch_event(&context, &app, &event, XK_Return) != 0
+                || app.flow.menu.pending_action != BOUNCE_MENU_ACTION_EXIT) {
+                fprintf(stderr,
+                        "save-restart leg %u: the Exit row was not reached"
+                        " (pending=%d)\n",
+                        exit_leg,
+                        (int)app.flow.menu.pending_action);
+                bad++;
+                goto leg_done;
+            }
+        }
+        bounce_game_shutdown(&app);
+
+        /* ---- THE SAVE MUST HAVE SURVIVED THE EXIT ---- */
+        if (bounce_persistence_load_record3(&after, &present) != 0 || !present) {
+            fprintf(stderr,
+                    "save-restart leg %u: the exit left no snapshot at all\n",
+                    exit_leg);
+            bad++;
+            goto leg_done;
+        }
+        after.timestamp_millis = 0u;
+        if (after.b1 != BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL) {
+            fprintf(stderr,
+                    "save-restart leg %u: the exit wrote an INERT record"
+                    " (b1=%u level=%u lives=%d)\n",
+                    exit_leg,
+                    after.b1,
+                    after.level,
+                    (int)after.lives);
+            bad++;
+            goto leg_done;
+        }
+        if (after.level != first.level
+            || after.lives != first.lives
+            || after.score != first.score
+            || after.unk_x != first.unk_x
+            || after.unk_y != first.unk_y
+            || after.ball_size != first.ball_size) {
+            fprintf(stderr,
+                    "save-restart leg %u: the saved run changed on the way out"
+                    " (level %u->%u lives %d->%d score %d->%d"
+                    " pos (%d,%d)->(%d,%d) ball %u->%u)\n",
+                    exit_leg,
+                    first.level, after.level,
+                    (int)first.lives, (int)after.lives,
+                    first.score, after.score,
+                    first.unk_x, after.unk_x,
+                    first.unk_y, after.unk_y,
+                    first.ball_size, after.ball_size);
+            bad++;
+            goto leg_done;
+        }
+
+        /* ---- a genuinely fresh app, built the way main() builds one ---- */
+        {
+            BounceApp fresh;
+
+            memset(&fresh, 0, sizeof fresh);
+            if (bounce_game_init(&fresh) != 0
+                || bounce_game_enter_menu(&fresh) != 0) {
+                bad++;
+                goto leg_done;
+            }
+            app_restore_persisted_settings(&fresh);
+            app_refresh_continue_availability(&fresh);
+            available = fresh.flow.menu.continue_available
+                && fresh.flow.menu.enabled_item_count == BOUNCE_MENU_ROW_COUNT
+                && fresh.flow.menu.selected_index == 0u;
+            if (!available) {
+                fprintf(stderr,
+                        "save-restart leg %u: the relaunched menu does not offer"
+                        " Continue (avail=%d enabled=%u selected=%u)\n",
+                        exit_leg,
+                        (int)fresh.flow.menu.continue_available,
+                        fresh.flow.menu.enabled_item_count,
+                        fresh.flow.menu.selected_index);
+                bad++;
+            } else {
+                dispatch_fixture_context(&context);
+                fill_key_event(&event, KeyPress, 36u, 1u, 100u);
+                if (x11_dispatch_event(
+                        &context, &fresh, &event, XK_Return) != 0) {
+                    bad++;
+                } else {
+                    for (guard = 0u; guard < 8192u; ++guard) {
+                        if (app_update_production_game(&fresh) != 0)
+                            break;
+                        if (fresh.state == BOUNCE_GAME_STATE_PLAYING
+                            || fresh.level != NULL)
+                            break;
+                    }
+                    resumed = fresh.level != NULL
+                        && fresh.level_id == after.level
+                        && fresh.lives == after.lives
+                        && fresh.score == after.score
+                        && fresh.player.TODO_unkX == after.unk_x
+                        && fresh.player.TODO_unkY == after.unk_y
+                        && fresh.player.ballSize == after.ball_size;
+                    if (!resumed) {
+                        fprintf(stderr,
+                                "save-restart leg %u: Continue did not restore the"
+                                " run (loaded=%s level %u vs %u lives %d vs %d"
+                                " score %d vs %d pos (%d,%d) vs (%d,%d)"
+                                " ball %u vs %u)\n",
+                                exit_leg,
+                                fresh.level != NULL ? "yes" : "NO",
+                                fresh.level_id, after.level,
+                                fresh.lives, (int)after.lives,
+                                fresh.score, after.score,
+                                fresh.player.TODO_unkX, after.unk_x,
+                                fresh.player.TODO_unkY, after.unk_y,
+                                fresh.player.ballSize, after.ball_size);
+                        bad++;
+                    }
+                }
+            }
+            bounce_game_shutdown(&fresh);
+        }
+
+leg_done:
+        if (saved_ok)
+            (void)setenv("XDG_DATA_HOME", saved, 1);
+        else
+            (void)unsetenv("XDG_DATA_HOME");
+    }
+
+    if (bad == 0) {
+        printf("SAVE-RESTART exits=window-close,menu-row"
+               " saved=survives-both restarts=offers-continue resumes=exact"
+               " PASS\n");
+    }
+    return bad == 0 ? 0 : -1;
+}
+
 static int bounce_shot_write_all(const char *dir)
 {
     static const char template[] = "/tmp/bounce-shots-XXXXXX";
@@ -34466,6 +34857,10 @@ int main(int argc, char **argv)
     }
     if (bounce_persistence_verify() != 0) {
         fprintf(stderr, "persistence store verification failed\n");
+        goto cleanup;
+    }
+    if (verify_save_and_continue_across_restart() != 0) {
+        fprintf(stderr, "save-and-continue-across-restart verification failed\n");
         goto cleanup;
     }
     if (verify_check_never_touches_the_real_store() != 0) {
