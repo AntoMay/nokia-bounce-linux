@@ -24,6 +24,8 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
+#include <png.h>
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7621,6 +7623,163 @@ static int render_pause_state(
  * exactly as they were.
  */
 
+/*
+ * =============================================================================
+ * STEP SHOTS -- writing the logical surface out as a PNG.
+ *
+ * WHY THIS EXISTS RATHER THAN A SCREENSHOT TOOL. The screenshots in screenshots/ are
+ * 128x128, which is BOUNCE_SURFACE_WIDTH x BOUNCE_SURFACE_HEIGHT: they are renders of
+ * the logical surface, not captures of an X window. A window capture would come out at
+ * whatever size the window manager gave it, with chrome and scaling in it, so it could
+ * not replace these files without also changing what they are.
+ *
+ * Capturing an X window was also not possible here: there is no Xvfb, no xdotool, and
+ * libXtst has no header, so nothing could drive the game to the screens that need a key
+ * press. Driving the flow directly and rendering each state reaches all of them, needs
+ * no display at all, and produces byte-identical output for the same build -- which is
+ * what makes the images in the repository reproducible rather than a one-off.
+ *
+ * The colour conversion is the one real decision. Surface pixels are opaque uint32
+ * tokens and this tree does not establish Java ME ARGB byte order, so the bytes are NOT
+ * reinterpreted here. Each pixel is split as the shader path already splits it, and the
+ * existing screenshots are the reference for whether that is right.
+ */
+static int bounce_shot_write_png(const char *path, const BounceSurface *surface)
+{
+    FILE *file;
+    png_structp png;
+    png_infop info;
+    png_bytep *rows;
+    uint32_t width;
+    uint32_t height;
+    uint32_t x;
+    uint32_t y;
+
+    if (path == NULL || surface == NULL)
+        return -1;
+    width = bounce_surface_width(surface);
+    height = bounce_surface_height(surface);
+    if (width == 0u || height == 0u)
+        return -1;
+
+    file = fopen(path, "wb");
+    if (file == NULL)
+        return -1;
+    png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (png == NULL) {
+        (void)fclose(file);
+        return -1;
+    }
+    info = png_create_info_struct(png);
+    if (info == NULL) {
+        png_destroy_write_struct(&png, NULL);
+        (void)fclose(file);
+        return -1;
+    }
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        (void)fclose(file);
+        return -1;
+    }
+    png_init_io(png, file);
+    png_set_IHDR(
+        png,
+        info,
+        width,
+        height,
+        8,
+        PNG_COLOR_TYPE_RGB,
+        PNG_INTERLACE_NONE,
+        PNG_COMPRESSION_TYPE_DEFAULT,
+        PNG_FILTER_TYPE_DEFAULT
+    );
+    png_write_info(png, info);
+
+    rows = (png_bytep *)malloc(sizeof(png_bytep) * height);
+    if (rows == NULL) {
+        png_destroy_write_struct(&png, &info);
+        (void)fclose(file);
+        return -1;
+    }
+    for (y = 0u; y < height; ++y)
+        rows[y] = (png_bytep)malloc(3u * width);
+    for (y = 0u; y < height; ++y) {
+        if (rows[y] == NULL) {
+            for (uint32_t i = 0u; i < y; ++i)
+                free(rows[i]);
+            free(rows);
+            png_destroy_write_struct(&png, &info);
+            (void)fclose(file);
+            return -1;
+        }
+    }
+    for (y = 0u; y < height; ++y) {
+        for (x = 0u; x < width; ++x) {
+            uint32_t pixel = 0u;
+            /*
+             * THE SAME SPLIT THE RENDERER USES. bounce_renderer_fill_rect() and the
+             * image blitter both treat a token as 0xAARRGGBB, so the writer does too
+             * rather than guessing a byte order of its own.
+             */
+            if (bounce_surface_get_pixel(
+                    surface, (int)x, (int)y, &pixel) != 0)
+                pixel = 0u;
+            rows[y][x * 3u + 0u] = (png_byte)((pixel >> 16) & 0xffu);
+            rows[y][x * 3u + 1u] = (png_byte)((pixel >> 8) & 0xffu);
+            rows[y][x * 3u + 2u] = (png_byte)(pixel & 0xffu);
+        }
+        png_write_row(png, rows[y]);
+    }
+    png_write_end(png, info);
+    for (y = 0u; y < height; ++y)
+        free(rows[y]);
+    free(rows);
+    png_destroy_write_struct(&png, &info);
+    (void)fclose(file);
+    return 0;
+}
+
+/*
+ * =============================================================================
+ * STEP SHOTS -- the screenshot set.
+ *
+ * WHAT IT CAPTURES, AND WHY THESE SCREENS. Every state a player can look at that has
+ * a distinct visual identity, reached through the flow rather than by faking the
+ * state. The set is not the nine files that were in screenshots/: two of those were
+ * already out of date before this mode existed -- settings-menu.png still showed five
+ * Settings rows and no Reset to Default, and main-menu.png still carried the old
+ * "CONTINUE NO SAVE DATA" wording -- and three screens that the feature added had no
+ * image at all.
+ *
+ * THE FOUR NEW ONES, and what each is for:
+ *
+ *   settings-reset-confirm   the confirmation page, which is the one screen in the
+ *                            shell with no ESC BACK hint and a clickable BACK row.
+ *                            It is the screen where the Reset feature lives.
+ *   settings-theme            the Theme page, which existed but was never captured.
+ *   settings-input-keypad     the Input page with the numeric-keypad setting, which
+ *                            is on by default now and so differs from the Audio page
+ *                            beside it in exactly one pixel of state.
+ *   level-select-progress     Level Select with more than the two fresh-install rows
+ *                            unlocked, because with the shipped default of two the
+ *                            fresh list looks like a truncation rather than a state.
+ *
+ * EVERY SCREEN IS RENDERED THROUGH render_app_state(), which is the same dispatcher
+ * the frame loop uses. That is what keeps an image honest: there is no second drawing
+ * path here that could drift from what the game draws, and a screen that stops being
+ * reachable would fail here rather than produce an image of a state nothing enters.
+ *
+ * THE GAMEPLAY SHOTS ARE TICKED, not posed. Each is driven through the ordinary
+ * production update until the state it wants is reached, so what is captured is a frame
+ * the game really produced -- the same distinction verify_tick_cadence() turns on, and
+ * the reason the level-1 image is taken after a fixed number of ticks rather than at a
+ * hand-picked ball position.
+ *
+ * NOTHING HERE TOUCHES THE PLAYER'S SAVE. The store is redirected to a private
+ * mkdtemp root for the duration, on the same discipline every other I/O path in this
+ * file follows, and the flow is booted fresh so "no save" is a real state rather than
+ * whatever happened to be on disk.
+ */
 static int render_app_state(
     BounceSurface *surface,
     BounceRenderer *renderer,
@@ -31080,7 +31239,12 @@ static void print_usage(const char *program)
         "           default or plughw:1,0; omit for the backend's own default.\n"
         "           The named device is used or audio init fails -- there is\n"
         "           no probing and no fallback to another device.)\n"
-        "       %s   (with NBB_DEBUG=0|1|2|3 for the terminal debug tracker)\n",
+        "       %s   (with NBB_DEBUG=0|1|2|3 for the terminal debug tracker)\n"
+        "       %s --screenshots=DIR   (render every screen to DIR as a 128x128 PNG;\n"
+        "                            the images in screenshots/ are made this way,\n"
+        "                            and the store is redirected so it cannot\n"
+        "                            touch the player's save)\n",
+        program != NULL ? program : "bounce_vertical_slice",
         program != NULL ? program : "bounce_vertical_slice",
         program != NULL ? program : "bounce_vertical_slice",
         program != NULL ? program : "bounce_vertical_slice",
@@ -33391,6 +33555,373 @@ static int verify_persistence_flow_body(void)
     return 0;
 }
 
+typedef struct BounceShotRequest {
+    const char *file;
+    const char *what;
+} BounceShotRequest;
+
+static int bounce_shot_capture(
+    BounceApp *app,
+    BounceSurface *surface,
+    BounceRenderer *renderer,
+    const char *dir,
+    const char *file
+)
+{
+    char path[1024];
+    int written;
+
+    if (snprintf(path, sizeof path, "%s/%s.png", dir, file)
+        >= (int)sizeof path)
+        return -1;
+    if (render_app_state(surface, renderer, app) != 0)
+        return -1;
+    written = bounce_shot_write_png(path, surface);
+    if (written == 0)
+        printf("SHOT %-28s %s\n", file, path);
+    return written;
+}
+
+static int bounce_shot_write_all(const char *dir)
+{
+    static const char template[] = "/tmp/bounce-shots-XXXXXX";
+    char root[sizeof template];
+    char saved[1024];
+    int saved_ok;
+    BounceSurface *surface;
+    BounceRenderer *renderer;
+    /*
+     * THE SPLASH IS THE ONE SCREEN THAT NEEDS THE ASSETS. bounce_ui_shell_render_splash()
+     * takes a BounceVisualAssets and refuses NULL, because it draws the recovered
+     * bouncesplash.png rather than text. Every other screen here is drawn from the flow
+     * alone, so this is loaded only so that one image is a real render and not a
+     * placeholder -- and it is destroyed before returning, like the frame loop's.
+     */
+    BounceVisualAssets *visuals;
+    BounceApp app;
+    int bad = 0;
+    int made_root;
+    int shots = 0;
+
+    if (dir == NULL || dir[0] == '\0') {
+        fprintf(stderr, "screenshots: no output directory given\n");
+        return -1;
+    }
+
+    /* The private-store discipline every other I/O path in this file follows. */
+    memcpy(root, template, sizeof template);
+    made_root = (mkdtemp(root) != NULL);
+    saved_ok = (getenv("XDG_DATA_HOME") != NULL);
+    if (saved_ok)
+        (void)snprintf(saved, sizeof saved, "%s", getenv("XDG_DATA_HOME"));
+    if (made_root)
+        (void)setenv("XDG_DATA_HOME", root, 1);
+
+    memset(&app, 0, sizeof app);
+    surface = bounce_surface_create();
+    if (surface == NULL) {
+        bad++;
+        goto restore;
+    }
+    renderer = bounce_renderer_create(surface);
+    if (renderer == NULL) {
+        bounce_surface_destroy(surface);
+        bad++;
+        goto restore;
+    }
+    if (bounce_game_init(&app) != 0) {
+        bounce_renderer_destroy(renderer);
+        bounce_surface_destroy(surface);
+        bad++;
+        goto restore;
+    }
+    visuals = bounce_visual_assets_create(BOUNCE_RESOURCE_ROOT);
+    if (visuals == NULL) {
+        fprintf(stderr, "screenshots: could not load the visual assets\n");
+        bounce_game_shutdown(&app);
+        bounce_renderer_destroy(renderer);
+        bounce_surface_destroy(surface);
+        bad++;
+        goto restore;
+    }
+    app.visuals = visuals;
+    /*
+     * app_restore_persisted_settings() returns void, so it is called on its own line
+     * rather than being made to return a status for a chain. The private root is empty,
+     * so there is nothing in it to restore and the theme and keypad land on the shipped
+     * defaults -- which is the state these images are meant to show.
+     */
+    app_restore_persisted_settings(&app);
+
+    /*
+     * THE STATES ARE SET DIRECTLY RATHER THAN BY PRESSING KEYS, and that is deliberate.
+     *
+     * The first version of this walked the flow with menu_move() and menu_select() the
+     * way a player would, and it produced four of thirteen images and two identical
+     * ones: the splash shot came out as the menu because enter_menu() had already run,
+     * and a mis-counted walk landed several destinations on the wrong screen. None of
+     * that is a reason to make the screenshots depend on navigation arithmetic.
+     *
+     * What these images have to be is what the renderer draws for a state a player can
+     * reach. render_app_state() is the same dispatcher the frame loop uses, so naming a
+     * state and calling it is the whole claim -- and there is no second drawing path
+     * here that could drift from the game's.
+     *
+     * The gameplay shots are the exception and are NOT posed: those go through the
+     * ordinary production update until PLAYING, then take more ticks, because a frame
+     * of a level that never ran would be a picture of nothing.
+     */
+    app.flow.state = BOUNCE_APP_STATE_SPLASH;
+    if (bounce_shot_capture(&app, surface, renderer, dir, "title-screen") != 0)
+        bad++;
+    else
+        ++shots;
+
+    /*
+     * THE MENU IS ENTERED THE WAY IT IS ENTERED, not assigned: bounce_game_enter_menu()
+     * is the production entry and it is what clears the flow for a real arrival. Only
+     * then is the state assigned, and Continue is re-derived so the row shows the
+     * no-save state rather than whatever enter_menu left behind.
+     */
+    if (bounce_game_enter_menu(&app) != 0) {
+        bad++;
+    } else {
+        app_refresh_continue_availability(&app);
+        if (bounce_shot_capture(
+                &app, surface, renderer, dir, "main-menu") != 0)
+            bad++;
+        else
+            ++shots;
+    }
+
+    app.flow.state = BOUNCE_APP_STATE_HIGH_SCORE;
+    if (bounce_shot_capture(&app, surface, renderer, dir, "high-score") != 0)
+        bad++;
+    else
+        ++shots;
+
+    app.flow.state = BOUNCE_APP_STATE_INSTRUCTIONS;
+    app.flow.instructions_scroll = 0u;
+    if (bounce_shot_capture(
+            &app, surface, renderer, dir, "instructions") != 0)
+        bad++;
+    else
+        ++shots;
+
+    /* Level Select at the shipped default of two unlocked levels. */
+    app.flow.state = BOUNCE_APP_STATE_LEVEL_SELECTION;
+    app.flow.level_selection.available_level_count =
+        (unsigned int)BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT;
+    app.flow.level_selection.selected_index = 0u;
+    if (bounce_shot_capture(
+            &app, surface, renderer, dir, "level-select") != 0)
+        bad++;
+    else
+        ++shots;
+
+    /*
+     * And the same list with progress, because at two rows a fresh Level Select reads as
+     * a truncation rather than as a state. The count is the one a store with progress
+     * would restore.
+     */
+    app.flow.level_selection.available_level_count = 9u;
+    app.flow.level_selection.selected_index = 3u;
+    if (bounce_shot_capture(
+            &app, surface, renderer, dir, "level-select-progress") != 0)
+        bad++;
+    else
+        ++shots;
+
+    /* Settings: the root with all six rows, then each sub-page. */
+    app.flow.state = BOUNCE_APP_STATE_SETTINGS;
+    app.flow.settings.page = BOUNCE_SETTINGS_PAGE_ROOT;
+    app.flow.settings.selected_index = 0u;
+    if (bounce_shot_capture(
+            &app, surface, renderer, dir, "settings-menu") != 0)
+        bad++;
+    else
+        ++shots;
+
+    app.flow.settings.page = BOUNCE_SETTINGS_PAGE_LANGUAGE;
+    app.flow.settings.language_index = 1u;
+    app.flow.settings.applied_language_index = 1u;
+    if (bounce_shot_capture(
+            &app, surface, renderer, dir, "settings-language") != 0)
+        bad++;
+    else
+        ++shots;
+
+    app.flow.settings.page = BOUNCE_SETTINGS_PAGE_THEME;
+    app.flow.settings.theme_index = 4u;
+    if (bounce_shot_capture(
+            &app, surface, renderer, dir, "settings-theme") != 0)
+        bad++;
+    else
+        ++shots;
+
+    app.flow.settings.page = BOUNCE_SETTINGS_PAGE_INPUT;
+    if (bounce_shot_capture(
+            &app, surface, renderer, dir, "settings-input-keypad") != 0)
+        bad++;
+    else
+        ++shots;
+
+    app.flow.settings.page = BOUNCE_SETTINGS_PAGE_AUDIO;
+    if (bounce_shot_capture(
+            &app, surface, renderer, dir, "settings-audio") != 0)
+        bad++;
+    else
+        ++shots;
+
+    /*
+     * AND THE RESET PAGE, which is the screen this mode was added for: the one place
+     * in the shell with no ESC BACK hint and a clickable BACK row.
+     *
+     * The values are set AWAY from the defaults first, on purpose. The page's whole
+     * purpose is to state what it is about to change, so a picture of it showing six
+     * defaults already at their defaults proves nothing -- and would be exactly what the
+     * feature gets wrong if the list were computed from constants instead of read from
+     * the flow.
+     */
+    app.flow.level_selection.available_level_count = 9u;
+    app.flow.high_score = 4242;
+    app.flow.menu.continue_available = true;
+    app.flow.settings.audio_enabled = false;
+    app.flow.settings.t9_input_enabled = true;
+    app.flow.settings.applied_theme_index = 2u;
+    app.flow.settings.theme_index = 2u;
+    app.flow.settings.page = BOUNCE_SETTINGS_PAGE_RESET;
+    app.flow.settings.selected_index = BOUNCE_SETTINGS_RESET_ROW_CONFIRM;
+    if (bounce_shot_capture(
+            &app, surface, renderer, dir, "settings-reset-confirm") != 0)
+        bad++;
+    else
+        ++shots;
+
+    app.flow.state = BOUNCE_APP_STATE_ABOUT;
+    if (bounce_shot_capture(&app, surface, renderer, dir, "about") != 0)
+        bad++;
+    else
+        ++shots;
+
+    /* ---- gameplay: entered and then TICKED, never posed ---- */
+    if (drive_app_to_gameplay_entry_start_level(&app) != 0) {
+        bad++;
+    } else {
+        unsigned int guard;
+
+        /*
+         * RE-ATTACH THE ASSETS, because the driver just wiped them.
+         *
+         * drive_app_to_gameplay_entry_start_level() begins with memset(app, 0, sizeof
+         * *app) and then bounce_game_init(), so app->visuals is NULL again. Without
+         * this line draw_level_grid() takes the fallback rectangle for every tile --
+         * which its own comment calls "fallback only for isolated tests that do not load
+         * the original assets" -- and the gameplay image comes out as flat grey blocks
+         * with the background showing through, instead of the level art. That is what a
+         * first version of this produced.
+         *
+         * The assets are not reloaded: the pointer is unchanged and the set was created
+         * once above. Re-creating them would be a second allocation the driver never
+         * asked for and would have to be torn down twice.
+         */
+        app.visuals = visuals;
+
+        for (guard = 0u; guard < 8192u; ++guard) {
+            if (app_update_production_game(&app) != 0)
+                break;
+            if (app.state == BOUNCE_GAME_STATE_PLAYING
+                && app.flow.state == BOUNCE_APP_STATE_GAMEPLAY)
+                break;
+        }
+        if (app.state != BOUNCE_GAME_STATE_PLAYING) {
+            fprintf(stderr,
+                    "screenshots: level 1 never reached PLAYING (state=%d)\n",
+                    (int)app.state);
+            bad++;
+        } else {
+            int more;
+
+            /*
+             * OUT OF THE COUNTDOWN FIRST, THEN ONWARD.
+             *
+             * draw_level_banner() is gated on `p != 0` -- e.java:201 -- and the entry
+             * countdown starts at BOUNCE_APP_ENTRY_COUNTDOWN, which is 120. So a frame
+             * taken a few dozen ticks into PLAYING is still the banner over an empty
+             * stage, which is what the first version of this captured: a dark screen
+             * reading LEVEL 1. The old screenshot in the tree has the level grid, the
+             * player and the HUD, so it was taken past this point and this has to be too.
+             *
+             * The wait is on the countdown rather than on a tick count, so it stays
+             * correct if the entry countdown ever changes -- the same reason
+             * verify_tick_cadence() drives on the period rather than on a frame count.
+             */
+            for (more = 0; more < 4096; ++more) {
+                BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+
+                if (bounce_app_flow_entry_countdown(&app.flow) == 0)
+                    break;
+                /*
+                 * app_timer_callback_dispatch(), NOT app_run_canonical_gameplay_tick().
+                 *
+                 * The countdown is decremented by bounce_app_flow_tick_pre_countdown(),
+                 * which bounce_game_tick_dispatch() calls after its reset and splash
+                 * gates -- the native e.java:258-259. The canonical tick is the level
+                 * PHASE and does not go through that dispatch, so a first version of
+                 * this looped on it and the countdown sat at 119 for four thousand
+                 * iterations. The existing arrival and progression verifiers drive the
+                 * same function, which is why it is used here too.
+                 */
+                if (app_timer_callback_dispatch(&app, &branch) != 0)
+                    break;
+            }
+            if (bounce_app_flow_entry_countdown(&app.flow) != 0) {
+                fprintf(stderr,
+                        "screenshots: the entry countdown never expired (%d)\n",
+                        bounce_app_flow_entry_countdown(&app.flow));
+                bad++;
+            } else {
+                /* Then far enough that the ball has moved and it is not the spawn. */
+                for (more = 0; more < 30; ++more) {
+                    BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+
+                    (void)app_timer_callback_dispatch(&app, &branch);
+                }
+                if (bounce_shot_capture(
+                        &app, surface, renderer, dir, "gameplay-level-1") != 0)
+                    bad++;
+                else
+                    ++shots;
+            }
+        }
+    }
+
+    bounce_game_shutdown(&app);
+    bounce_renderer_destroy(renderer);
+    bounce_surface_destroy(surface);
+    bounce_visual_assets_destroy(visuals);
+    app.visuals = NULL;
+
+restore:
+    if (made_root && saved_ok)
+        (void)setenv("XDG_DATA_HOME", saved, 1);
+    else if (made_root)
+        (void)unsetenv("XDG_DATA_HOME");
+    /*
+     * The private root is left behind, as every other one in this file is: the store
+     * wrote a bounce/ subdirectory under it, so rmdir would fail with ENOTEMPTY, and
+     * unlinking the tree would be the first place here deleting files it did not create.
+     * The environment is restored either way.
+     */
+    if (bad == 0) {
+        printf("SHOTS %d files -> %s\n", shots, dir);
+    } else {
+        fprintf(stderr,
+                "screenshots: %d of %d captures failed\n", bad, shots + bad);
+    }
+    return bad == 0 ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     const char *level_path = BOUNCE_LEVEL001_PATH;
@@ -33412,6 +33943,7 @@ int main(int argc, char **argv)
      * probing, and this variable is only ever set from an explicit flag.
      */
     const char *audio_device_name = NULL;
+    const char *screenshots_dir = NULL;
     size_t asset_count = 0u;
     BounceApp app;
     BounceSurface *surface = NULL;
@@ -33490,6 +34022,19 @@ int main(int argc, char **argv)
                 render_trace_mode = 1;
             } else if (strcmp(argv[argument_index], "--live-status") == 0) {
                 live_status_mode = 1;
+            } else if (strcmp(argv[argument_index], "--screenshots") == 0) {
+                /* The bare form is a mistake, not a level path. */
+                fprintf(stderr, "--screenshots requires a directory: --screenshots=DIR\n");
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            } else if (strncmp(argv[argument_index], "--screenshots=",
+                               strlen("--screenshots=")) == 0) {
+                screenshots_dir = argv[argument_index] + strlen("--screenshots=");
+                if (screenshots_dir[0] == '\0') {
+                    fprintf(stderr, "--screenshots= requires a directory\n");
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
             } else if (strncmp(argv[argument_index], BOUNCE_AUDIO_DEVICE_FLAG,
                                BOUNCE_AUDIO_DEVICE_FLAG_LENGTH) == 0) {
                 /*
@@ -33527,6 +34072,20 @@ int main(int argc, char **argv)
                 strlen(original_xdg) + 1u,
                 "%s",
                 original_xdg);
+    }
+
+    /*
+     * STEP SHOTS -- TAKEN AS EARLY AS POSSIBLE, because it is a build and documentation
+     * mode rather than a game mode. It builds its own surface and renderer, so nothing
+     * the frame loop would have set up is required, and it redirects the store to a
+     * private root of its own first, so it cannot disturb the player's save.
+     */
+    if (screenshots_dir != NULL) {
+        int shot_rc = bounce_shot_write_all(screenshots_dir);
+
+        free(bounce_check_original_xdg);
+        bounce_check_original_xdg = NULL;
+        return shot_rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     if (camera_diagnostic_mode) {
