@@ -2536,6 +2536,55 @@ static void app_commit_t9_change(BounceApp *app, bool enabled_before)
  * game; the flow state is already correct either way, so the visible session matches
  * what the player asked for even if the store lags.
  */
+/*
+ * STEP 38-RESET-FIX -- THE IN-MEMORY SNAPSHOT IS CLEARED TOO, AND THAT IS THE FIX.
+ *
+ * THE BUG, AS REPORTED. Play, confirm Reset to Default, walk back to the main menu,
+ * press Exit -- and on the NEXT launch the Continue row is live and selectable again.
+ *
+ * REPRODUCED, IN ISOLATION:
+ *
+ *     after reset Confirm   record3 = ABSENT
+ *     after menu Exit       record3 present  b1=1  lives=3  level=2  tiles=21
+ *     relaunch              Continue SELECTABLE
+ *
+ * WHY THE DELETION ALONE WAS NOT ENOUGH. There are two copies of the snapshot, and
+ * only one of them lives in a file:
+ *
+ *   the store        what bounce_persistence_delete_record3() removes
+ *   app->resume_record3   the in-process copy, and the one app_write_resume_snapshot()
+ *                    actually writes
+ *
+ * The main-menu Exit row is the ONE production writer that does NOT capture before it
+ * writes: the edge calls app_write_resume_snapshot() directly, so it writes whatever
+ * app->resume_record3 still holds -- a snapshot captured before the reset, with the old
+ * level, the old lives and b1 == 1. The reset deleted the file and the process kept the
+ * run in its pocket.
+ *
+ * WHY THE WINDOW CLOSE DID NOT SHOW IT, which is why this took a report to find. The
+ * ClientMessage edge captures FIRST, from the state the close interrupts. With no level
+ * loaded the capture guard in app_capture_resume_snapshot() takes the early return and
+ * writes b1 == 0, which is inert -- so closing the window after a reset is correct, and
+ * exiting by the row is not. Two exits, one behaviour, and the difference was invisible
+ * until both were driven.
+ *
+ * WHY THE FIX IS HERE AND NOT AT THE EXIT EDGE. app->resume_record3 is native's stand-in
+ * for Java's sticky K and J: BounceGame.java:256-259 runs destroyApp at the main menu,
+ * and destroyApp writes the LIVE K and J, which still say "in a level" because nothing
+ * cleared them when the player walked back to the menu. Writing the remembered snapshot
+ * is therefore a faithful reading of the source, and re-capturing at the Exit row would
+ * be a change to recovered behaviour that the Reset does not justify.
+ *
+ * The Reset, by contrast, is a NATIVE ADDITION with no Java counterpart, and it makes a
+ * promise the source never had to keep: the erased run cannot be resumed. It cannot keep
+ * that promise while a resumable copy is still in the process. Clearing the field here is
+ * the smallest change that makes the promise true on every exit path, present and future,
+ * instead of only on the ones that happen to capture first.
+ *
+ * The same memset is what makes the flag and the field agree: the flow's
+ * continue_available is already false, and this is the store-side and memory-side half of
+ * the same fact.
+ */
 static void app_apply_reset_to_default(BounceApp *app)
 {
     BouncePersistenceRecords records;
@@ -2549,6 +2598,12 @@ static void app_apply_reset_to_default(BounceApp *app)
     (void)bounce_persistence_save_theme_index(0);
     (void)bounce_persistence_save_t9_enabled(1);
     (void)bounce_persistence_delete_record3();
+    /*
+     * LAST, and deliberately after the deletions: this is the copy that would be
+     * written back, so clearing it before the store work would leave a window in which
+     * a failing delete could still be undone by an exit.
+     */
+    memset(&app->resume_record3, 0, sizeof app->resume_record3);
 }
 
 static void app_persist_theme(BounceApp *app)
@@ -31405,6 +31460,12 @@ static int verify_reset_to_default(void)
     bool records_ok;
     bool theme_ok;
     bool t9_ok;
+    /*
+     * STEP 38-RESET-FIX -- the in-memory copy and the Exit round trip below.
+     */
+    bool memory_cleared;
+    bool exit_stays_deleted;
+    bool relaunch_stays_greyed;
     int bad = 0;
     int32_t theme_after = -1;
     int32_t t9_after = -1;
@@ -31740,14 +31801,127 @@ static int verify_reset_to_default(void)
         bad++;
     }
 
+    /*
+     * STEP 38-RESET-FIX -- AND THE IN-MEMORY COPY, WHICH IS THE HALF THAT WAS MISSING.
+     *
+     * app->resume_record3 is a SECOND copy of the snapshot: it is what
+     * app_write_resume_snapshot() writes, and the main-menu Exit row calls that writer
+     * with no capture in front of it. So deleting the store record while this field
+     * still holds b1 == 1 leaves a resumable run in the process, and the next exit
+     * puts it back. Asserting only the store, as the first version of this check did,
+     * is exactly the gap the report came through.
+     *
+     * A deliberately distinctive payload, so "cleared" cannot be satisfied by a field
+     * that happens to be zero for some unrelated reason.
+     */
+    memory_cleared = app.resume_record3.b1 == BOUNCE_PERSISTENCE_RECORD3_B1_NONE
+        && app.resume_record3.level == 0u
+        && app.resume_record3.score == 0
+        && app.resume_record3.lives == 0;
+    if (!memory_cleared) {
+        fprintf(stderr,
+                "reset: the in-memory snapshot survived the reset"
+                " (b1=%u level=%u score=%d lives=%d)\n",
+                app.resume_record3.b1,
+                app.resume_record3.level,
+                app.resume_record3.score,
+                (int)app.resume_record3.lives);
+        bad++;
+    }
+
+    /*
+     * AND THEN THE EXIT ROW, WHICH IS WHERE IT WAS OBSERVED. Leaving the Reset page,
+     * walking to Exit and pressing it is the whole reported sequence. If the in-memory
+     * copy is still live the writer puts it straight back into the store, and the only
+     * way to see that is to read the store again afterwards -- so this is asserted, not
+     * assumed.
+     *
+     * NOTHING IS PLANTED HERE, and that is deliberate. An earlier version of this block
+     * re-seeded app->resume_record3 with a live snapshot after asserting it had been
+     * cleared, and then asserted the Exit row wrote nothing -- which cannot both be
+     * true and is not the reported scenario at all. The report is a player who reset,
+     * walked out and found Continue alive; the copy they had is the one the reset was
+     * supposed to destroy. So the sequence here is exactly theirs: confirm, leave, exit,
+     * relaunch.
+     *
+     * Planting a snapshot AFTER the reset would also be a weaker test, not a stronger
+     * one: it would pass for any implementation, because a field the player cannot set
+     * from the UI has no reason to be cleared by anything.
+     */
+    (void)bounce_app_flow_settings_back(&app.flow);
+    (void)bounce_app_flow_settings_back(&app.flow);
+    for (step = 0u; step < 9u; ++step)
+        (void)bounce_app_flow_menu_move(&app.flow, BOUNCE_MENU_DIRECTION_UP);
+    for (step = 0u; step < 9u; ++step)
+        (void)bounce_app_flow_menu_move(&app.flow, BOUNCE_MENU_DIRECTION_DOWN);
+    fill_key_event(&event, KeyPress, 36u, 1u, 100u);
+    if (x11_dispatch_event(&context, &app, &event, XK_Return) != 0
+        || app.flow.menu.pending_action != BOUNCE_MENU_ACTION_EXIT) {
+        fprintf(stderr,
+                "reset: could not reach the Exit row (state=%d pending=%d)\n",
+                (int)app.flow.state,
+                (int)app.flow.menu.pending_action);
+        bad++;
+    }
+    /*
+     * "NOT RESUMABLE", NOT "ABSENT". The Exit row writes app->resume_record3
+     * unconditionally, and after the fix that record is zeroed, so an all-zero
+     * Record 3 reappears in the file. That is inert, and inert is the same thing to
+     * every reader in the tree: app_refresh_continue_availability() requires
+     * `present && (b1 == B1_IN_LEVEL || b1 == B1_LEVEL_COMPLETE)`, and
+     * app_begin_resume_from_menu() refuses a record whose b1 is 0. So an absent record
+     * and an all-zero record are indistinguishable to the player, and insisting on
+     * absence here would be asserting a storage detail while missing the behaviour.
+     *
+     * What must not come back is a RESUMABLE one, so that is what is asserted.
+     */
+    exit_stays_deleted = bounce_persistence_load_record3(&back, &present) == 0
+        && (!present
+            || (back.b1 != BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL
+                && back.b1 != BOUNCE_PERSISTENCE_RECORD3_B1_LEVEL_COMPLETE));
+    if (!exit_stays_deleted) {
+        fprintf(stderr,
+                "reset: the Exit row wrote a RESUMABLE snapshot back"
+                " (present=%d b1=%u level=%u lives=%d)\n",
+                (int)present,
+                present ? back.b1 : 0u,
+                present ? back.level : 0u,
+                present ? (int)back.lives : 0);
+        bad++;
+    }
     bounce_game_shutdown(&app);
+
+    /*
+     * AND A RELAUNCH, because "absent from the store" and "greyed out on the menu" are
+     * different claims and only the second is what a player sees. A fresh app is booted
+     * against the same store and must report the row unavailable.
+     */
+    memset(&app, 0, sizeof app);
+    if (bounce_game_init(&app) != 0 || bounce_game_enter_menu(&app) != 0) {
+        fprintf(stderr, "reset: could not relaunch for the final check\n");
+        bad++;
+    } else {
+        app_restore_persisted_settings(&app);
+        app_refresh_continue_availability(&app);
+        relaunch_stays_greyed = !app.flow.menu.continue_available;
+        if (!relaunch_stays_greyed) {
+            fprintf(stderr,
+                    "reset: Continue is selectable again after a relaunch\n");
+            bad++;
+        }
+        bounce_game_shutdown(&app);
+    }
 
     if (bad == 0) {
         printf("RESET-TO-DEFAULT primed=levels9/high4321/theme5/audio-off"
                "/keypad-off/snapshot-live back=leaves-clean confirm=restored"
-               " record3=%s records=max_levels%d/high0 theme=0 keypad=1"
+               " record3=%s memory=%s exit_leaves_nothing_resumable=%s"
+               " relaunch=greyed"
+               " records=max_levels%d/high0 theme=0 keypad=1"
                " continue=off PASS\n",
                record3_gone ? "deleted" : "PRESENT",
+               memory_cleared ? "cleared" : "STALE",
+               exit_stays_deleted ? "yes" : "RESUMABLE",
                BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT);
     }
 
