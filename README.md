@@ -66,6 +66,46 @@ asset paths relative to it:
 ./native/app/bounce_vertical_slice
 ```
 
+## Where the save lives
+
+The store is one file, `records.bin`, resolved in this order:
+
+| order | path | when |
+| --- | --- | --- |
+| 1 | `$BOUNCE_SAVE_DIR/bounce/records.bin` | the override is set |
+| 2 | `$XDG_DATA_HOME/bounce/records.bin` | the standard |
+| 3 | `$HOME/.local/share/bounce/records.bin` | the standard's default |
+
+`--save=DIR` sets the same variable, before anything reads the store:
+
+```
+./native/app/bounce_vertical_slice --save=/tmp/bounce-scratch
+./native/app/bounce_vertical_slice --save=~/my-bounce-checkout
+```
+
+`BOUNCE_SAVE_DIR` takes the place of `XDG_DATA_HOME`, not the place of the
+file name, so the layout below it is the same either way. It exists for a
+checkout that should carry its own progress and for a throwaway instance that
+must not read the real save. It is not the default: a save outside
+`XDG_DATA_HOME` is one a package uninstall removes without asking.
+
+`--save=DIR` beats `BOUNCE_SAVE_DIR` when both are given, because a flag typed
+at a terminal is the more specific of the two. `DIR` does not have to exist:
+`DIR/bounce/` is created, including any missing parent directories.
+
+`--save-path` writes one throwaway record, prints where the store resolved to,
+and exits. It is how `--check` finds out which file a run would have written.
+
+```
+./native/app/bounce_vertical_slice --save-path
+./native/app/bounce_vertical_slice --save=/tmp/b --save-path
+```
+
+```
+make -C native/app run                     # the normal location
+XDG_DATA_HOME=/tmp/bounce-fresh   make -C native/app run                   # a clean install
+```
+
 ## Debug tracker (native, optional)
 
 `NBB_DEBUG` turns on the terminal debug tracker. It writes to **stderr** and

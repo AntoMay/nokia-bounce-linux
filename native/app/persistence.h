@@ -26,6 +26,7 @@
  *   record.
  *
  * FILE LOCATION
+ *   $BOUNCE_SAVE_DIR/bounce/records.bin, if that is set; otherwise
  *   $XDG_DATA_HOME/bounce/records.bin, falling back to
  *   $HOME/.local/share/bounce/records.bin. XDG_DATA_HOME is the standard
  *   per-user data location on Linux and is the closest native analogue of the
@@ -34,6 +35,19 @@
  *   BOUNCE_RESOURCE_ROOT ("src/main/resources", vertical_slice.c:32), which is
  *   read-only game data -- so a new location had to be chosen, and the standard
  *   one was chosen rather than a project-local path.
+ *
+ *   BOUNCE_SAVE_DIR IS AN OVERRIDE, NOT A DEFAULT, and it takes the place of
+ *   XDG_DATA_HOME rather than naming a file: the layout below it is unchanged,
+ *   so a caller who sets either variable gets the same shape of path. It exists
+ *   for the two cases the standard does not cover -- a checkout that should
+ *   carry its own progress, and a throwaway instance for testing a build
+ *   without reading the real save. main()'s --save=DIR sets the same variable,
+ *   before anything reads the store, because bounce_persistence_path() resolves
+ *   once and caches for the life of the process.
+ *
+ *   WHY NOT MAKE IT THE DEFAULT. A save that lives outside XDG_DATA_HOME is a
+ *   save that a package uninstall removes without asking, or that a user cannot
+ *   find after moving a machine. The override is opt-in for that reason.
  *
  * FAILURE POLICY
  *   Java's LoadRecords() catches every exception and leaves J = 0

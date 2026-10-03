@@ -375,9 +375,36 @@ static int record3_decode(const unsigned char *payload, uint32_t size,
 }
 
 /*
- * Resolve $XDG_DATA_HOME/bounce/records.bin, else $HOME/.local/share/bounce/.
- * Returns 0 and fills out, or -1 when neither variable is usable. out must have
- * room for BOUNCE_PERSISTENCE_PATH_MAX bytes.
+ * STEP SAVE-DIR -- Resolve the store, in this order:
+ *
+ *     $BOUNCE_SAVE_DIR/bounce/records.bin      an explicit override, if set
+ *     $XDG_DATA_HOME/bounce/records.bin        the XDG standard
+ *     $HOME/.local/share/bounce/records.bin    the XDG default
+ *
+ * WHY THE OVERRIDE IS A ROOT AND NOT A FILE PATH. It occupies exactly the position
+ * XDG_DATA_HOME already has, so the layout below it is unchanged and every existing
+ * test that repoints the store keeps working by setting either variable. Someone
+ * wanting the save beside a checkout writes BOUNCE_SAVE_DIR=/path/to/checkout and
+ * gets /path/to/checkout/bounce/records.bin -- the same shape XDG_DATA_HOME produces,
+ * which is one less thing to remember and one less way to be wrong.
+ *
+ * It is NOT a file name, deliberately. Allowing that would mean two variables with
+ * different shapes, and a caller who set the wrong one would silently get a file
+ * somewhere they did not look.
+ *
+ * main()'s --save=DIR flag sets this variable before anything reads the store, so the
+ * two are the same switch by two routes: a flag for a person at a terminal, an
+ * environment variable for a launcher, a desktop file or an AppRun. --save wins over a
+ * set BOUNCE_SAVE_DIR because main() overwrites it.
+ *
+ * WHY IT IS NOT THE DEFAULT. XDG_DATA_HOME is where a desktop user expects their data,
+ * and a save that wanders off it is a save that gets wiped by a package uninstall or
+ * never found after a move. The override exists for the cases the standard does not
+ * cover -- a portable checkout, a throwaway instance for testing a build, a shared
+ * install -- not to replace the rule.
+ *
+ * Returns 0 and fills out, or -1 when no variable is usable. out must have room for
+ * BOUNCE_PERSISTENCE_PATH_MAX bytes.
  */
 static int resolve_path(char *out, size_t out_size)
 {
@@ -387,7 +414,9 @@ static int resolve_path(char *out, size_t out_size)
     if (out == NULL || out_size == 0u)
         return -1;
 
-    root = getenv("XDG_DATA_HOME");
+    root = getenv("BOUNCE_SAVE_DIR");
+    if (root == NULL || root[0] == '\0')
+        root = getenv("XDG_DATA_HOME");
     if (root != NULL && root[0] != '\0')
         written = (size_t)snprintf(
             out, out_size, "%s/%s/%s", root, BOUNCE_PERSISTENCE_DIR,
@@ -637,24 +666,47 @@ int bounce_persistence_load_record3(BouncePersistenceRecord3 *out, bool *present
     return 0;
 }
 
-/* Ensure the parent directory exists. Shared by both save paths. */
+/*
+ * Ensure the parent directory exists. Shared by both save paths.
+ *
+ * EVERY LEVEL, NOT THE LAST TWO. mkdir() does not create its parents, so making just
+ * the final directory and the one above it only ever worked for the two shapes the
+ * default location has: $HOME/.local/share (with $HOME present) and a root given as
+ * $XDG_DATA_HOME (with its parent present). It broke the moment a caller named a path
+ * whose whole chain was new -- --save=DIR pointing at a directory that does not exist
+ * yet wrote nothing at all and reported only "could not write the save probe to ...",
+ * which names the file and not the reason.
+ *
+ * WHY IT STILL DOES NOT REPORT MKDIR FAILURES. The contract is unchanged from the
+ * version this replaces: a directory that cannot be created is not an error here, it is
+ * an error at open() time, and the caller already treats a failed write as "keep the
+ * documented defaults" (see FAILURE POLICY in persistence.h). Turning this into a real
+ * return code would change which errors are fatal and which are survivable, and none of
+ * that is what this change is about.
+ *
+ * The walk starts one byte in so the leading '/' is never passed to mkdir as an empty
+ * string. It stops at the end of the buffer, so a truncated copy cannot walk off it.
+ */
 static int ensure_directory(const char *path)
 {
     char dir[BOUNCE_PERSISTENCE_PATH_MAX];
-    char *last_slash;
+    char *cursor;
 
-    (void)snprintf(dir, sizeof dir, "%s", path);
-    last_slash = strrchr(dir, '/');
-    if (last_slash == NULL)
+    if (path == NULL
+        || snprintf(dir, sizeof dir, "%s", path) >= (int)sizeof dir)
         return -1;
-    *last_slash = '\0';
-    (void)mkdir(dir, 0777);
-    /* A second level (.local/share) may also be absent on a fresh account. */
-    last_slash = strrchr(dir, '/');
-    if (last_slash != NULL && last_slash != dir) {
-        *last_slash = '\0';
+    cursor = strrchr(dir, '/');
+    if (cursor == NULL)
+        return -1;
+    *cursor = '\0';
+    for (cursor = dir + 1; *cursor != '\0'; cursor++) {
+        if (*cursor != '/')
+            continue;
+        *cursor = '\0';
         (void)mkdir(dir, 0777);
+        *cursor = '/';
     }
+    (void)mkdir(dir, 0777);
     return 0;
 }
 

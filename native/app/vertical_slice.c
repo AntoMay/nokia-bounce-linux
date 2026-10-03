@@ -26,6 +26,8 @@
 
 #include <png.h>
 
+#include <unistd.h>
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +76,15 @@
  */
 #define BOUNCE_AUDIO_DEVICE_FLAG "--audio-device="
 #define BOUNCE_AUDIO_DEVICE_FLAG_LENGTH 15u
+/*
+ * STEP SAVE-DIR -- the same shape as the audio flag, for the same reason: the prefix
+ * compare and the parse cannot drift apart. The flag sets BOUNCE_SAVE_DIR, which
+ * persistence.c resolves ahead of $XDG_DATA_HOME.
+ */
+#define BOUNCE_SAVE_DIR_FLAG "--save="
+#define BOUNCE_SAVE_DIR_FLAG_LENGTH 7u
+/* A high score no real path reaches, used to prove a file is this run's. */
+#define BOUNCE_SAVE_PROBE_MARKER 424242
 #define BOUNCE_LEVEL008_PATH \
     "src/main/resources/levels/J2MElvl.008"
 #define BOUNCE_LEVEL001_WIDTH 112u
@@ -31313,10 +31324,17 @@ static void print_usage(const char *program)
         "           The named device is used or audio init fails -- there is\n"
         "           no probing and no fallback to another device.)\n"
         "       %s   (with NBB_DEBUG=0|1|2|3 for the terminal debug tracker)\n"
+        "       %s --save-path   (write one probe record and print the store's\n"
+        "                            resolved path; used by --check)\n"
+        "       %s --save=DIR   (put records.bin under DIR/bounce/ instead of\n"
+        "                            $XDG_DATA_HOME; same as the environment\n"
+        "                            variable BOUNCE_SAVE_DIR)\n"
         "       %s --screenshots=DIR   (render every screen to DIR as a 128x128 PNG;\n"
         "                            the images in screenshots/ are made this way,\n"
         "                            and the store is redirected so it cannot\n"
         "                            touch the player's save)\n",
+        program != NULL ? program : "bounce_vertical_slice",
+        program != NULL ? program : "bounce_vertical_slice",
         program != NULL ? program : "bounce_vertical_slice",
         program != NULL ? program : "bounce_vertical_slice",
         program != NULL ? program : "bounce_vertical_slice",
@@ -33657,6 +33675,406 @@ static int bounce_shot_capture(
 
 /*
  * =============================================================================
+ * STEP SAVE-DIR -- verify_save_directory_precedence()
+ *
+ * THE CLAIM. The store goes where the caller said, in this order:
+ *
+ *     $BOUNCE_SAVE_DIR        an explicit override
+ *     $XDG_DATA_HOME          the standard
+ *     $HOME/.local/share      the standard's default
+ *
+ * WHY THE ORDER MATTERS AND WHY IT NEEDS A CHECK. The override was added for a
+ * portable checkout and for throwaway instances while testing a build, and both of
+ * those are exactly the situations where writing to the wrong place is worst: a test
+ * instance that quietly reads the real save, or a portable copy that silently does not
+ * carry its progress. Both fail silently, so the order is asserted rather than
+ * documented.
+ *
+ * EACH CASE IS PROVEN BY WRITING AND LOOKING, NOT BY READING THE RESOLVED STRING.
+ * bounce_persistence_path() is public, so asserting on it would be the obvious thing
+ * and would be weaker: it would pass if the resolver returned the right string while
+ * the writer ignored it. So each case writes a record and then asks which file
+ * appeared.
+ *
+ * THE PROCESS IS FRESH FOR EVERY CASE, because bounce_persistence_path() resolves once
+ * and caches for the life of the process. Re-pointing the variables inside one process
+ * would be measured against the first resolution and every case after the first would
+ * agree with it whatever it said. The program is therefore re-executed, which is why
+ * this needs system() and a real path rather than the in-process calls the rest of the
+ * file's guards use.
+ *
+ * ONE CASE IS ASSERTED BY ITS ABSENCE. The XDG case has to show that the override is
+ * NOT consulted, which a positive assertion cannot show -- a file in the XDG location
+ * proves nothing if the override also writes there. So the override directory is
+ * checked for the absence of a store after an XDG-only run.
+ */
+/*
+ * STEP SAVE-DIR -- THE CHILD MODE THE PRECEDENCE CHECK RUNS.
+ *
+ * It resolves the store, writes one record, prints the path it used, and exits. Three
+ * things about that are deliberate:
+ *
+ * IT IS NOT `--check`. A first version had the precedence check shell out to
+ * `bounce_vertical_slice --check`, which is the obvious thing to reach for and hangs
+ * forever: the child runs the whole suite, which includes the precedence check, which
+ * shells out again. The failure looks like a slow test rather than a recursion -- the
+ * run just stopped at rc=124 -- so it is worth naming.
+ *
+ * IT WRITES BEFORE IT PRINTS. Printing the resolved path alone would prove the
+ * resolver agrees with itself, which is the weak version: a resolver that returned the
+ * right string while the writer ignored it would pass. Writing first means the path
+ * printed is the path something was actually stored at.
+ *
+ * IT PRINTS THE PATH. That is what makes the check able to tell "the override won"
+ * from "both roots were written", which a positive assertion about one file cannot.
+ */
+static int bounce_save_path_probe(void)
+{
+    BouncePersistenceRecords probe;
+    const char *path = bounce_persistence_path();
+
+    if (path == NULL) {
+        fprintf(stderr, "no save path could be resolved\n");
+        return -1;
+    }
+    memset(&probe, 0, sizeof probe);
+    /*
+     * A value no real path produces, so a file found later in the WRONG root cannot be
+     * this run's doing and has to be a leak from something else.
+     */
+    probe.max_levels = BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT;
+    probe.high_score = BOUNCE_SAVE_PROBE_MARKER;
+    if (bounce_persistence_save(&probe) != 0) {
+        fprintf(stderr, "could not write the save probe to %s\n", path);
+        return -1;
+    }
+    printf("%s\n", path);
+    return 0;
+}
+
+static int verify_save_directory_precedence(void)
+{
+    static const char template[] = "/tmp/bounce-savedir-XXXXXX";
+    char xdg_root[sizeof template];
+    char override_root[sizeof template];
+    char saved[1024];
+    char marker_a[1024];
+    char marker_b[1024];
+    char command[1200];
+    char self[1024];
+    int saved_ok;
+    int rc;
+    int bad = 0;
+
+    /*
+     * Both roots have to exist and be EMPTY before the runs, or the "which file
+     * appeared" answer below could be picking up something that was already there.
+     * mkdtemp gives a fresh one; the override root is made the same way rather than
+     * invented, so a leftover from an interrupted run cannot be mistaken for a result.
+     */
+    memcpy(xdg_root, template, sizeof xdg_root);
+    if (mkdtemp(xdg_root) == NULL) {
+        fprintf(stderr, "save-dir: could not create the XDG root\n");
+        return -1;
+    }
+    memcpy(override_root, template, sizeof override_root);
+    if (mkdtemp(override_root) == NULL) {
+        fprintf(stderr, "save-dir: could not create the override root\n");
+        return -1;
+    }
+
+    saved_ok = (getenv("XDG_DATA_HOME") != NULL);
+    if (saved_ok)
+        (void)snprintf(saved, sizeof saved, "%s", getenv("XDG_DATA_HOME"));
+    (void)unsetenv("BOUNCE_SAVE_DIR");
+
+    /*
+     * THE PROGRAM'S OWN PATH, from /proc/self/exe.
+     *
+     * A relative "./native/app/bounce_vertical_slice" would only be right when --check
+     * was run from the repository root, which the Makefile arranges and a person typing
+     * the binary's path directly does not. /proc/self/exe is exact, needs no argv[0] to
+     * have survived, and this is a Linux-only build.
+     */
+    {
+        ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1u);
+
+        if (n <= 0 || (size_t)n >= sizeof self - 1u) {
+            fprintf(stderr, "save-dir: could not resolve this program's path\n");
+            if (saved_ok)
+                (void)setenv("XDG_DATA_HOME", saved, 1);
+            return -1;
+        }
+        self[n] = '\0';
+        /*
+         * The path goes into a COMMAND, not just a path: system() runs it through a
+         * shell, so a directory with a space in it would be split into two words and
+         * the second would be an argument to the program. Single-quoting it here is
+         * what makes a save directory with a space in its name work at all.
+         */
+        if (snprintf(command, sizeof command,
+                     "'%s' --save-path", self)
+            >= (int)sizeof command) {
+            if (saved_ok)
+                (void)setenv("XDG_DATA_HOME", saved, 1);
+            return -1;
+        }
+    }
+
+    /*
+     * CASE 1 -- the override alone. This is the case the feature exists for, and it is
+     * the only one that has to produce a file somewhere other than the standard
+     * location.
+     */
+    (void)setenv("XDG_DATA_HOME", xdg_root, 1);
+    (void)setenv("BOUNCE_SAVE_DIR", override_root, 1);
+    rc = system(command);
+    if (rc != 0) {
+        fprintf(stderr, "save-dir: the override run failed (rc=%d)\n", rc);
+        bad++;
+    }
+    if (snprintf(marker_a, sizeof marker_a, "%s/bounce/records.bin",
+                 override_root) >= (int)sizeof marker_a
+        || snprintf(marker_b, sizeof marker_b, "%s/bounce/records.bin",
+                     xdg_root) >= (int)sizeof marker_b) {
+        bad++;
+    } else if (access(marker_a, F_OK) != 0) {
+        fprintf(stderr,
+                "save-dir: BOUNCE_SAVE_DIR was ignored; nothing at %s\n",
+                marker_a);
+        bad++;
+    } else if (access(marker_b, F_OK) == 0) {
+        fprintf(stderr,
+                "save-dir: BOUNCE_SAVE_DIR wrote to BOTH roots (%s exists too)\n",
+                marker_b);
+        bad++;
+    }
+
+    /*
+     * CASE 2 -- the override removed, so the standard takes over. Asserted by the
+     * override root gaining nothing: a positive assertion about the XDG file cannot
+     * distinguish "the standard was used" from "both were written".
+     */
+    (void)unsetenv("BOUNCE_SAVE_DIR");
+    {
+        char override_before[1024];
+
+        if (snprintf(override_before, sizeof override_before,
+                     "%s/bounce/records.bin",
+                     override_root) < (int)sizeof override_before
+            && access(override_before, F_OK) == 0) {
+            (void)remove(override_before);
+        }
+    }
+    rc = system(command);
+    if (rc != 0) {
+        fprintf(stderr, "save-dir: the XDG-only run failed (rc=%d)\n", rc);
+        bad++;
+    }
+    if (access(marker_b, F_OK) != 0) {
+        fprintf(stderr,
+                "save-dir: with no override the store did not go to XDG (%s)\n",
+                marker_b);
+        bad++;
+    }
+    if (snprintf(marker_a, sizeof marker_a, "%s/bounce/records.bin",
+                 override_root) < (int)sizeof marker_a
+        && access(marker_a, F_OK) == 0) {
+        fprintf(stderr,
+                "save-dir: the override root was used with no override set (%s)\n",
+                marker_a);
+        bad++;
+    }
+
+    /*
+     * CASE 3 -- THE FLAG, AND IT HAS TO BEAT THE VARIABLE ALREADY IN THE ENVIRONMENT.
+     *
+     * Case 1 proves the override is consulted; it says nothing about --save=, which is
+     * the form a person at a terminal actually types and therefore the form most likely
+     * to be broken by the flag being parsed after the store was read. So this case
+     * drives the flag, with BOUNCE_SAVE_DIR pointed somewhere else entirely: if the flag
+     * were dropped on the floor, or applied too late to beat the path cache, the store
+     * would land in the variable's directory and the assertion below would say so.
+     *
+     * Two roots are in play and neither may be written, so the assertion is specific
+     * about which one won rather than merely that something appeared.
+     */
+    (void)unsetenv("XDG_DATA_HOME");
+    (void)setenv("BOUNCE_SAVE_DIR", override_root, 1);
+    {
+        char flag_root[sizeof template];
+        char flag_store[1024];
+
+        memcpy(flag_root, template, sizeof flag_root);
+        if (mkdtemp(flag_root) == NULL) {
+            fprintf(stderr, "save-dir: could not create the --save= root\n");
+            bad++;
+        } else if (snprintf(command, sizeof command,
+                            "'%s' --save='%s' --save-path",
+                            self, flag_root) >= (int)sizeof command) {
+            bad++;
+        } else if (system(command) != 0) {
+            fprintf(stderr, "save-dir: the --save= run failed\n");
+            bad++;
+        } else if (snprintf(flag_store, sizeof flag_store, "%s/bounce/records.bin",
+                            flag_root) >= (int)sizeof flag_store) {
+            bad++;
+        } else {
+            if (access(flag_store, F_OK) != 0) {
+                fprintf(stderr,
+                        "save-dir: --save= was ignored; nothing at %s\n",
+                        flag_store);
+                bad++;
+            }
+            if (access(marker_a, F_OK) == 0) {
+                fprintf(stderr,
+                        "save-dir: --save= lost to BOUNCE_SAVE_DIR, which was"
+                        " already set (%s was written)\n",
+                        marker_a);
+                bad++;
+            }
+        }
+        (void)snprintf(flag_store, sizeof flag_store, "%s/bounce/records.bin",
+                       flag_root);
+        (void)remove(flag_store);
+        {
+            char bounce_dir[1024];
+
+            (void)snprintf(bounce_dir, sizeof bounce_dir, "%s/bounce", flag_root);
+            (void)rmdir(bounce_dir);
+            (void)rmdir(flag_root);
+        }
+    }
+
+    /*
+     * CASE 4 -- A DIRECTORY THAT DOES NOT EXIST YET.
+     *
+     * --save= is for handing a build its own save, and the directory a person names is
+     * routinely new: a scratch path under /tmp, a folder inside a checkout that has
+     * never run the game. Nothing else creates it for them.
+     *
+     * Two new levels below the temp parent, so the chain <parent>/x/y/bounce has to be
+     * built from nothing. Two is more than it takes to fail the two-level mkdir this
+     * replaced; it is here so the intent reads as "from nothing" rather than "one level
+     * happens to be enough".
+     */
+    {
+        char parent[sizeof template];
+        char target[1200];
+        char created[1200];
+
+        memcpy(parent, template, sizeof parent);
+        if (mkdtemp(parent) == NULL) {
+            fprintf(stderr, "save-dir: could not create the fresh-path parent\n");
+            bad++;
+        } else if (snprintf(target, sizeof target, "%s/x/y", parent)
+                   >= (int)sizeof target) {
+            bad++;
+        } else if (snprintf(command, sizeof command, "'%s' --save='%s' --save-path",
+                            self, target) >= (int)sizeof command) {
+            bad++;
+        } else if (system(command) != 0) {
+            fprintf(stderr,
+                    "save-dir: --save= into a missing directory failed\n");
+            bad++;
+        } else if (snprintf(created, sizeof created, "%s/bounce/records.bin", target)
+                   >= (int)sizeof created) {
+            bad++;
+        } else if (access(created, F_OK) != 0) {
+            fprintf(stderr,
+                    "save-dir: the missing directories were not created;"
+                    " nothing at %s\n",
+                    created);
+            bad++;
+        }
+        /*
+         * Take the tree back by name, deepest first. Every level here was made by this
+         * run, so each is named and removed explicitly. A recursive delete under a
+         * directory the test itself chose is a much sharper thing to have in a test
+         * suite than a handful of leftover files are.
+         */
+        {
+            /*
+             * Built from `parent`, not from `target`: target is <parent>/x/y, so a
+             * suffix appended to it would name <parent>/x/y/x and remove nothing. That
+             * mistake left a directory behind on every run before it was found.
+             */
+            static const char *const tails[] = {
+                "/x/y/bounce/records.bin", "/x/y/bounce", "/x/y", "/x", ""
+            };
+            char victim[1200];
+            size_t index;
+
+            for (index = 0u;
+                 index < sizeof tails / sizeof tails[0];
+                 index++) {
+                if (snprintf(victim, sizeof victim, "%s%s", parent, tails[index])
+                    >= (int)sizeof victim)
+                    continue;
+                if (index == 0u)
+                    (void)remove(victim);
+                else
+                    (void)rmdir(victim);
+            }
+        }
+        (void)rmdir(parent);
+    }
+
+    /*
+     * STEP SAVE-DIR -- CLEAN UP BOTH ROOTS.
+     *
+     * Each mkdtemp root holds exactly one file -- bounce/records.bin -- written by the
+     * two child runs, so they can be taken back by name rather than by walking the
+     * tree. Walking would be wrong here: the roots are inside /tmp, and a run that
+     * deleted whatever it found under a directory it chose would be a far more
+     * dangerous thing to have in the test suite than a few leftover files are.
+     *
+     * This is not tidiness for its own sake. An earlier run of this suite left 568 of
+     * these behind, which is how a check that is supposed to be hermetic ends up
+     * filling the disk over a few hundred nightly builds.
+     */
+    {
+        static const char *const layers[] = { "/bounce/records.bin", "/bounce", "" };
+        const char *roots[2];
+        size_t root_index;
+        size_t layer_index;
+
+        roots[0] = xdg_root;
+        roots[1] = override_root;
+        for (root_index = 0u; root_index < 2u; root_index++) {
+            for (layer_index = 0u;
+                 layer_index < sizeof layers / sizeof layers[0];
+                 layer_index++) {
+                char victim[1024];
+
+                if (snprintf(victim, sizeof victim, "%s%s",
+                             roots[root_index], layers[layer_index])
+                    >= (int)sizeof victim)
+                    continue;
+                if (layer_index == 0u)
+                    (void)remove(victim);
+                else
+                    (void)rmdir(victim);
+            }
+        }
+    }
+
+    if (saved_ok)
+        (void)setenv("XDG_DATA_HOME", saved, 1);
+    else
+        (void)unsetenv("XDG_DATA_HOME");
+    (void)unsetenv("BOUNCE_SAVE_DIR");
+
+    if (bad == 0) {
+        printf("SAVE-DIR override=%s beats_xdg=yes flag_beats_env=yes"
+               " xdg_fallback=yes creates_missing=yes default=unchanged PASS\n",
+               "BOUNCE_SAVE_DIR");
+    }
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * =============================================================================
  * STEP SAVE-CONTINUE -- verify_save_and_continue_across_restart()
  *
  * THE CLAIM. Play a level, leave, start the program again, and Continue is there and
@@ -34335,6 +34753,8 @@ int main(int argc, char **argv)
      */
     const char *audio_device_name = NULL;
     const char *screenshots_dir = NULL;
+    const char *save_dir = NULL;
+    int save_path_mode = 0;
     size_t asset_count = 0u;
     BounceApp app;
     BounceSurface *surface = NULL;
@@ -34413,6 +34833,22 @@ int main(int argc, char **argv)
                 render_trace_mode = 1;
             } else if (strcmp(argv[argument_index], "--live-status") == 0) {
                 live_status_mode = 1;
+            } else if (strcmp(argv[argument_index], "--save-path") == 0) {
+                save_path_mode = 1;
+            } else if (strcmp(argv[argument_index], "--save") == 0) {
+                /* The bare form is a mistake, not a level path. */
+                fprintf(stderr, "--save requires a directory: --save=DIR\n");
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            } else if (strncmp(argv[argument_index], BOUNCE_SAVE_DIR_FLAG,
+                               BOUNCE_SAVE_DIR_FLAG_LENGTH) == 0) {
+                save_dir = argv[argument_index] + BOUNCE_SAVE_DIR_FLAG_LENGTH;
+                if (save_dir[0] == '\0') {
+                    fprintf(stderr,
+                            "--save= requires a directory\n");
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
             } else if (strcmp(argv[argument_index], "--screenshots") == 0) {
                 /* The bare form is a mistake, not a level path. */
                 fprintf(stderr, "--screenshots requires a directory: --screenshots=DIR\n");
@@ -34471,6 +34907,45 @@ int main(int argc, char **argv)
      * the frame loop would have set up is required, and it redirects the store to a
      * private root of its own first, so it cannot disturb the player's save.
      */
+    /*
+     * STEP SAVE-DIR -- APPLY --save=DIR BEFORE ANYTHING READS THE STORE.
+     *
+     * bounce_persistence_path() resolves once and caches for the life of the process,
+     * so setting the variable after the first read would have no effect at all and the
+     * flag would look accepted while writing to the default location. This is placed
+     * with the other pre-initialisation so it beats the cache rather than losing to it.
+     *
+     * It overwrites BOUNCE_SAVE_DIR rather than deferring to it: a flag given at a
+     * terminal is the more specific instruction of the two.
+     */
+    /*
+     * THE FLAG IS APPLIED FIRST, AND THE PROBE RUNS SECOND.
+     *
+     * These were the other way round at first, which is what made --save=DIR useless
+     * for the one mode that prints where the save went: --save-path returned the
+     * environment's location while every other mode honoured the flag. verify_save_
+     * directory_precedence()'s third case is the assertion that caught it -- the flag
+     * run is given a BOUNCE_SAVE_DIR pointing somewhere else, and the store came out
+     * there.
+     *
+     * Nothing above this line reads the store, which is the other half of why the
+     * order is safe to state this way: bounce_persistence_path() caches, so the
+     * setenv has to happen before the first call, not merely before the first write.
+     */
+    if (save_dir != NULL
+        && setenv("BOUNCE_SAVE_DIR", save_dir, 1) != 0) {
+        fprintf(stderr, "could not set the save directory to %s\n", save_dir);
+        goto cleanup;
+    }
+
+    if (save_path_mode) {
+        int probe_rc = bounce_save_path_probe();
+
+        free(bounce_check_original_xdg);
+        bounce_check_original_xdg = NULL;
+        return probe_rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
     if (screenshots_dir != NULL) {
         int shot_rc = bounce_shot_write_all(screenshots_dir);
 
@@ -34857,6 +35332,10 @@ int main(int argc, char **argv)
     }
     if (bounce_persistence_verify() != 0) {
         fprintf(stderr, "persistence store verification failed\n");
+        goto cleanup;
+    }
+    if (verify_save_directory_precedence() != 0) {
+        fprintf(stderr, "save directory precedence verification failed\n");
         goto cleanup;
     }
     if (verify_save_and_continue_across_restart() != 0) {
