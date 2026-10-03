@@ -2499,6 +2499,58 @@ static void app_commit_t9_change(BounceApp *app, bool enabled_before)
     app_persist_t9_setting(app);
 }
 
+/*
+ * STEP 38-RESET -- carry out a confirmed Reset to Default.
+ *
+ * THE FLOW LAYER HAS ALREADY RESET ITS OWN STATE by the time this runs;
+ * bounce_app_flow_reset_to_default() did that and raised the one-shot flag. What is
+ * left is everything the flow cannot do, because it performs no I/O: the store.
+ *
+ * FIVE WRITES, IN THIS ORDER, AND THE ORDER MATTERS.
+ *
+ *   1, 2  the unlocked-level count and the high score, from the values the flow has
+ *          already restored. Written first so that a failure here cannot leave a
+ *          reset Continue pointing at levels the player has just lost.
+ *   4     the color profile, index 0 -- the default profile.
+ *   5     the keypad setting, ON. Non-zero is written rather than removing the
+ *          record, because the default is now ON and absence still reads as OFF: a
+ *          reset that deleted record 5 would leave a fresh install reporting no
+ *          keypad, which is the opposite of what was just confirmed.
+ *   3     the Continue snapshot, DELETED LAST.
+ *
+ * Record 3 is last on purpose. It is the only write here that removes something, and
+ * it is the one whose absence is what makes Continue unavailable -- so if anything
+ * above fails, the snapshot survives and the menu keeps offering the resume it
+ * already had, which is a stale-but-working Continue rather than a reset that looks
+ * complete and is not.
+ *
+ * WHY IT DOES NOT CALL app_refresh_continue_availability(). That function is guarded
+ * on BOUNCE_APP_STATE_MENU and this runs while the flow is in SETTINGS. It does not
+ * need to: the row is re-derived from the store on every menu arrival, and with
+ * Record 3 gone that read reports unavailable. Forcing the flag here as well would be
+ * a second writer for a field the refresh owns.
+ *
+ * EVERY WRITE IGNORES ITS RESULT, for the reason app_persist_theme() gives and for
+ * the same reason Java does: WriteToStore() swallows its IOException
+ * (BounceGame.java:413-414). A reset that could not be saved must not interrupt the
+ * game; the flow state is already correct either way, so the visible session matches
+ * what the player asked for even if the store lags.
+ */
+static void app_apply_reset_to_default(BounceApp *app)
+{
+    BouncePersistenceRecords records;
+
+    if (app == NULL)
+        return;
+    records.max_levels
+        = (int32_t)bounce_app_flow_available_level_count(&app->flow);
+    records.high_score = (int32_t)bounce_app_flow_high_score(&app->flow);
+    (void)bounce_persistence_save(&records);
+    (void)bounce_persistence_save_theme_index(0);
+    (void)bounce_persistence_save_t9_enabled(1);
+    (void)bounce_persistence_delete_record3();
+}
+
 static void app_persist_theme(BounceApp *app)
 {
     if (app == NULL)
@@ -7842,15 +7894,57 @@ static int app_begin_canonical_gameplay(BounceApp *app)
 /*
  * Drive the canonical tick from the frame loop.
  *
- * The existing verified 40 ms timer remains authoritative. This is the platform
- * backend deciding WHEN to fire it: it fires at most once per frame, advances the
- * deadline by exactly one period, and therefore never produces a catch-up burst
- * and never accumulates missed ticks. There is no second timer, scheduler,
- * accumulator, delta-time, or Tick function.
+ * The existing verified 40 ms timer remains authoritative: BounceTimer.java:17
+ * schedules `this` with `schedule(this, 0L, 40L)`, i.e. a 40 ms FIXED-DELAY
+ * period, ~25 Hz. This is the platform backend deciding WHEN to fire it, and the
+ * deadline arithmetic below is what makes the achieved cadence match that period
+ * instead of merely being bounded by it.
+ *
+ * WHY THE DEADLINE ADVANCES FROM THE PREVIOUS DEADLINE, NOT FROM `now`
+ *   `now` is sampled once per RENDERED FRAME, and sleep_frame() is 16 ms, so `now`
+ *   is quantised to the frame grid. Setting `next = now + PERIOD` therefore adds a
+ *   fresh 0..16 ms of quantisation error to EVERY tick and never removes it: the
+ *   error accumulates and the game runs permanently slow. Measured over 60 s of
+ *   simulated 16 ms frames, that shape yields 1250 ticks, an average period of
+ *   48.00 ms and an effective 20.8 Hz -- a 17% shortfall against the source's
+ *   25 Hz, and one that silently scales gravity, jump height and every other
+ *   per-tick constant in f.java. It is not a rounding artefact; it is the game
+ *   running in slow motion.
+ *
+ *   Advancing by exactly one period from the PREVIOUS DEADLINE makes the period an
+ *   identity rather than a bound: the same 60 s yields 1500 ticks, an average
+ *   period of 40.00 ms and exactly 25.0 Hz. The quantisation error stays bounded
+ *   by one frame, but it stops accumulating. This is the drift-free accumulator
+ *   discipline the PSP reference port uses in main.c; what is kept from the source
+ *   is the 40 ms period itself, which that port sets to 30 ms.
+ *
+ * WHY THERE IS STILL NO CATCH-UP BURST
+ *   Java's `schedule(task, delay, period)` is FIXED-DELAY, not fixed-rate: the next
+ *   run is scheduled `period` after the previous one COMPLETES, so a late run
+ *   delays the next one instead of firing a backlog. A java.util.TimerTask also
+ *   runs on a single thread, so it cannot overlap itself. The resync branch below
+ *   reproduces that exactly: after a stall longer than one period (a debugger
+ *   break, a swapped-out process, a suspended window) the missed deadlines are
+ *   DISCARDED and the next deadline is placed one period from `now`, which is
+ *   what Java computes at completion time. It is not an accumulator and not a
+ *   replay loop: at most one tick runs per frame, so `app_timer_callback_dispatch()`
+ *   is entered at most once per call and the self-test's one-dispatch-per-frame
+ *   invariant still holds.
+ *
+ *   With lateness strictly below one period -- every tick in normal operation --
+ *   the resync branch is not taken and the deadline walks forward one period at a
+ *   time, so the cadence is exact. It is taken only when the deadline would
+ *   already be in the past, which is precisely the backlog condition.
+ *
+ * NOTHING ELSE CHANGES: the period constant, the timer object and its counters,
+ * the Tick dispatch, the physics continuation, the legacy route and every
+ * self-test contract are untouched, and the deadline still sits at most one
+ * period ahead of and at most one period behind the clock.
  */
 static int app_run_canonical_gameplay_tick(BounceApp *app)
 {
     int64_t now;
+    int64_t next;
     BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
 
     if (app == NULL)
@@ -7862,7 +7956,15 @@ static int app_run_canonical_gameplay_tick(BounceApp *app)
         app->canonical_next_tick_ms = now;
     if (now < app->canonical_next_tick_ms)
         return 0;
-    app->canonical_next_tick_ms = now + BOUNCE_GAME_TIMER_PERIOD_MS;
+    /*
+     * One period forward from the previous deadline, then the fixed-delay resync.
+     * See the header comment: the first line is what removes the drift, the second
+     * is what keeps a stall from turning into a burst.
+     */
+    next = app->canonical_next_tick_ms + BOUNCE_GAME_TIMER_PERIOD_MS;
+    if (next <= now)
+        next = now + BOUNCE_GAME_TIMER_PERIOD_MS;
+    app->canonical_next_tick_ms = next;
     return app_timer_callback_dispatch(app, &branch);
 }
 
@@ -8209,6 +8311,80 @@ static void app_write_resume_snapshot(BounceApp *app)
         return;
     app->resume_record3.timestamp_millis = app_wall_clock_millis();
     (void) bounce_persistence_save_record3(&app->resume_record3);
+}
+
+/*
+ * STEP G-R3-T2-FIX -- PUBLISH THE CAPTURED SNAPSHOT WHEN A SESSION ENDS.
+ *
+ * THE DEFECT THIS CLOSES, STATED AS THE SEQUENCE IT PRODUCED.
+ *
+ *   Record 3 was written in exactly two places in the whole program: the explicit
+ *   main-menu Exit row and the window close. Both are application teardown. Every
+ *   OTHER way a session can end -- walking out of gameplay with the Escape key,
+ *   accepting the Game Over or Game End form -- captured the snapshot into
+ *   app->resume_record3 and then threw it away, because the capture is a pure
+ *   in-memory read and only app_write_resume_snapshot() performs the store write.
+ *
+ *   The availability refresh immediately afterwards re-reads the store, not the
+ *   capture, so on those edges it derived Continue from whatever the LAST teardown
+ *   had written. The observable result is the reported one: die on level 3, press
+ *   OK, and the main menu still offers Continue -- pointing at level 2, because
+ *   level 2 is what the previous exit happened to save. The run that had just ended
+ *   was still resumable and the level it belonged to was wrong.
+ *
+ * WHY JAVA DOES NOT SHOW THIS, AND WHY THAT IS NOT AN EXCUSE.
+ *
+ *   In the original the invalidation is a pair of in-memory assignments, not a
+ *   store write:
+ *
+ *     BounceGame.java:431-432   TODO_ShowInstructions: this.K = 3; this.J = 0;
+ *     BounceGame.java:116       ShowMainMenu appends Continue only when
+ *                               `K == 1 || J == 1 || J == 2`
+ *
+ *   so the latch J is cleared the moment the terminal form appears and ShowMainMenu
+ *   simply never appends the row. Record 3 on disk is left alone, and it does not
+ *   matter, because nothing consults it again in that session.
+ *
+ *   Native has no J latch. Its Continue availability is RE-DERIVED FROM THE STORE on
+ *   every menu arrival (app_refresh_continue_availability), which is a deliberate
+ *   choice -- it is why a Continue written by a previous launch is honoured at all.
+ *   The consequence is that the store, not a field, is the thing that has to be
+ *   brought up to date at the transition, because it is the store the next arrival
+ *   will read. Java can afford to defer its write to destroyApp; native cannot
+ *   defer it past the point where the session ends.
+ *
+ * WHAT IS WRITTEN. Whichever record the capture just produced, unchanged. That
+ * preserves every b1 case the capture already distinguishes, so the four endings
+ * each get the right behaviour with no new state and no new branch here:
+ *
+ *   GAMEPLAY, lives >= 0   b1 = 1   Continue resumes this level at this position
+ *                                   with these lives -- the "save while you still
+ *                                   have lives" case, kept fresh on every exit.
+ *   LEVEL_COMPLETE         b1 = 2   Continue restarts the NEXT level from its
+ *                                   beginning, carrying score and lives (the R2
+ *                                   record-continue route).
+ *   GAME_OVER / GAME_END   b1 = 0   INERT. The refresh that follows reads it and
+ *                                   reports Continue unavailable, which is the
+ *                                   requested behaviour: after a game over the only
+ *                                   way back in is New Game, and from there Level
+ *                                   Select offers the levels already unlocked.
+ *   no session owned       zeroed record, also inert -- "never played".
+ *
+ * WHY IT IS NOT DONE PER TICK. This runs on a screen transition, at most once per
+ * arrival at the menu, and the payload is a few hundred bytes at most. Writing it
+ * every tick would be a filesystem write 25 times a second for a value that only
+ * changes when the player leaves a level.
+ *
+ * IT IS NOT FATAL IF IT FAILS, for the reason given on app_write_resume_snapshot():
+ * a failed write leaves the previous record in place, and the refresh then reads
+ * that. That is a stale-Continue rather than a crash, which is the same failure
+ * mode the game already had.
+ */
+static void app_persist_resume_snapshot_for_continue(BounceApp *app)
+{
+    if (app == NULL)
+        return;
+    app_write_resume_snapshot(app);
 }
 
 /*
@@ -10268,9 +10444,54 @@ static int verify_gameplay_entry_boundary(void){
 
     bounce_app_flow_init(&flow);
 
-    /* Test A: direct New Game with the source-backed fresh count of 0. */
+    /*
+     * STEP 38-RESET -- the count is no longer the source's 0.
+     *
+     * WHAT CHANGED AND WHY IT IS NOT A REGRESSION. BounceGame.java:276-279 leaves
+     * MaxLevels at its Java default of 0 on a fresh install, and with 0 the New Game
+     * gate at :241 (`MaxLevels > 1`) is false, so `a(true, 1)` runs and level 1 starts
+     * directly -- Level Select is unreachable and a second level is unreachable
+     * forever. That was reproduced faithfully and is now deliberately 2, so that
+     * levels 1 and 2 are both selectable on a new install. See
+     * BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT in app_flow.h.
+     *
+     * THE COUNT OF 0 IS STILL COVERED, as an explicitly SET value rather than as the
+     * default. That distinction is the point: the Java branch it exercises -- "the
+     * gate is false, so stage the first level directly" -- is a real behaviour of
+     * the flow and is worth asserting, but it is no longer reachable by accident on a
+     * new install, and pretending otherwise would let the two drift apart silently.
+     */
     if (bounce_app_flow_apply(&flow, BOUNCE_APP_EVENT_SPLASH_DONE) != 0
         || flow.state != BOUNCE_APP_STATE_MENU
+        || bounce_app_flow_available_level_count(&flow)
+            != (unsigned int)BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT) {
+        return -1;
+    }
+    /*
+     * THE SHIPPED DEFAULT ROUTES NEW GAME THROUGH LEVEL SELECT, and that is a
+     * behaviour change with a visible consequence: on a new install the player now
+     * chooses between levels 1 and 2 instead of being dropped straight into level 1.
+     * It is asserted on its own, before the count of 0 is set below, because the two
+     * cases are mutually exclusive -- the first SELECT lands on LEVEL_SELECTION and
+     * only then can the count be changed back to 0 for the Java-shaped case.
+     */
+    if (bounce_app_flow_menu_select(&flow) != BOUNCE_MENU_ACTION_NEW_GAME
+        || flow.state != BOUNCE_APP_STATE_LEVEL_SELECTION
+        || bounce_app_flow_available_level_count(&flow)
+            != (unsigned int)BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT
+        || bounce_app_flow_level_selection_selected_index(&flow) != 0u) {
+        return -1;
+    }
+    bounce_app_flow_menu_clear_action(&flow);
+    /*
+     * Back to the menu before touching the count. bounce_app_flow_set_available_
+     * level_count() is guarded on MENU, so setting it from LEVEL_SELECTION would be
+     * refused and the Java-shaped case below would silently be testing the default
+     * count a second time instead of 0.
+     */
+    if (bounce_app_flow_return_to_menu(&flow) != 0
+        || flow.state != BOUNCE_APP_STATE_MENU
+        || bounce_app_flow_set_available_level_count(&flow, 0u) != 0
         || bounce_app_flow_available_level_count(&flow) != 0u
         || bounce_app_flow_begin_gameplay_entry(&flow) != -1
         || bounce_app_flow_entry_phase(&flow)
@@ -10499,8 +10720,23 @@ static int verify_level_entry_route(
     app.v = camera_v;
 
     if (list_index < 0) {
-        /* Direct route: default count 0 -> START_LEVEL(1). */
-        if (bounce_app_flow_available_level_count(&app.flow) != 0u
+        /*
+         * Direct route: START_LEVEL(1) with no Level Select hop.
+         *
+         * STEP 38-RESET -- the count is SET to 0 here instead of being inherited from
+         * the launch default, which is now 2. `MaxLevels > 1` is then false, so the
+         * first SELECT on the main menu stages level 1 directly.
+         *
+         * It has to be explicit. This branch presses SELECT on the MAIN MENU, so it
+         * used to be reading whatever bounce_app_flow_init() happened to write, and
+         * the moment the shipped default stopped being 0 the branch silently began
+         * exercising the Level Select path instead -- and then failed three lines
+         * later on a state it no longer expected, which is a confusing way to learn
+         * that a default moved. Naming the value makes this fixture's precondition
+         * legible and independent of the default, which is what a fixture is for.
+         */
+        if (bounce_app_flow_set_available_level_count(&app.flow, 0u) != 0
+            || bounce_app_flow_available_level_count(&app.flow) != 0u
             || bounce_ui_shell_handle_press(
                 &app.flow,
                 BOUNCE_UI_INPUT_SELECT
@@ -10620,7 +10856,19 @@ static int drive_app_to_level_loaded(
     app->v = 333;
 
     if (list_index < 0) {
-        if (bounce_app_flow_available_level_count(&app->flow) != 0u
+        /*
+         * STEP 38-RESET -- the count is SET to 0 here rather than inherited.
+         *
+         * This branch means "press SELECT on the main menu and stage level 1 with no
+         * Level Select hop", which is BounceGame.java:241's `MaxLevels > 1` gate
+         * evaluating false. It used to get that condition by reading whatever
+         * bounce_app_flow_init() wrote, and the shipped default is now 2, so without
+         * this the branch would silently stop testing the thing it is named for and
+         * start testing the Level Select route instead. Naming the value keeps every
+         * caller of this helper on the route it asked for.
+         */
+        if (bounce_app_flow_set_available_level_count(&app->flow, 0u) != 0
+            || bounce_app_flow_available_level_count(&app->flow) != 0u
             || bounce_ui_shell_handle_press(
                 &app->flow,
                 BOUNCE_UI_INPUT_SELECT
@@ -14260,7 +14508,17 @@ static int verify_level_load_entry_integration(void)
     char guard[4];
     size_t index;
 
-    /* Test A: direct New Game, level 1, via the source-default route. */
+    /*
+     * STEP 38-RESET -- Test A is UNCHANGED and still uses the direct route into
+     * level 1.
+     *
+     * It keeps working because verify_level_entry_route() now sets the count to 0
+     * itself on the list_index < 0 branch, instead of inheriting the launch default.
+     * That is the right place for the value: this fixture is about the level-load
+     * integration, and the shipped default of 2 -- which routes New Game through
+     * Level Select -- is a flow-level behaviour covered by
+     * verify_gameplay_entry_boundary()'s Test A.
+     */
     if (verify_level_entry_route(-1, &level001) != 0)
         return -1;
     /* Test B: a wide level with thorns, then the largest big-ball level. */
@@ -19475,7 +19733,23 @@ static int drive_app_to_gameplay_entry_start_level(BounceApp *app)
     if (bounce_game_init(app) != 0 || bounce_game_enter_menu(app) != 0)
         return -1;
     app->next_player_tick_ms = INT64_C(4321);
-    if (bounce_ui_shell_handle_press(
+    /*
+     * STEP 38-RESET -- the available-level count is SET to 0, not inherited.
+     *
+     * This helper's whole contract is "New Game stages level 1 straight into the
+     * gameplay-entry boundary", which is BounceGame.java:241's `MaxLevels > 1` gate
+     * evaluating FALSE. It used to satisfy that by reading whatever
+     * bounce_app_flow_init() wrote, and the shipped default is now 2, so without
+     * this the first SELECT lands on LEVEL_SELECTION instead and every caller of this
+     * helper silently changes what it is testing.
+     *
+     * Setting it here rather than at each of the many call sites is the point: there
+     * are a dozen of them across the resume, arrival, cadence and hoop checks, and a
+     * helper whose precondition depends on a global default is a helper that breaks
+     * the next time that default moves.
+     */
+    if (bounce_app_flow_set_available_level_count(&app->flow, 0u) != 0
+        || bounce_ui_shell_handle_press(
             &app->flow,
             BOUNCE_UI_INPUT_SELECT
         ) != 0
@@ -20200,10 +20474,29 @@ static int verify_native_extension_ui(void)
                    BOUNCE_MENU_ACTION_CONTINUE_UNAVAILABLE),
                "CONTINUE UNAVAILABLE") != 0
         /*
-         * With no level count published, New game takes the source's
-         * MaxLevels <= 1 branch (BounceGame.java:241-242): it records
-         * START_LEVEL(1) at the action boundary instead of opening the list.
+         * STEP 38-RESET -- THE COUNT IS PINNED TO 0 HERE, because this assertion is
+         * about the single-branch route and the shipped default now takes the other
+         * one.
+         *
+         * The claim below is that when no level count is published, New game takes
+         * the source's MaxLevels <= 1 branch (BounceGame.java:241-242) and records
+         * START_LEVEL(1) at the action boundary instead of opening the list. That
+         * claim is still true; what stopped being true is the unstated premise that
+         * a fresh flow publishes no count.
+         *
+         * A new install now ships with levels 1 and 2 unlocked, so
+         * available_level_count is 2 and this same press goes to Level Select. Left
+         * alone the block would fail on `state != ACTION_BOUNDARY`, blaming the menu
+         * for a change made to the defaults, and the MaxLevels <= 1 branch it was
+         * written to cover would go untested. Pinning the count is what keeps the
+         * assertion pointed at its own subject.
+         *
+         * The count-of-2 route is not abandoned here; verify_default_state() pins
+         * the shipped value and verify_gameplay_entry_boundary() drives it end to
+         * end, so both branches of the Java condition stay covered.
          */
+        || bounce_app_flow_set_available_level_count(&flow, 0u) != 0
+        || bounce_app_flow_available_level_count(&flow) != 0u
         || bounce_app_flow_menu_select(&flow)
             != BOUNCE_MENU_ACTION_NEW_GAME
         || flow.state != BOUNCE_APP_STATE_ACTION_BOUNDARY
@@ -20327,19 +20620,38 @@ static int verify_native_extension_ui(void)
      * NATIVE ADDITION -- the Input page's numeric-keypad setting, in the Audio
      * page's shape.
      *
-     * THE DEFAULT IS OFF, WHICH MAKES THIS SEQUENCE THE MIRROR OF THE AUDIO ONE
-     * BELOW rather than a copy of it: Audio starts ON, so "moving does not apply"
-     * there leaves it true, and here it must leave it FALSE. An earlier
-     * revision of this block copied the Audio assertions verbatim and asserted
-     * `!t9_enabled` after a move -- which is false, because the default is OFF,
-     * so the check failed on correct code. The asymmetry is stated here rather
-     * than left to be re-derived.
+     * THE SEQUENCE IS THE MIRROR OF THE AUDIO ONE BELOW RATHER THAN A COPY OF IT.
+     * Audio starts ON, so "moving does not apply" there leaves it true; this block
+     * starts OFF, so the same assertion has to leave it false. An earlier revision
+     * copied the Audio assertions verbatim and asserted `!t9_enabled` after a move --
+     * which is false when the value in force is OFF->ON is reversed, so the check
+     * failed on correct code. The asymmetry is stated here rather than left to be
+     * re-derived.
      *
-     * Fresh flow: two rows, OFF, highlight on row 0. Moving to OFF must not
-     * change anything. SELECT applies the highlighted row. Moving back to ON
-     * without SELECT still leaves it OFF. SELECT on ON turns it on. Moving past
-     * the end clamps rather than wraps.
+     * STEP 38-RESET -- the starting value of this walk is now PINNED OFF rather than
+     * inherited from the launch default, which is ON. See the block below.
+     *
+     * Two rows, OFF, highlight on row 0. Moving to OFF must not change anything.
+     * SELECT applies the highlighted row. Moving back to ON without SELECT still
+     * leaves it OFF. SELECT on ON turns it on. Moving past the end clamps rather
+     * than wraps.
      */
+    /*
+     * STEP 38-RESET -- the keypad is PINNED OFF before the toggle mechanics run.
+     *
+     * This block walks ON -> OFF -> ON -> OFF to prove that moving the highlight
+     * applies nothing and SELECT does. It used to start from the launch default,
+     * which was OFF; the shipped default is now ON, so without the pin the very first
+     * assertion below ("it is off") fails and the whole toggle walk is never reached.
+     *
+     * Starting from OFF is what makes the walk readable anyway: the first move to the
+     * OFF row is then a genuine "select the other value" rather than a select of the
+     * value already in force. Which value a NEW INSTALL starts on is a different
+     * question and is asserted in verify_default_state(), which is where the shipped
+     * defaults live.
+     */
+    if (bounce_app_flow_restore_persisted_t9(&flow, false) != 0)
+        return -1;
     flow.settings.page = BOUNCE_SETTINGS_PAGE_INPUT;
     if (bounce_app_flow_settings_list_count(&flow)
             != BOUNCE_SETTINGS_T9_VALUE_COUNT
@@ -20661,8 +20973,14 @@ static int verify_native_extension_ui(void)
         bounce_surface_destroy(surface);
         return -1;
     }
+    /*
+     * STEP 38-RESET-UI -- AND THE LOOP NOW INCLUDES THE RESET PAGE. It stopped at THEME,
+     * which is the highest page that existed when this was written, so the confirmation
+     * screen was never among the pages this smoke test rendered. Bounded by the page
+     * enum's last value rather than by THEME so a future page is covered by default.
+     */
     for (index = BOUNCE_SETTINGS_PAGE_ROOT;
-         index <= BOUNCE_SETTINGS_PAGE_THEME;
+         index <= BOUNCE_SETTINGS_PAGE_RESET;
          ++index) {
         flow.settings.page = (BounceSettingsPage)index;
         if (bounce_ui_shell_render_settings(surface, renderer, &flow) != 0
@@ -21615,6 +21933,13 @@ static int verify_production_game_routing(void)
      * legitimately skips the tick, so the invariant is: the dispatch count never
      * grows by more than one per frame, it always equals the tick-entry count
      * and the physics count, and the legacy route is never taken.
+     *
+     * The achieved CADENCE is not asserted here, and deliberately so: this loop
+     * runs back to back with no frame period between iterations, so `now` advances
+     * by microseconds and almost every iteration legitimately skips its tick. A
+     * cadence measured in a loop like this one measures the loop, not the
+     * scheduler. verify_tick_cadence() below is where the rate is measured, over
+     * real frame periods.
      */
     for (i = 0u; i < 64u; ++i) {
         int64_t before;
@@ -21704,6 +22029,1567 @@ static int verify_production_game_routing(void)
 failure:
     bounce_game_release_level(&app);
     return -1;
+}
+
+/*
+ * WHICH ENTRY ROUTE SELECTS A GIVEN LEVEL.
+ *
+ * drive_app_to_level_loaded() takes a `list_index`, and the two values are not
+ * interchangeable:
+ *
+ *   list_index < 0   Press SELECT on the main menu. That is BounceGame.java:241's
+ *                    `MaxLevels > 1` gate failing, so it records a(true, 1) and
+ *                    ALWAYS starts level 1 -- the level_id argument is only range
+ *                    checked on this route. Passing -1 for every level therefore
+ *                    silently tested level 1 eleven times, which is exactly the
+ *                    vacuous check this function exists to avoid.
+ *
+ *   list_index >= 0  Press SELECT into Level Selection with the available count
+ *                    set to level_id, walk down list_index rows, press SELECT
+ *                    again. That is BounceGame.java:218-219's List command, and it
+ *                    is the only route that reaches a level other than 1.
+ *
+ * Level 1 has no Level Selection row to walk to, because the count is 1 and the
+ * menu gate at :241 is `> 1`, so it necessarily takes the first route. Every level
+ * from 2 up must take the second, or it would be reported as level 1's data.
+ */
+static int door_list_index(int level_id)
+{
+    if (level_id <= BOUNCE_APP_FIRST_LEVEL_ID)
+        return -1;
+    return level_id - 1;
+}
+
+/*
+ * Forward declarations for the three X11 helpers this check drives. They are
+ * defined much further down, next to the dispatcher they belong to; declaring them
+ * here keeps this verifier where it belongs chronologically -- with the other
+ * resume/Continue checks -- instead of moving it below the X11 section purely to
+ * satisfy the declaration order.
+ */
+static void dispatch_fixture_context(X11PresentationContext *context);
+static void fill_key_event(
+    XEvent *event,
+    int type,
+    unsigned int keycode,
+    unsigned long serial,
+    unsigned long time
+);
+static int x11_dispatch_event(
+    X11PresentationContext *context,
+    BounceApp *app,
+    const XEvent *event,
+    KeySym key
+);
+
+/*
+ * EVERY LEVEL MUST BE PLAYABLE ON ARRIVAL, NOT JUST ON A DIRECT LOAD.
+ *
+ * THIS IS THE TRANSITION NOBODY WAS TESTING. Every other per-level check builds a
+ * FRESH app and loads the level directly, which means it always observes a context
+ * that has never run anything. A player does not arrive that way. They arrive at
+ * level N+1 by finishing level N, and that route is a different chain with a
+ * different history behind it:
+ *
+ *     bounce_game_mark_level_complete()  -> flow LEVEL_COMPLETE, deferred_init armed
+ *     bounce_game_continue_level()       -> bounce_game_release_level(), stage START_LEVEL(N+1)
+ *     app_begin_canonical_gameplay()     -> load -> player -> runtime -> camera
+ *                                          -> activate -> timer
+ *
+ * The finished run leaves state behind -- the open door, the collected tiles, the
+ * spent power-ups, the camera, the lives -- and only some of it is cleared on the
+ * way. That is exactly the class of defect the door reset turned out to be, and it
+ * was invisible for the same reason: a fresh-load fixture cannot see it.
+ *
+ * "PLAYABLE" IS THREE THINGS, NOT ONE, because a level can pass the first and still
+ * strand the player:
+ *
+ *   IT LOADS. The right level id, from the right file.
+ *   THE BALL FITS. The spawn is not inside the level. For the three big-ball levels
+ *   this is a real question rather than a formality -- see verify_big_ball_spawn_fit()
+ *   and f.java:168-206 -- and it is the state that survives a bad transition worst,
+ *     because the ball is rebuilt from the level header and then nudged by the
+ *     resolver, and both steps read geometry the previous run may have disturbed.
+ *   THE BALL MOVES. The strongest form of "not stuck", and the only one that
+ *     observes the symptom rather than a precondition of it: gravity alone, no
+ *     input, over 90 ticks -- three and a half seconds at the source's 25 Hz. A ball
+ *     wedged in a ceiling cannot fall, and this is what catches it.
+ *
+ * EVERY TRANSITION IS COVERED, 1 -> 2 through 10 -> 11, because the three big-ball
+ * levels are scattered through that range (3, 5 and 11) and each is entered from a
+ * different predecessor with a different amount of leftover state.
+ */
+static int verify_arrival_is_playable(void)
+{
+    int level_id;
+    int bad = 0;
+    int not_playable = 0;
+
+    printf("ARRIVAL transitions=1->2..10->11 checks=level,ballSize,fit,moves\n");
+    for (level_id = BOUNCE_APP_FIRST_LEVEL_ID;
+         level_id < BOUNCE_APP_LAST_LEVEL_ID;
+         ++level_id) {
+        BounceApp app;
+        int32_t target = level_id + 1;
+        int32_t nominal_x;
+        int32_t nominal_y;
+        bool loaded_ok;
+        bool size_ok;
+        bool fits;
+        bool moves;
+        int run;
+
+        memset(&app, 0, sizeof app);
+        if (bounce_game_init(&app) != 0
+            || bounce_game_enter_menu(&app) != 0
+            || drive_app_to_level_loaded(
+                   &app,
+                   door_list_index(level_id),
+                   level_id
+               ) != 0
+            || app_advance_level_loaded_to_player_initialized(&app) != 0
+            || app_advance_player_initialized_to_runtime_initialized(&app) != 0
+            || app_advance_runtime_initialized_to_camera_initialized(&app) != 0
+            || app_advance_camera_initialized_to_activated(&app) != 0
+            || bounce_game_initialize_game_timer(&app) != 0) {
+            bounce_game_shutdown(&app);
+            return -1;
+        }
+        /* Finish this level for real: every hoop, then the door, then completion. */
+        while (app.hoops_scored < bounce_level_hoops_total(app.level)) {
+            if (app_collect_hoop(&app, 1, 1, 13u, 0u) != 0) {
+                bounce_game_shutdown(&app);
+                return -1;
+            }
+        }
+        if (!app.TODO_ExitUnlocked) {
+            bounce_game_shutdown(&app);
+            return -1;
+        }
+        if (bounce_game_mark_level_complete(&app) != 0) {
+            bounce_game_shutdown(&app);
+            return -1;
+        }
+        /* The production route onward. See verify_door_resets_between_levels(). */
+        bounce_game_timer_stop(&app.game_timer);
+        if (bounce_game_continue_level(&app) < 0) {
+            bounce_game_shutdown(&app);
+            return -1;
+        }
+        /*
+         * app_begin_canonical_gameplay() runs the WHOLE staged chain, and its last
+         * step starts the timer (bounce_game_initialize_game_timer), so the timer is
+         * already running here. Calling it again would be a second activation attempt
+         * on a boundary that is not the LEVEL_LOADED one this function guards, and it
+         * refuses -- which is why this check first reported a setup failure at level
+         * 1 rather than a result.
+         */
+        if (app_begin_canonical_gameplay(&app) != 0) {
+            bounce_game_shutdown(&app);
+            return -1;
+        }
+
+        loaded_ok = app.level != NULL
+            && app.runtime != NULL
+            && app.player.initialized
+            && app.flow.state == BOUNCE_APP_STATE_GAMEPLAY
+            && app.level_id == target;
+        /*
+         * The ball size is checked against the DESTINATION level's own header rather
+         * than a constant, so a level that arrives carrying the previous level's ball
+         * is caught even when the previous level happened to agree.
+         */
+        size_ok = app.player.ballSize
+            == (bounce_level_is_big_ball(app.level) != 0u
+                    ? BOUNCE_BIG_BALL_SIZE
+                    : BOUNCE_REGULAR_BALL_SIZE);
+        nominal_x = (int32_t) bounce_level_initial_x(app.level) * 12 + 6;
+        nominal_y = (int32_t) bounce_level_initial_y(app.level) * 12 + 6;
+        fits = loaded_ok
+            && bounce_collision_query_level(
+                   app.player.TODO_unkX,
+                   app.player.TODO_unkY,
+                   app.player.p,
+                   app.level
+               )
+            /*
+             * A big-ball level whose ball landed exactly on the nominal point means
+             * the resolver never ran, and the fit above would then be measuring the
+             * wrong position rather than the one that would be played.
+             */
+            && (app.player.ballSize != BOUNCE_BIG_BALL_SIZE
+                || app.player.TODO_unkX != nominal_x
+                || app.player.TODO_unkY != nominal_y);
+        moves = false;
+        if (loaded_ok) {
+            int32_t first_x = app.player.TODO_unkX;
+            int32_t first_y = app.player.TODO_unkY;
+
+            for (run = 0; run < 90; ++run) {
+                BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+
+                if (app_timer_callback_dispatch(&app, &branch) != 0)
+                    break;
+                if (app.player.TODO_unkX != first_x
+                    || app.player.TODO_unkY != first_y) {
+                    moves = true;
+                    break;
+                }
+            }
+        }
+        printf("ARRIVAL %2d->%2d loaded=%s ball=%d/%d nominal=(%ld,%ld)"
+               " at=(%ld,%ld) fits=%s moves=%s %s\n",
+               level_id,
+               (int) target,
+               loaded_ok ? "yes" : "no",
+               (int) app.player.ballSize,
+               (int) app.player.p,
+               (long) nominal_x,
+               (long) nominal_y,
+               (long) app.player.TODO_unkX,
+               (long) app.player.TODO_unkY,
+               fits ? "yes" : "no",
+               moves ? "yes" : "no",
+               (loaded_ok && size_ok && fits && moves) ? "PASS" : "FAIL");
+        if (!(loaded_ok && size_ok && fits && moves))
+            ++not_playable;
+        if (!(loaded_ok && size_ok && fits && moves))
+            bad = 1;
+        bounce_game_shutdown(&app);
+    }
+    printf("ARRIVAL summary transitions=10 not_playable=%d expected=0 %s\n",
+           not_playable,
+           bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * A BIG BALL MUST NOT SPAWN INSIDE THE LEVEL.
+ *
+ * THE ONLY THREE LEVELS WHERE THIS CAN HAPPEN. Levels 3, 5 and 11 are the shipped
+ * levels whose header byte 2 is non-zero, and f.java:127-131 turns that into a
+ * different ball constructor:
+ *
+ *     if (ballSize == 12) UseRegularBall();   // 12 px, p 6, no resolver
+ *     else               UseBigBall();       // 16 px, p 8, WITH a resolver
+ *
+ * A 16 px ball in a 12 px cell grid has a box two cells wide and one-and-a-half
+ * cells tall, so a spawn cell that is clear for the small ball can still bury the
+ * big one in its neighbours. Level 5 is the clearest case in the shipped set: the
+ * spawn cell (32,32) is empty, but the whole row above it, row 31, is brick wall
+ * across columns 31..35, and the nominal position (390,390) has its box covering
+ * rows 31..33. A ball left there is embedded in a ceiling.
+ *
+ * WHAT THE SOURCE DOES ABOUT IT. f.java:173-206, inside UseBigBall() only:
+ *
+ *     for (byte offset = 1; !TODO_collidesWithLevel; offset++) {
+ *         TODO_collidesWithLevel = true;
+ *         if (TODO_CheckBallCollision(x, y - offset))            { y -= offset; continue; }
+ *         if (TODO_CheckBallCollision(x - offset, y - offset))   { x -= offset; y -= offset; continue; }
+ *         if (TODO_CheckBallCollision(x + offset, y - offset))   { x += offset; y -= offset; continue; }
+ *         if (TODO_CheckBallCollision(x, y + offset))            { y += offset; continue; }
+ *         if (TODO_CheckBallCollision(x - offset, y + offset))   { x -= offset; y += offset; continue; }
+ *         if (TODO_CheckBallCollision(x + offset, y + offset))   { x += offset; y += offset; continue; }
+ *         TODO_collidesWithLevel = false;
+ *     }
+ *
+ * Six candidates per offset, offset growing until one of them lands the ball on a
+ * free spot. Note that all six change y, so the resolver can move the ball DOWN as
+ * well as up: on level 5 it has to, because the ceiling is above and the pocket
+ * that fits is below. An implementation that only searched upward would leave the
+ * ball in the ceiling there, which is the stuck case this check exists for.
+ *
+ * TWO SEPARATE CLAIMS ARE ASSERTED, because the resolver and the fit are different
+ * things and either can be broken on its own:
+ *
+ *   THE PROBE RAN. The spawn position must differ from the bare header formula
+ *   `tile * 12 + 6`, which is what proves the resolver was reached at all. A ball
+ *   sitting exactly on the nominal point on a big-ball level means the resolver was
+ *   skipped, and every other assertion here would then be measuring the wrong thing.
+ *
+ *   THE RESULT IS FREE. The settled position must pass the SAME predicate the
+ *   resolver tests, `bounce_collision_query_level()` -- the f.TODO_CheckBallCollision
+ *   traversal over the pristine level. Asserting the outcome with the resolver's
+ *   own predicate is what makes "not stuck" mean "the source would agree it fits",
+ *   rather than "it fits according to a different rule".
+ *
+ * THE PRODUCTION PATH IS THE ONE DRIVEN. The session is built through the staged
+ * entry chain, so this covers bounce_game_initialize_player_entry()'s call to
+ * bounce_player_use_big_ball_level() rather than the legacy loader's.
+ */
+static int verify_big_ball_spawn_fit(void)
+{
+    /* The shipped levels whose header byte 2 selects UseBigBall(). */
+    static const int big_ball_levels[] = { 3, 5, 11 };
+    unsigned int index;
+    int bad = 0;
+    int not_free = 0;
+    int probe_skipped = 0;
+
+    printf("BIGBALL-SPAWN levels=3,5,11 predicate=bounce_collision_query_level"
+           " (f.TODO_CheckBallCollision)\n");
+    for (index = 0u;
+         index < sizeof big_ball_levels / sizeof big_ball_levels[0];
+         ++index) {
+        BounceApp app;
+        int level_id = big_ball_levels[index];
+        int32_t nominal_x;
+        int32_t nominal_y;
+        bool is_big;
+        bool probe_ran;
+        bool free_at_settle;
+        bool free_after_runtime = false;
+        bool respawn_is_big;
+        bool respawn_free = false;
+        bool ball_moves = false;
+        bool never_embedded = false;
+        int32_t settled_x;
+        int32_t settled_y;
+        int32_t respawn_x = 0;
+        int32_t respawn_y = 0;
+
+        memset(&app, 0, sizeof app);
+        if (bounce_game_init(&app) != 0
+            || bounce_game_enter_menu(&app) != 0
+            || drive_app_to_level_loaded(
+                   &app,
+                   door_list_index(level_id),
+                   level_id
+               ) != 0
+            || app_advance_level_loaded_to_player_initialized(&app) != 0
+            || app_advance_player_initialized_to_runtime_initialized(&app) != 0
+            || app_advance_runtime_initialized_to_camera_initialized(&app) != 0
+            || app_advance_camera_initialized_to_activated(&app) != 0
+            /*
+             * The timer has to be running for the movement half of this check to
+             * mean anything. bounce_game_tick_dispatch() refuses while the timer is
+             * stopped (game_timer.c:150-151), so without this the dispatch returns
+             * without running any physics and the ball would report as "never
+             * moved" no matter what the level contained -- which is exactly the
+             * false failure this check first produced.
+             */
+            || bounce_game_initialize_game_timer(&app) != 0) {
+            bounce_game_shutdown(&app);
+            return -1;
+        }
+        /* The header formula, e.java:121: tile * 12 + 6 on both axes. */
+        nominal_x = (int32_t) bounce_level_initial_x(app.level) * 12 + 6;
+        nominal_y = (int32_t) bounce_level_initial_y(app.level) * 12 + 6;
+        is_big = app.player.ballSize == BOUNCE_BIG_BALL_SIZE
+            && app.player.p == BOUNCE_BIG_BALL_P;
+        settled_x = app.player.TODO_unkX;
+        settled_y = app.player.TODO_unkY;
+        probe_ran = (settled_x != nominal_x) || (settled_y != nominal_y);
+        free_at_settle = bounce_collision_query_level(
+            settled_x, settled_y, app.player.p, app.level);
+        /*
+         * And again against the runtime copy, because that is the grid the ball
+         * will actually live in once play starts. A level-load-time fit that does not
+         * survive the copy would still be a ball embedded in the world.
+         */
+        if (app.runtime != NULL) {
+            free_after_runtime = bounce_collision_query(
+                settled_x, settled_y, app.player.p, app.runtime);
+        }
+        /*
+         * THE RESPAWN, which is the other way a big ball appears on these levels and
+         * the one a player actually reaches by dying.
+         *
+         * Java rebuilds the ball through e.java:277:
+         *
+         *     a(this.aq.d * 12 + 6, this.aq.c * 12 + 6, this.aq.b, 0, 0);
+         *
+         * where `this.aq.b` is the size the CHECKPOINT recorded (f.java:137), not the
+         * level's own header size. So on a big-ball level the respawn is a big-ball
+         * construction, and f.java:127-131 routes it through UseBigBall() and its
+         * resolver all over again -- at the checkpoint cell, which is a DIFFERENT
+         * piece of geometry from the level spawn. A level whose start cell is open
+         * can still have a checkpoint tucked under a ceiling, and that is a second,
+         * independent chance for the ball to come back embedded.
+         *
+         * The death is produced by app_kill_ball() and consumed by
+         * app_respawn_after_death(), both production functions, so the whole
+         * respawn chain runs.
+         */
+        /*
+         * AND THE DIRECT QUESTION: DOES THE BALL ACTUALLY MOVE? Everything above
+         * checks that the spawn position is not embedded. That is necessary but not
+         * sufficient -- a ball can sit in a legal cell and still be wedged, unable to
+         * fall, roll or jump out, because the resolver only guarantees ONE offset is
+         * collision-free; it says nothing about whether the surrounding geometry lets
+         * the ball travel. So the position is sampled across a run of real ticks and
+         * required to change, and every intermediate position is required to stay
+         * free. A ball that never moves is the stuck case, and this is the only
+         * assertion here that observes it directly.
+         *
+         * No input is applied, so any motion is gravity and residual velocity alone.
+         * 90 ticks is more than three and a half seconds at 25 Hz, which is far more
+         * than a ball needs to fall the four rows to the floor.
+         */
+        {
+            int32_t first_x = app.player.TODO_unkX;
+            int32_t first_y = app.player.TODO_unkY;
+            int moved = 0;
+            int embedded_mid_run = 0;
+            int run;
+
+            for (run = 0; run < 90; ++run) {
+                BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+
+                if (app_timer_callback_dispatch(&app, &branch) != 0)
+                    break;
+                if (app.player.TODO_unkX != first_x
+                    || app.player.TODO_unkY != first_y) {
+                    moved = 1;
+                }
+                if (!bounce_collision_query(
+                        app.player.TODO_unkX,
+                        app.player.TODO_unkY,
+                        app.player.p,
+                        app.runtime)) {
+                    embedded_mid_run = 1;
+                    break;
+                }
+            }
+            ball_moves = (moved != 0);
+            never_embedded = (embedded_mid_run == 0);
+        }
+
+        app.god_mode = false;
+        app.lives = 3;
+        app.state = BOUNCE_GAME_STATE_PLAYING;
+        app_kill_ball(&app);
+        (void)app_respawn_after_death(&app);
+        respawn_is_big = app.player.ballSize == BOUNCE_BIG_BALL_SIZE
+            && app.player.p == BOUNCE_BIG_BALL_P;
+        respawn_x = app.player.TODO_unkX;
+        respawn_y = app.player.TODO_unkY;
+        respawn_free = bounce_collision_query(
+            respawn_x, respawn_y, app.player.p, app.runtime);
+
+        printf("BIGBALL-SPAWN level=%2d big_ball=%s nominal=(%ld,%ld)"
+               " settled=(%ld,%ld) probe_ran=%s fits_level=%s fits_runtime=%s"
+               " | moves=%s never_embedded=%s"
+               " | respawn_big=%s respawn=(%ld,%ld) respawn_fits=%s"
+               " %s\n",
+               level_id,
+               is_big ? "yes" : "no",
+               (long) nominal_x,
+               (long) nominal_y,
+               (long) settled_x,
+               (long) settled_y,
+               probe_ran ? "yes" : "no",
+               free_at_settle ? "yes" : "no",
+               free_after_runtime ? "yes" : "no",
+               ball_moves ? "yes" : "no",
+               never_embedded ? "yes" : "no",
+               respawn_is_big ? "yes" : "no",
+               (long) respawn_x,
+               (long) respawn_y,
+               respawn_free ? "yes" : "no",
+               (is_big && probe_ran && free_at_settle && free_after_runtime
+                   && ball_moves && never_embedded
+                   && respawn_is_big && respawn_free)
+                   ? "PASS"
+                   : "FAIL");
+        if (!is_big || !probe_ran)
+            ++probe_skipped;
+        if (!free_at_settle || !free_after_runtime || !respawn_free
+            || !ball_moves || !never_embedded) {
+            ++not_free;
+        }
+        if (!is_big || !probe_ran || !free_at_settle || !free_after_runtime
+            || !ball_moves || !never_embedded
+            || !respawn_is_big || !respawn_free) {
+            bad = 1;
+        }
+        bounce_game_shutdown(&app);
+    }
+    printf("BIGBALL-SPAWN summary levels=3 probe_skipped=%d not_free=%d"
+           " spawn+movement+respawn checked=yes expected=0 0 %s\n",
+           probe_skipped,
+           not_free,
+           bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * THE LIVES LADDER, WALKED ALL THE WAY DOWN.
+ *
+ * THE SHAPE THE PLAYER DESCRIBES, WHICH IS ALSO THE SHAPE THE SOURCE HAS:
+ *
+ *     lives = 5  (the cap, f.java:611)
+ *     die -> 4
+ *     die -> 3
+ *     die -> 2
+ *     die -> 1
+ *     die -> 0     <- still a PLAYABLE life, not the end
+ *     die -> -1    <- and only now does e.java:268 fire
+ *
+ * Six deaths from a full set of five, and the sixth is the one that ends the run.
+ * Two things make that non-obvious and both are easy to get wrong:
+ *
+ *   THE DECAY IS A DECREMENT, NOT A SET. f.java:219 is `this.n.lives--`, inside the
+ *   `if (!this.n.GodMode)` body, so the ladder passes through every value rather
+ *   than jumping straight to -1. An implementation that wrote -1 on the first death
+ *   would produce the same game-over moment and a completely different game: five
+ *   lives would be worth one.
+ *
+ *   lives == 0 IS NOT GAME OVER. The boundary is e.java:268 `if (this.lives < 0)`,
+ *   strictly less than zero, so a run sitting on 0 still has a life to lose. Firing
+ *   the game over at 0 would take a life away without being asked to.
+ *
+ * The 1-up is checked in the same run because the cap is the other half of the
+ * ladder: f.java:611-613 is `if (this.n.lives < 5) { this.n.lives++; }`, so a pickup
+ * at 4 reaches 5 and a further pickup at 5 changes nothing while still scoring.
+ *
+ * EVERY FUNCTION CALLED HERE IS THE PRODUCTION ONE. The death is app_kill_ball()
+ * (the f.java:215 transcription), the game-over test and respawn are
+ * app_respawn_after_death() (e.java:267-281), and the pickup is
+ * app_consume_extra_life() (f.java:609-617). Asserting the ladder against anything
+ * else would only prove that arithmetic works.
+ *
+ * WHY IT IS NOT COVERED ELSEWHERE. The existing checks assert single transitions --
+ * one death taking 3 to 2, the GodMode guard refusing one, the pickup's placement
+ * relative to the cap. None of them walks the ladder to its end, so a regression
+ * that turned the decrement into a reset, or moved the boundary to `<= 0`, would
+ * leave all of them passing while the game silently became one life long.
+ */
+static int verify_lives_ladder(void)
+{
+    BounceApp app;
+    /* The ladder a full set of five has to produce, death by death. */
+    static const int expected_after_death[6] = { 4, 3, 2, 1, 0, -1 };
+    int observed[6];
+    /*
+     * Whether the run was still PLAYABLE after each death. This is the half of the
+     * contract the ladder of numbers alone cannot express: a decrement that jumped
+     * straight to -1 would still print 4,3,2,1,0,-1 if the arithmetic were faked, and
+     * a boundary moved to `<= 0` would still print the same six numbers while
+     * silently ending the run one life early. Both of those regressions were
+     * actually tried against an earlier version of this check, and the numeric
+     * ladder alone caught NEITHER -- the first because the printout was faked, the
+     * second because the numbers are identical either way. Asserting the run's own
+     * state after each death is what makes the "0 is still a life" claim testable.
+     */
+    bool still_playable[6];
+    int deaths;
+    bool ladder_ok = true;
+    bool zero_still_playable = true;
+    bool end_only_on_last = true;
+    bool oneup_under_cap;
+    bool oneup_at_cap;
+    int bad = 0;
+
+    memset(observed, 0, sizeof observed);
+    memset(still_playable, 0, sizeof still_playable);
+    memset(&app, 0, sizeof app);
+    if (bounce_game_init(&app) != 0
+        || bounce_game_enter_menu(&app) != 0
+        || drive_app_to_level_loaded(&app, -1, 1) != 0
+        || app_advance_level_loaded_to_player_initialized(&app) != 0
+        || app_advance_player_initialized_to_runtime_initialized(&app) != 0
+        || app_advance_runtime_initialized_to_camera_initialized(&app) != 0
+        || app_advance_camera_initialized_to_activated(&app) != 0
+        || bounce_game_initialize_game_timer(&app) != 0) {
+        bounce_game_shutdown(&app);
+        return -1;
+    }
+    /* GodMode must be off or f.java:216 swallows every death (f.java:216-225). */
+    app.god_mode = false;
+    app.lives = 5;
+
+    for (deaths = 0; deaths < 6; ++deaths) {
+        app_kill_ball(&app);
+        observed[deaths] = app.lives;
+        /*
+         * The game-over test runs here, exactly where e.java:267-273 runs: after
+         * the death write and inside the same tick, before the respawn rebuild.
+         */
+        (void)app_respawn_after_death(&app);
+        /*
+         * The ball respawned and the run carries on iff the state is still PLAYING.
+         * app_respawn_after_death() is the whole of e.java:267-281: the lives < 0 arm
+         * hands over to the terminal flow, and every other arm rebuilds the player at
+         * the spawn or checkpoint and leaves the run playable.
+         */
+        still_playable[deaths] = (app.state == BOUNCE_GAME_STATE_PLAYING);
+    }
+    /* The fifth death leaves lives == 0, which must still be playable. */
+    zero_still_playable = still_playable[4];
+    /* And only the sixth, the one that reaches lives == -1, may end the run. */
+    end_only_on_last = true;
+    for (deaths = 0; deaths < 5; ++deaths) {
+        if (!still_playable[deaths])
+            end_only_on_last = false;
+    }
+    if (still_playable[5])
+        end_only_on_last = false;
+    for (deaths = 0; deaths < 6; ++deaths) {
+        if (observed[deaths] != expected_after_death[deaths])
+            ladder_ok = false;
+    }
+
+    /*
+     * THE CAP, from f.java:611. A pickup one below the ceiling reaches it, and a
+     * further pickup leaves it alone. The score is deliberately not asserted here;
+     * f.java:610 awards it OUTSIDE the guard, which verify_tile_51_54_powerup()
+     * already covers, and mixing the two would make this failure ambiguous.
+     */
+    app.lives = 4;
+    if (app_consume_extra_life(&app, 1, 1, 29u) != 0)
+        ladder_ok = false;
+    oneup_under_cap = (app.lives == 5);
+    if (app_consume_extra_life(&app, 2, 1, 29u) != 0)
+        ladder_ok = false;
+    oneup_at_cap = (app.lives == 5);
+    bounce_game_shutdown(&app);
+
+    if (!ladder_ok || !zero_still_playable || !end_only_on_last
+        || !oneup_under_cap || !oneup_at_cap) {
+        bad = 1;
+    }
+    printf("LIVES-LADDER start=5 deaths=6 ladder=%d,%d,%d,%d,%d,%d"
+           " decrement_not_reset=%s zero_still_playable=%s"
+           " end_only_on_sixth_death=%s oneup_4_to_5=%s oneup_capped_at_5=%s"
+           " expected=4,3,2,1,0,-1 yes yes yes yes yes %s\n",
+           observed[0], observed[1], observed[2],
+           observed[3], observed[4], observed[5],
+           ladder_ok ? "yes" : "no",
+           zero_still_playable ? "yes" : "no",
+           end_only_on_last ? "yes" : "no",
+           oneup_under_cap ? "yes" : "no",
+           oneup_at_cap ? "yes" : "no",
+           bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * A FINISHED RUN MUST NOT LEAVE A CONTINUE BEHIND, AND A LIVE ONE MUST.
+ *
+ * IT DRIVES x11_dispatch_event(), NOT THE HELPER. That is the whole point of the
+ * test and the reason the first version of it was worthless: calling
+ * app_persist_resume_snapshot_for_continue() directly and then asserting the store
+ * proves only that the helper writes, which was never in doubt. The missing write
+ * was a missing CALL, and only the production edge can be missing a call. So both
+ * phases synthesise the keystroke a player would press and let the real dispatcher
+ * run the capture, the publish and the refresh, exactly as the frame loop does.
+ *
+ * THE SEQUENCE BEING TESTED. The reported defect needed three things to line up: a
+ * stale record in the store from an earlier session, a run that ended without going
+ * through application teardown, and an availability refresh that reads the store
+ * rather than the in-memory capture. So each phase primes the store with a record
+ * that is deliberately WRONG for the current session, ends the session the way the
+ * UI ends it, and then asserts both the store and the menu row.
+ *
+ *   PHASE A -- the game over case, and the one that was reported.
+ *     The store is primed with b1 == 1 at LEVEL 2, which is the shape of the bug: a
+ *     valid-looking Continue pointing at a level the player has already left. A live
+ *     session is then marked as the Game Over screen and the form's own OK command is
+ *     pressed. The store must end up holding b1 == 0 and the menu must not offer
+ *     Continue. With the publish missing, the primed record survives and Continue
+ *     stays enabled -- which is exactly what was observed.
+ *
+ *     The flow state is set directly rather than driven through the death pipeline,
+ *     because app_capture_resume_snapshot() keys off the state it is given and
+ *     nothing else in this contract reads the ball. The pipeline that decides a
+ *     session reaches Game Over is covered by verify_w1_completion_request_latch()
+ *     and the b1 mapping by RECORD3-TERMINAL-B1; re-deriving them here would add a
+ *     second, weaker copy of both.
+ *
+ *   PHASE B -- the live case, so phase A cannot pass vacuously.
+ *     The store is primed INERT, a live session with lives is on the board, and the
+ *     Escape key -- the native gameplay-to-menu edge -- is pressed. The store must
+ *     end up holding b1 == 1 at the level actually being played, with Continue
+ *     offered. Without this, "inert after game over" would also be satisfied by a
+ *     publish that wrote nothing, or wrote the same thing unconditionally.
+ *
+ * THE STORE IS REDIRECTED, so the test can never read or damage a real save.
+ */
+static int verify_continue_publication(void)
+{
+    static const char template[] = "/tmp/bounce-continue-XXXXXX";
+    char root[sizeof template];
+    char saved[512];
+    int saved_ok;
+    BounceApp app;
+    X11PresentationContext context;
+    XEvent event;
+    BouncePersistenceRecord3 prime;
+    BouncePersistenceRecord3 back;
+    bool present = false;
+    bool stale_primed;
+    bool gameover_store_inert = false;
+    bool gameover_row_hidden = false;
+    bool live_store_present = false;
+    bool live_store_in_level = false;
+    bool live_row_shown = false;
+    int bad = 0;
+
+    memcpy(root, template, sizeof root);
+    if (mkdtemp(root) == NULL)
+        return -1;
+    saved_ok = (getenv("XDG_DATA_HOME") != NULL);
+    if (saved_ok)
+        (void)snprintf(saved, sizeof saved, "%s", getenv("XDG_DATA_HOME"));
+    if (setenv("XDG_DATA_HOME", root, 1) != 0)
+        return -1;
+
+    /* ---------- PHASE A: a stale Continue must not survive a game over ---------- */
+    memset(&prime, 0, sizeof prime);
+    prime.b1 = (uint8_t)BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL;
+    prime.level = 2;
+    prime.lives = 3;
+    prime.score = 1234;
+    prime.hoops_scored = 6;
+    stale_primed = bounce_persistence_save_record3(&prime) == 0;
+
+    memset(&app, 0, sizeof app);
+    if (stale_primed
+        && bounce_game_init(&app) == 0
+        && bounce_game_enter_menu(&app) == 0
+        && drive_app_to_level_loaded(&app, door_list_index(3), 3) == 0
+        && app_advance_level_loaded_to_player_initialized(&app) == 0
+        && app_advance_player_initialized_to_runtime_initialized(&app) == 0
+        && app_advance_runtime_initialized_to_camera_initialized(&app) == 0
+        && app_advance_camera_initialized_to_activated(&app) == 0
+        && bounce_game_initialize_game_timer(&app) == 0) {
+        /* The Game Over screen, reached with the session still owned. */
+        app.flow.state = BOUNCE_APP_STATE_GAME_OVER;
+        app.state = BOUNCE_GAME_STATE_GAME_OVER;
+        dispatch_fixture_context(&context);
+        fill_key_event(&event, KeyPress, 9u, 1u, 100u);
+        if (x11_dispatch_event(&context, &app, &event, XK_Escape) == 0) {
+            (void)bounce_persistence_load_record3(&back, &present);
+            gameover_store_inert = present
+                && back.b1 == BOUNCE_PERSISTENCE_RECORD3_B1_NONE;
+            gameover_row_hidden
+                = app.flow.state == BOUNCE_APP_STATE_MENU
+                && !bounce_app_flow_menu_item_enabled(&app.flow, 0u);
+        }
+    }
+    bounce_game_shutdown(&app);
+
+    /* ---------- PHASE B: a live run with lives must publish a resumable record --- */
+    memset(&prime, 0, sizeof prime);
+    prime.b1 = (uint8_t)BOUNCE_PERSISTENCE_RECORD3_B1_NONE;
+    prime.level = 11;
+    prime.lives = -1;
+    (void)bounce_persistence_save_record3(&prime);
+
+    memset(&app, 0, sizeof app);
+    if (bounce_game_init(&app) == 0
+        && bounce_game_enter_menu(&app) == 0
+        && drive_app_to_level_loaded(&app, door_list_index(5), 5) == 0
+        && app_advance_level_loaded_to_player_initialized(&app) == 0
+        && app_advance_player_initialized_to_runtime_initialized(&app) == 0
+        && app_advance_runtime_initialized_to_camera_initialized(&app) == 0
+        && app_advance_camera_initialized_to_activated(&app) == 0
+        && bounce_game_initialize_game_timer(&app) == 0) {
+        dispatch_fixture_context(&context);
+        fill_key_event(&event, KeyPress, 9u, 1u, 100u);
+        if (x11_dispatch_event(&context, &app, &event, XK_Escape) == 0) {
+            (void)bounce_persistence_load_record3(&back, &present);
+            live_store_present = present
+                && back.b1 == BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL;
+            live_store_in_level = back.level == 5;
+            live_row_shown = app.flow.state == BOUNCE_APP_STATE_MENU
+                && bounce_app_flow_menu_item_enabled(&app.flow, 0u);
+        }
+    }
+    bounce_game_shutdown(&app);
+
+    if (saved_ok)
+        (void)setenv("XDG_DATA_HOME", saved, 1);
+    else
+        (void)unsetenv("XDG_DATA_HOME");
+
+    if (!stale_primed
+        || !gameover_store_inert
+        || !gameover_row_hidden
+        || !live_store_present
+        || !live_store_in_level
+        || !live_row_shown) {
+        bad = 1;
+    }
+    printf("CONTINUE-PUBLISH stale_primed=%s gameover_store_inert=%s"
+           " gameover_row_hidden=%s live_store_present=%s"
+           " live_store_in_level=%s live_row_shown=%s"
+           " expected=yes yes yes yes yes yes %s\n",
+           stale_primed ? "yes" : "no",
+           gameover_store_inert ? "yes" : "no",
+           gameover_row_hidden ? "yes" : "no",
+           live_store_present ? "yes" : "no",
+           live_store_in_level ? "yes" : "no",
+           live_row_shown ? "yes" : "no",
+           bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * THE DOOR MUST START SHUT ON EVERY LEVEL BUT THE FIRST.
+ *
+ * THIS IS THE ONE TRANSITION NONE OF THE OTHER CHECKS COVERS, AND IT IS THE ONE
+ * THAT EXPLAINS "levels 2 to 11".
+ *
+ * The reset lives in bounce_game_load_level() (game.c:400-403), which clears
+ * TODO_ExitUnlocked, door_image_offset and door_open_flag together. Every check so
+ * far builds a FRESH app and loads a level directly, so it proves the reset runs
+ * when a level is loaded -- and says nothing about whether it runs on the route
+ * that actually follows a completed level. A player never reaches level 2 by
+ * loading it; they reach it by finishing level 1, and that is a different chain:
+ *
+ *   bounce_game_mark_level_complete()  ->  BOUNCE_APP_STATE_LEVEL_COMPLETE
+ *   bounce_game_continue_level()       ->  release, stage START_LEVEL(N+1)
+ *   app_begin_canonical_gameplay()     ->  bounce_game_load_level_entry(N+1)
+ *
+ * If any link of that chain skips the load, the new level inherits the finished
+ * one's door: door_image_offset is still 24 and door_open_flag still true, so the
+ * exit is drawn in its OPEN frame and admits the ball from the first tick. That is
+ * precisely the reported symptom, and it is invisible to a fresh-load fixture for
+ * the strongest possible reason -- level 1 is the only level that can be reached
+ * without a predecessor, so level 1 is the only level a fresh-load fixture proves
+ * anything about.
+ *
+ * WHAT IS ASSERTED, PER LEVEL. The door is driven fully open on level N through the
+ * real producer, the level is completed through the real M gate, the production
+ * Continue runs, and the staging chain is driven to the point where level N+1 is
+ * owned. Then all three pieces of door state must be back at their level-load
+ * values. door_open_flag alone is not enough: it is the latch, while
+ * door_image_offset is what the renderer reads, and a reset that cleared only the
+ * latch would leave the open frame on screen while the gate correctly refused.
+ */
+static int verify_door_resets_between_levels(void)
+{
+    int level_id;
+    int bad = 0;
+    int stale = 0;
+
+    for (level_id = BOUNCE_APP_FIRST_LEVEL_ID;
+         level_id < BOUNCE_APP_LAST_LEVEL_ID;
+         ++level_id) {
+        BounceApp run;
+        int32_t exit_col;
+        int32_t exit_row;
+        int32_t total_hoops;
+        int tick;
+        bool opened = false;
+        bool completed = false;
+        bool next_loaded = false;
+        bool reset_ok = false;
+        int32_t next_total = 0;
+
+        memset(&run, 0, sizeof run);
+        if (bounce_game_init(&run) != 0
+            || bounce_game_enter_menu(&run) != 0
+            || drive_app_to_level_loaded(
+                   &run,
+                   door_list_index(level_id),
+                   level_id
+               ) != 0
+            || app_advance_level_loaded_to_player_initialized(&run) != 0
+            || app_advance_player_initialized_to_runtime_initialized(&run) != 0
+            || app_advance_runtime_initialized_to_camera_initialized(&run) != 0
+            || app_advance_camera_initialized_to_activated(&run) != 0
+            || bounce_game_initialize_game_timer(&run) != 0) {
+            bounce_game_shutdown(&run);
+            return -1;
+        }
+        exit_col = (int32_t)bounce_level_exit_x(run.level);
+        exit_row = (int32_t)bounce_level_exit_y(run.level);
+        total_hoops = bounce_level_hoops_total(run.level);
+        if (exit_col < 0 || exit_row < 0 || total_hoops <= 0) {
+            bounce_game_shutdown(&run);
+            return -1;
+        }
+
+        /* Open this level's door for real, then stand on it until it completes. */
+        while (run.hoops_scored < total_hoops) {
+            if (app_collect_hoop(&run, 1, 1, 13u, 0u) != 0) {
+                bounce_game_shutdown(&run);
+                return -1;
+            }
+        }
+        for (tick = 0; tick < 40 && !opened; ++tick) {
+            BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+
+            run.player.TODO_unkX = exit_col * BOUNCE_TILE_SIZE + 6;
+            run.player.TODO_unkY = exit_row * BOUNCE_TILE_SIZE + 6;
+            if (app_timer_callback_dispatch(&run, &branch) != 0) {
+                bounce_game_shutdown(&run);
+                return -1;
+            }
+            if (run.door_open_flag)
+                opened = true;
+        }
+        /*
+         * The completion is entered through bounce_game_mark_level_complete(),
+         * which is the production transcription of f.java:602 `this.n.e = true` --
+         * the single write the tile-9 collision performs -- and of e.java:313-317.
+         * It is called directly rather than by parking the ball on the door,
+         * because parking a big ball inside the level's own geometry makes the
+         * tile walk abort on a blocking cell first (f.java:159-162), which is a
+         * property of the fixture and not of the door; see the note in
+         * verify_door_waits_for_hoops(). Using the production entry point keeps
+         * this transition under test instead of under the walk's abort rule.
+         */
+        if (!opened) {
+            bounce_game_shutdown(&run);
+            return -1;
+        }
+        /*
+         * The tick loop may already have completed the level, because the ball was
+         * parked on the door and the M gate is live by then. That is the normal
+         * outcome and is accepted as-is; mark_level_complete() is only called when
+         * it has not happened yet, and it refuses anything but PLAYING, so the
+         * two orderings cannot both be attempted.
+         */
+        completed = run.level_complete;
+        if (!completed) {
+            if (bounce_game_mark_level_complete(&run) != 0) {
+                bounce_game_shutdown(&run);
+                return -1;
+            }
+            completed = run.level_complete;
+        }
+        if (!completed) {
+            bounce_game_shutdown(&run);
+            return -1;
+        }
+
+        /*
+         * THE PRODUCTION ROUTE ONWARD, AND IT IS THE ONE JAVA TAKES.
+         *
+         * bounce_game_mark_level_complete() ends by arming deferred_init, which is
+         * Java's `this.d = true` at e.java:316. The next Tick consumes it:
+         *
+         *   e.java:222-226   if (this.d) { InitializeGame(); repaint(); return; }
+         *   e.java:115-124   InitializeGame() -> LoadLevelId(this.level)
+         *   b.java:239         CreateTiles(this.exitX, this.exitY, Sprites[EXIT])
+         *   b.java:814,816       this.b = 0;   this.M = false;
+         *
+         * So ONE further dispatch IS the whole level transition in the original,
+         * and the loader it reaches is bounce_game_tick_dispatch()'s deferred arm
+         * (game.c:974-979) calling bounce_game_load_level_entry(). Driving that is
+         * what makes this a test of the real route rather than a reconstruction:
+         * bounce_game_continue_level() and the staged entry are the other route,
+         * and they reach the same loader, so the reset is asserted on the route a
+         * player actually takes when a level ends.
+         *
+         */
+        /*
+         * THE STAGED ENTRY, i.e. what the Level Complete screen's Continue does.
+         *
+         * bounce_game_continue_level() is BounceGame.java:263-266 -- it releases
+         * the finished run and stages START_LEVEL(level + 1) -- and
+         * app_begin_canonical_gameplay() is the frame loop's own driver of the
+         * staged chain, which reaches bounce_game_load_level_entry() through
+         * app_advance_gameplay_entry_to_level_loaded(). Both are the production
+         * functions, called in the production order.
+         *
+         * The timer stop is explicit because the test cannot reach the one that
+         * normally happens first. In play, game.c:978 stops it inside
+         * bounce_game_tick_dispatch()'s deferred arm; here the completion was
+         * entered by calling bounce_game_mark_level_complete() directly, so no tick
+         * tail follows it and the timer is still running. bounce_game_initialize_
+         * game_timer() is idempotent in the Java sense (b.java:836-837) and refuses
+         * to start over a running timer, so without this the staging would fail for
+         * a reason that has nothing to do with the door.
+         */
+        bounce_game_timer_stop(&run.game_timer);
+        if (bounce_game_continue_level(&run) < 0) {
+            bounce_game_shutdown(&run);
+            return -1;
+        }
+        if (app_begin_canonical_gameplay(&run) != 0) {
+            bounce_game_shutdown(&run);
+            return -1;
+        }
+        next_loaded = run.level != NULL && run.runtime != NULL;
+        if (next_loaded) {
+            next_total = bounce_level_hoops_total(run.level);
+            reset_ok = !run.TODO_ExitUnlocked
+                && run.door_image_offset == 0
+                && !run.door_open_flag
+                && run.hoops_scored == 0
+                && run.level_id == level_id + 1
+                && next_total > 0;
+        }
+        if (!reset_ok)
+            ++stale;
+        if (!next_loaded || !reset_ok)
+            bad = 1;
+        printf("DOOR-RESET %2d->%2d next_loaded=%s unlock=%d offset=%d"
+               " open=%d hoops=%d level_id=%d next_hoops=%ld all_reset=%s %s\n",
+               level_id,
+               level_id + 1,
+               next_loaded ? "yes" : "no",
+               (int)run.TODO_ExitUnlocked,
+               (int)run.door_image_offset,
+               (int)run.door_open_flag,
+               (int)run.hoops_scored,
+               (int)run.level_id,
+               (long)next_total,
+               reset_ok ? "yes" : "no",
+               (next_loaded && reset_ok) ? "PASS" : "FAIL");
+        bounce_game_shutdown(&run);
+    }
+    printf("DOOR-RESET summary transitions=10 stale_door=%d expected=0 %s\n",
+           stale,
+           bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * NO SINGLE TICK MAY COUNT MORE THAN ONE HOOP.
+ *
+ * WHY THIS IS ITS OWN CHECK, AND WHY IT IS THE LIKELY DEFECT. The unlock is
+ * `HoopsScored == HoopsTotal`, and the only writer of HoopsScored is
+ * app_collect_hoop(). So the exit opening "too early" is not a door problem at
+ * all -- the door gate is downstream of the counter and faithfully obeys it. The
+ * only way the exit can open while hoops remain on the map is for the counter to
+ * reach the total before every hoop has actually been taken. If one physical hoop
+ * were counted twice, the door would open at half the hoops, and the symptom
+ * would be exactly the reported one.
+ *
+ * THE MECHANISM IT LOOKS FOR. A hoop is two adjacent cells (f.java:508/518/539
+ * write the consumed PAIR, and app_collect_hoop() reproduces that: the self cell
+ * and its partner are both rewritten to their consumed ids before the counter is
+ * touched). Once that holds, the second half cannot be collected again, because
+ * the consumed ids are not in app_hoop_collect_gate_id(). The failure mode that
+ * would break this is a tile walk that READS all of its cells up front and
+ * processes the cached values afterwards: the rewrite would then be invisible to
+ * the walk's own second half, and the pair would score twice in one tick.
+ *
+ * WHY THE WHOLE LEVEL IS SWEPT RATHER THAN ONE SPOT. Whether both halves land in
+ * the same tick depends on where the hoops sit relative to the ball's walk box,
+ * which differs per level and per hoop orientation. A single fixture would only
+ * test the one spot it happened to pick -- which is how a defect can live in the
+ * tree while every existing check passes. So every hoop cell in every level is
+ * visited, from a ball placed on that cell, and the counter's per-tick delta is
+ * recorded.
+ *
+ * WHY IT IS A MAX-OVER-ALL-TICKS RATHER THAN A TOTAL. The end state cannot show
+ * the defect: if every cell is visited once and each scores, the total lands on
+ * HoopsTotal either way. Only the per-tick delta shows it.
+ *
+ * ALSO ASSERTED, because a double count has a second signature: the counter must
+ * never exceed the number of distinct hoops the level actually contains.
+ */
+static int verify_hoop_counter_no_double_count(void)
+{
+    int level_id;
+    int bad = 0;
+    int levels_with_double = 0;
+    long worst_delta = 0;
+
+    for (level_id = BOUNCE_APP_FIRST_LEVEL_ID;
+         level_id <= BOUNCE_APP_LAST_LEVEL_ID;
+         ++level_id) {
+        BounceApp hoop;
+        int32_t total_hoops;
+        int32_t grid_w;
+        int32_t grid_h;
+        int32_t x;
+        int32_t y;
+        long worst = 0;
+        int over_total = 0;
+
+        memset(&hoop, 0, sizeof hoop);
+        if (bounce_game_init(&hoop) != 0
+            || bounce_game_enter_menu(&hoop) != 0
+            || drive_app_to_level_loaded(
+                   &hoop,
+                   door_list_index(level_id),
+                   level_id
+               ) != 0
+            || app_advance_level_loaded_to_player_initialized(&hoop) != 0
+            || app_advance_player_initialized_to_runtime_initialized(&hoop) != 0
+            || app_advance_runtime_initialized_to_camera_initialized(&hoop) != 0
+            || app_advance_camera_initialized_to_activated(&hoop) != 0
+            || bounce_game_initialize_game_timer(&hoop) != 0) {
+            bounce_game_shutdown(&hoop);
+            return -1;
+        }
+        total_hoops = bounce_level_hoops_total(hoop.level);
+        grid_w = (int32_t)bounce_runtime_level_tiles_width(hoop.runtime);
+        grid_h = (int32_t)bounce_runtime_level_tiles_height(hoop.runtime);
+        if (total_hoops <= 0 || grid_w <= 0 || grid_h <= 0) {
+            bounce_game_shutdown(&hoop);
+            return -1;
+        }
+
+        for (y = 0; y < grid_h && !over_total; ++y) {
+            for (x = 0; x < grid_w; ++x) {
+                uint16_t value = 0u;
+                int32_t before;
+                BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+
+                if (bounce_runtime_level_tiles_get(
+                        hoop.runtime, (int) x, (int) y, &value
+                    ) != 0) {
+                    bounce_game_shutdown(&hoop);
+                    return -1;
+                }
+                if (!app_hoop_collect_gate_id((uint32_t) (value & 0x3Fu)))
+                    continue;
+                /*
+                 * Park the ball on this cell so the walk certainly reaches it, and
+                 * so the partner cell is inside the same walk window when the two
+                 * are adjacent -- which is precisely the condition the double
+                 * count needs.
+                 */
+                hoop.player.TODO_unkX = x * BOUNCE_TILE_SIZE + 6;
+                hoop.player.TODO_unkY = y * BOUNCE_TILE_SIZE + 6;
+                before = hoop.hoops_scored;
+                if (app_timer_callback_dispatch(&hoop, &branch) != 0) {
+                    bounce_game_shutdown(&hoop);
+                    return -1;
+                }
+                if (hoop.hoops_scored - before > worst)
+                    worst = (long) (hoop.hoops_scored - before);
+                if (hoop.hoops_scored > total_hoops)
+                    over_total = 1;
+            }
+        }
+        if (worst > worst_delta)
+            worst_delta = worst;
+        if (worst > 1)
+            ++levels_with_double;
+        if (worst > 1 || over_total)
+            bad = 1;
+        printf("HOOP-COUNT level=%2d hoops_total=%ld worst_single_tick_delta=%ld"
+               " delta_at_most_one=%s never_exceeds_total=%s %s\n",
+               level_id,
+               (long) total_hoops,
+               worst,
+               worst <= 1 ? "yes" : "no",
+               over_total ? "no" : "yes",
+               (worst <= 1 && !over_total) ? "PASS" : "FAIL");
+        bounce_game_shutdown(&hoop);
+    }
+    printf("HOOP-COUNT summary levels=11 worst_delta=%ld levels_double_counted=%d"
+           " expected=1 0 %s\n",
+           worst_delta,
+           levels_with_double,
+           bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * THE DOOR MUST NOT OPEN BEFORE THE LAST HOOP.
+ *
+ * WHY THIS EXISTS ALONGSIDE THE OTHER DOOR-GATE FIXTURE. The fixture in
+ * verify_collision_query() proves the POSITIVE chain: collect every hoop, watch the
+ * animation run, watch the one-shot clear consume it. It establishes that the gate
+ * works when it should fire. It says nothing at all about what happens when the
+ * gate should NOT fire, which is precisely the reported symptom: the exit usable
+ * before the hoops are in. A gate can satisfy the positive chain and still be
+ * reachable without its unlock precondition -- for instance if the flag were
+ * cleared too late, set somewhere else, or if a second producer existed. Only the
+ * negative direction catches that.
+ *
+ * THE INVARIANT, STATED OVER EVERY TICK RATHER THAN AT ONE INSTANT. The two pieces
+ * of state that make the exit usable are door_image_offset (the animation position)
+ * and door_open_flag (Java's M, which is also what f.java:601 tests before it sets
+ * `e`). Both are produced by exactly one block -- the e.java:286-297 gate -- and that
+ * block is reachable only when TODO_ExitUnlocked is true, whose only producer is
+ * the collection site in app_collect_hoop() and fires only on
+ * `hoops_scored == hoops_total`. So on EVERY tick:
+ *
+ *     hoops_scored < hoops_total  =>  door_image_offset == 0 && !door_open_flag
+ *     and, because the ball is parked ON the exit for the whole run:
+ *                                 =>  !level_complete
+ *
+ * The third clause is the functional half and the reason the ball is moved rather
+ * than left to fall: it asserts the exit cannot be PASSED, not merely that it does
+ * not animate. A door that rendered shut but let the ball through would satisfy the
+ * first clause and still be broken.
+ *
+ * THE BALL IS PLACED ON THE EXIT, AND THE CAMERA OPERAND IS SATISFIED FOR IT. Both
+ * are preconditions of the gate, so leaving either unmet would make the assertion
+ * vacuous -- the gate would be unreachable for reasons that have nothing to do with
+ * the unlock. The existing fixture documents the same requirement for the same
+ * reason. The ball is moved rather than the camera written, because
+ * app_update_camera_*() recomputes l, k and v from the ball every tick and would
+ * overwrite a direct write on the next frame.
+ *
+ * THE NEGATIVE CONTROL, AND WHY IT IS NOT OPTIONAL. Having proved the door stays
+ * shut for the whole run, the second phase collects every hoop through the REAL
+ * producer -- app_collect_hoop(), which is where `HoopsScored == HoopsTotal ->
+ * TODO_ExitUnlocked = true` actually lives -- and then requires the gate to reach
+ * the open state and the ball to complete the level. Without this phase a gate that
+ * was simply dead code, permanently false, would satisfy every implication above
+ * and pass. This is what makes the first phase a real assertion.
+ *
+ * STATE IS NOT LEAKED BETWEEN THE PHASES. The second phase rebuilds the whole app
+ * from scratch rather than continuing the first, because the first phase's ball has
+ * fallen, its counters have moved and its camera has followed it; a shared app
+ * would make the second phase depend on where the first one happened to stop.
+ */
+static int verify_door_waits_for_hoops(void)
+{
+    /*
+     * ALL ELEVEN LEVELS, NOT JUST ONE. Level 1 is the odd one out in this tree:
+     * it is the only shipped level with no dynamic thorns (thorn_count 0, where
+     * levels 2-11 carry 4..12), it is the shortest, and it was the only level the
+     * first version of this check ran on. A gate defect that only shows up where
+     * thorn updates, longer scrolls or denser hoop fields exist would be invisible
+     * to a single-level check, so every level is driven through the same two
+     * phases and the failure is reported per level.
+     */
+    int level_id;
+    int bad = 0;
+    int early_levels = 0;
+    int dead_levels = 0;
+
+    printf("DOOR-HOOPS levels=1-11 phase1=hoops_incomplete_ball_on_exit"
+           " phase2=hoops_complete\n");
+    for (level_id = BOUNCE_APP_FIRST_LEVEL_ID;
+         level_id <= BOUNCE_APP_LAST_LEVEL_ID;
+         ++level_id) {
+        BounceApp door;
+        int32_t total_hoops;
+        int32_t exit_col;
+        int32_t exit_row;
+        int tick;
+        bool stayed_shut = true;
+        bool stayed_passable_shut = true;
+        bool opened_after_collection = false;
+        bool completed_after_open = false;
+        bool skip = false;
+
+        memset(&door, 0, sizeof door);
+        if (bounce_game_init(&door) != 0
+            || bounce_game_enter_menu(&door) != 0
+            || drive_app_to_level_loaded(
+                   &door,
+                   door_list_index(level_id),
+                   level_id
+               ) != 0
+            || app_advance_level_loaded_to_player_initialized(&door) != 0
+            || app_advance_player_initialized_to_runtime_initialized(&door) != 0
+            || app_advance_runtime_initialized_to_camera_initialized(&door) != 0
+            || app_advance_camera_initialized_to_activated(&door) != 0
+            || bounce_game_initialize_game_timer(&door) != 0) {
+            bounce_game_shutdown(&door);
+            return -1;
+        }
+        total_hoops = bounce_level_hoops_total(door.level);
+        exit_col = (int32_t)bounce_level_exit_x(door.level);
+        exit_row = (int32_t)bounce_level_exit_y(door.level);
+        /*
+         * exit_col == 0 is NOT rejected: level 11 legitimately places its door at
+         * column 0, and the gate's camera operand
+         * `(exitX + 1) * 12 > m() && exitX * 12 < g()` is satisfied there because
+         * the camera's left edge is itself 0. Rejecting it would have silently
+         * skipped the one level with the largest hoop count and a big ball.
+         */
+        if (total_hoops <= 0
+            || exit_col < 0
+            || exit_col >= (int32_t)bounce_runtime_level_tiles_width(door.runtime)
+            || exit_row < 0
+            || exit_row + 1 >= (int32_t)bounce_runtime_level_tiles_height(
+                door.runtime)) {
+            bounce_game_shutdown(&door);
+            return -1;
+        }
+
+        /* PHASE ONE -- hoops_scored 0, ball parked on the exit door cell. */
+        door.hoops_scored = 0;
+        door.player.TODO_unkX = exit_col * BOUNCE_TILE_SIZE + 6;
+        door.player.TODO_unkY = exit_row * BOUNCE_TILE_SIZE + 6;
+        for (tick = 0; tick < 120; ++tick) {
+            BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+
+            if (app_timer_callback_dispatch(&door, &branch) != 0) {
+                bounce_game_shutdown(&door);
+                return -1;
+            }
+            if (door.TODO_ExitUnlocked
+                || door.door_image_offset != 0
+                || door.door_open_flag) {
+                stayed_shut = false;
+                break;
+            }
+            if (door.level_complete
+                || door.state != BOUNCE_GAME_STATE_PLAYING) {
+                stayed_passable_shut = false;
+                break;
+            }
+        }
+        bounce_game_shutdown(&door);
+
+        /* PHASE TWO -- negative control, on a FRESH app for this level. */
+        memset(&door, 0, sizeof door);
+        if (bounce_game_init(&door) != 0
+            || bounce_game_enter_menu(&door) != 0
+            || drive_app_to_level_loaded(
+                   &door,
+                   door_list_index(level_id),
+                   level_id
+               ) != 0
+            || app_advance_level_loaded_to_player_initialized(&door) != 0
+            || app_advance_player_initialized_to_runtime_initialized(&door) != 0
+            || app_advance_runtime_initialized_to_camera_initialized(&door) != 0
+            || app_advance_camera_initialized_to_activated(&door) != 0
+            || bounce_game_initialize_game_timer(&door) != 0) {
+            bounce_game_shutdown(&door);
+            return -1;
+        }
+        door.hoops_scored = 0;
+        while (door.hoops_scored < total_hoops) {
+            if (app_collect_hoop(&door, 1, 1, 13u, 0u) != 0) {
+                bounce_game_shutdown(&door);
+                return -1;
+            }
+        }
+        if (!door.TODO_ExitUnlocked) {
+            bounce_game_shutdown(&door);
+            return -1;
+        }
+        for (tick = 0; tick < 40; ++tick) {
+            BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+
+            door.player.TODO_unkX = exit_col * BOUNCE_TILE_SIZE + 6;
+            door.player.TODO_unkY = exit_row * BOUNCE_TILE_SIZE + 6;
+            if (app_timer_callback_dispatch(&door, &branch) != 0) {
+                bounce_game_shutdown(&door);
+                return -1;
+            }
+            if (door.door_open_flag)
+                opened_after_collection = true;
+            if (door.level_complete) {
+                completed_after_open = true;
+                break;
+            }
+        }
+        bounce_game_shutdown(&door);
+
+        if (!stayed_shut || !stayed_passable_shut)
+            ++early_levels;
+        if (!opened_after_collection)
+            ++dead_levels;
+        /*
+         * control_completes is REPORTED BUT NOT ASSERTED, and the reason is a
+         * property of this fixture rather than of the door.
+         *
+         * Completing the level needs the tile walk to REACH the door cell, and
+         * that walk aborts at the first blocking cell -- f.java:159-162, which
+         * verify_static_wall_response and the Step 12X-P4-C-D-C-B4-B probe both
+         * establish. Parking the ball on the door cell puts it inside the level's
+         * own geometry, and a big ball's box is 16 px against a small ball's 12, so
+         * on the three big-ball levels (3, 5 and 11) the walk meets a wall before
+         * it reaches the door and returns first. That is the fixture standing the
+         * ball somewhere it would never be, not the door failing: the same phase
+         * reports control_opens=yes on every level, which is the e.java:286-297
+         * contract this function is actually about.
+         *
+         * Completion through the door is a separate contract and it is already
+         * asserted where the approach is real: verify_w1_completion_request_latch()
+         * drives the af completion key, and verify_collision_query()'s DOOR-GATE
+         * fixture asserts the open/consume/one-shot sequence. Duplicating it here
+         * with a ball wedged in a wall would add a brittle assertion, not coverage.
+         */
+        if (!stayed_shut || !stayed_passable_shut || !opened_after_collection)
+            bad = 1;
+        skip = false;
+
+        printf("DOOR-HOOPS level=%2d hoops=%2ld exit=(%ld,%ld)"
+               " stayed_shut=%s never_completed=%s"
+               " control_opens=%s control_completes=%s %s\n",
+               level_id,
+               (long) total_hoops,
+               (long) exit_col,
+               (long) exit_row,
+               stayed_shut ? "yes" : "no",
+               stayed_passable_shut ? "yes" : "no",
+               opened_after_collection ? "yes" : "no",
+               completed_after_open ? "yes" : "no",
+               skip
+                   ? "SKIP"
+                   : ((stayed_shut && stayed_passable_shut
+                       && opened_after_collection)
+                          ? "PASS"
+                          : "FAIL"));
+    }
+    printf("DOOR-HOOPS summary levels=11 early_open=%d dead_gate=%d"
+           " assert=early_open+gate_reaches_open"
+           " expected=0 0 %s\n",
+           early_levels,
+           dead_levels,
+           bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * THE ACHIEVED TICK CADENCE, MEASURED OVER REAL FRAME PERIODS.
+ *
+ * WHAT THIS EXISTS TO CATCH. Everything else in this file bounds the deadline; none
+ * of it pins the RATE. The two shapes below both satisfy every existing bound:
+ *
+ *   next = now + PERIOD        a fresh, exact 40 ms gap after every tick
+ *   next = prev_deadline + P   exactly 40 ms of wall clock per tick, forever
+ *
+ * They differ only in whether the frame-time lateness is fed back into the
+ * deadline. Because `now` is sampled once per rendered frame, the first shape adds
+ * 0..16 ms of lateness to every single tick and never recovers it, so the error is
+ * cumulative rather than bounded. Simulated over 60 s of 16 ms frames it yields
+ * 1250 ticks -- a 48.00 ms average period and 20.8 Hz -- against the 40 ms /
+ * ~25 Hz that BounceTimer.java:17 schedules with `schedule(this, 0L, 40L)`.
+ *
+ * WHY A 17% SHORTFALL IS A GAMEPLAY DEFECT AND NOT PACING. Every physics constant
+ * in the recovered source is expressed PER TICK, not per second: JUMP_STRENGTH -67,
+ * NORMAL_GRAVITY_ACCELL 4, MAX_TOTAL_SPEED 150, MAX_HORZ_SPEED 50 (f.java). Those
+ * numbers are only meaningful at the tick rate they were authored for. Running
+ * them at 20.8 Hz instead of 25 Hz scales gravity, jump height, run speed and every
+ * bonus timer by 0.83, and it does so silently and uniformly, so nothing looks
+ * broken -- the game just feels wrong and is not the game.
+ *
+ * WHY THIS NEEDS REAL FRAME PERIODS. The 64-iteration loop in
+ * verify_production_game_routing() runs with no sleep, so `now` moves by
+ * microseconds and nearly every iteration correctly skips its tick. A rate measured
+ * there describes the loop. This routine therefore reproduces the production frame
+ * loop's own shape -- one dispatch per iteration, then one frame period of sleep --
+ * which is the only condition under which the deadline arithmetic is exercised the
+ * way it is at run time.
+ *
+ * THE ACCEPTANCE BAND, AND WHY IT IS ASYMMETRIC. The source rate is 25 Hz. The band
+ * has to survive a loaded, preempted or virtualised host, where a frame can
+ * overrun; a stall makes the measured rate LOWER, never higher, because the
+ * fixed-delay resync discards missed ticks instead of replaying them. So:
+ *
+ *   upper 32 Hz  The drifting shape cannot reach this: it is strictly slower than
+ *                nominal, never faster, because lateness is only ever added. The
+ *                upper bound is therefore slack that costs no sensitivity at all.
+ *   lower 21 Hz  The drifting shape sits at 20.8 Hz, just outside it, and the
+ *                exact shape sits at 25.0 Hz, comfortably inside. The 4% margin
+ *                between them is what makes this a real discriminator; the 20%
+ *                headroom below nominal is what makes it survivable on a slow host.
+ *
+ * The structural invariant is asserted alongside the rate, because the rate alone
+ * cannot tell a correct 25 Hz from an accidental one: the per-tick deadline advance
+ * must never exceed one period on a tick that was not served after a stall. That
+ * is the property the rate is a consequence of, and it is exact where the rate is
+ * statistical.
+ */
+static int verify_tick_cadence(void)
+{
+    BounceApp app;
+    /* One production frame is 16 ms; 80 of them is ~1.28 s and ~32 ticks. */
+    enum { CADENCE_FRAMES = 80 };
+    const int64_t band_low_mHz = 21000;
+    const int64_t band_high_mHz = 32000;
+    struct timespec nap;
+    uint64_t ticks_before;
+    uint64_t ticks_after;
+    int64_t started_ms;
+    int64_t elapsed_ms;
+    int64_t measured_mHz;
+    unsigned int frames_run;
+    unsigned int served = 0u;
+    bool advance_ok = true;
+    bool rate_ok;
+
+    memset(&app, 0, sizeof app);
+    if (drive_app_to_gameplay_entry_start_level(&app) != 0)
+        return -1;
+    /*
+     * The first production frame is what consumes START_LEVEL, loads the level,
+     * starts the timer and runs tick #1 (verified in verify_production_game_routing
+     * steps A+B+C). Everything measured below therefore counts ticks 2..N, which is
+     * why the baseline is taken here and not one call earlier.
+     */
+    if (app_update_production_game(&app) != 0
+        || !app_canonical_gameplay_active(&app)) {
+        bounce_game_release_level(&app);
+        return -1;
+    }
+    ticks_before = bounce_game_timer_tick_dispatch_count(&app.game_timer);
+    started_ms = monotonic_milliseconds();
+    if (started_ms < 0) {
+        bounce_game_release_level(&app);
+        return -1;
+    }
+    for (frames_run = 0u; frames_run < (unsigned int) CADENCE_FRAMES;
+         ++frames_run) {
+        int64_t before;
+        int64_t deadline_pre;
+        uint64_t dispatch_before;
+        uint64_t dispatch_after;
+
+        before = monotonic_milliseconds();
+        deadline_pre = app.canonical_next_tick_ms;
+        dispatch_before = bounce_game_timer_tick_dispatch_count(&app.game_timer);
+        if (app_update_production_game(&app) != 0) {
+            bounce_game_release_level(&app);
+            return -1;
+        }
+        dispatch_after = bounce_game_timer_tick_dispatch_count(&app.game_timer);
+        if (dispatch_after < dispatch_before
+            || dispatch_after - dispatch_before > 1u) {
+            bounce_game_release_level(&app);
+            return -1;
+        }
+        if (dispatch_after != dispatch_before) {
+            int64_t advance;
+
+            ++served;
+            /*
+             * The exact shape advances the deadline by exactly one period. The
+             * drifting shape advances it by one period PLUS this frame's lateness,
+             * so it exceeds the period whenever the frame was even slightly late --
+             * which, over 80 real frames, is nearly always. Ticks that arrived after
+             * a stall of a full period or more are exempt, because there the
+             * fixed-delay resync deliberately places the deadline a period from
+             * `now`; see app_run_canonical_gameplay_tick().
+             */
+            if (deadline_pre > 0
+                && before >= deadline_pre
+                && (before - deadline_pre)
+                    < (int64_t) BOUNCE_GAME_TIMER_PERIOD_MS) {
+                advance = app.canonical_next_tick_ms - deadline_pre;
+                if (advance <= 0
+                    || advance > (int64_t) BOUNCE_GAME_TIMER_PERIOD_MS) {
+                    advance_ok = false;
+                }
+            }
+        }
+        /* The production frame period. sleep_frame() is the frame loop's own. */
+        nap.tv_sec = 0;
+        nap.tv_nsec = 16L * 1000L * 1000L;
+        (void) nanosleep(&nap, NULL);
+    }
+    ticks_after = bounce_game_timer_tick_dispatch_count(&app.game_timer);
+    elapsed_ms = monotonic_milliseconds() - started_ms;
+    app_end_canonical_gameplay(&app);
+    bounce_game_release_level(&app);
+
+    if (elapsed_ms <= 0 || ticks_after <= ticks_before || served == 0u)
+        return -1;
+    /* Rate in millihertz, so the whole computation stays in integer arithmetic. */
+    measured_mHz = (int64_t) (ticks_after - ticks_before) * 1000000
+        / elapsed_ms;
+    rate_ok = measured_mHz >= band_low_mHz && measured_mHz <= band_high_mHz;
+
+    printf("TICK-CADENCE frames=%u served=%u elapsed_ms=%lld rate_mHz=%lld"
+           " nominal_mHz=%d band=[%lld,%lld] per_tick_advance=%s rate=%s"
+           " expected=yes >=%lld <=%lld %s %s %s\n",
+           (unsigned int) CADENCE_FRAMES,
+           served,
+           (long long) elapsed_ms,
+           (long long) measured_mHz,
+           1000000 / (int) BOUNCE_GAME_TIMER_PERIOD_MS,
+           (long long) band_low_mHz,
+           (long long) band_high_mHz,
+           advance_ok ? "exact" : "drifting",
+           rate_ok ? "in_band" : "out_of_band",
+           (long long) band_low_mHz,
+           (long long) band_high_mHz,
+           advance_ok ? "exact" : "drifting",
+           rate_ok ? "yes" : "no",
+           advance_ok && rate_ok ? "PASS" : "FAIL");
+    return advance_ok && rate_ok ? 0 : -1;
 }
 
 /*
@@ -23302,7 +25188,25 @@ static int verify_continue_entry_wiring(void)
         bounce_game_release_level(&app);
         do { fprintf(stderr, "R2FAIL site 11\n"); goto failure; } while (0);
     }
-    if (bounce_ui_shell_handle_press(
+    /*
+     * STEP 38-RESET -- the count is pinned to 0 before the New Game press.
+     *
+     * What this section is FOR is that offering a Continue row does not disturb New
+     * Game: the highlight moves off Continue, New Game activates, the score resets
+     * and three lives are dealt. None of that depends on the unlocked-level count,
+     * so the count is set to the value that makes New Game stage level 1 directly and
+     * the section keeps testing only what it names.
+     *
+     * Without the pin, the shipped default of 2 would send this press through Level
+     * Select instead, app_begin_canonical_gameplay() would have nothing staged to
+     * begin, and the section would fail on `lives == 3` -- three lines away from the
+     * thing it is actually about, which is a poor way to report a moved default. The
+     * default-of-2 route is covered where it belongs, by
+     * verify_gameplay_entry_boundary()'s Test A.
+     */
+    if (bounce_app_flow_set_available_level_count(&app.flow, 0u) != 0
+        || bounce_app_flow_available_level_count(&app.flow) != 0u
+        || bounce_ui_shell_handle_press(
             &app.flow,
             BOUNCE_UI_INPUT_DOWN
         ) != 0
@@ -24212,11 +26116,17 @@ static int x11_dispatch_event(
         bool pressed;
         bool recognized_input;
         /* STEP 12X-P4-B: sampled before the UI press; see the use below. */
-        bool was_game_end;
+        bool was_terminal_screen;
         /* TUGAS 2b: sampled before the UI press, to detect a theme change. */
         unsigned int theme_before;
         /* NATIVE ADDITION: the same sample for the keypad setting. */
         bool t9_before;
+        /*
+         * STEP CONTINUE-RETURN: sampled before the UI press, so the arrival at the main
+         * menu can be told apart from a press made while already there. See the refresh
+         * call on the far side of bounce_ui_shell_handle_press().
+         */
+        bool was_menu;
 
         /*
          * STEP 13G-X -- claim keyboard focus once the window is really viewable.
@@ -24689,12 +26599,33 @@ static int x11_dispatch_event(
 
                 ui_input = app_ui_input_from_source(source);
                 /*
-                 * STEP 12X-P4-B -- sample the game-complete terminal state
-                 * before the press, for the same reason the Escape edge samples
-                 * app_canonical_gameplay_active() and the terminal states
+                 * STEP 12X-P4-B, EXTENDED TO GAME_OVER -- sample BOTH terminal
+                 * states before the press, for the same reason the Escape edge
+                 * samples app_canonical_gameplay_active() and the terminal states
                  * before it applies BOUNCE_APP_EVENT_MENU.
+                 *
+                 * WHY GAME_OVER IS HERE AND WAS NOT. TODO_ShowInstructions
+                 * (BounceGame.java:430-435) is the single producer of BOTH terminal
+                 * forms -- it is called with won == false from the death arm
+                 * (e.java:271) and with won == true from the win arm (e.java:321) --
+                 * and it sets K = 3 and J = 0 before calling either ShowGameEnd or
+                 * the congrats variant. So both forms leave Continue invalid, and
+                 * the two states are reached from the same Java method by the same
+                 * UI gesture: the form's own OK command. Handling only GAME_END
+                 * therefore left the death form's OK press on a different path from
+                 * the win form's, for no reason in the source.
+                 *
+                 * The consequence of the omission was the stale-Continue class the
+                 * Escape edge already documents and fixes at length: dying leaves
+                 * the store holding the previous in-level b1 = 1, so neither the
+                 * capture that would overwrite it with b1 = 0 nor the availability
+                 * refresh ran on this route, and the main menu rendered a Continue
+                 * row at index 0 and preselected it -- offering to resume a run that
+                 * had just ended.
                  */
-                was_game_end = app->flow.state == BOUNCE_APP_STATE_GAME_END;
+                was_terminal_screen
+                    = app->flow.state == BOUNCE_APP_STATE_GAME_END
+                    || app->flow.state == BOUNCE_APP_STATE_GAME_OVER;
 
                 /*
                  * TUGAS 2b -- the applied color profile, sampled BEFORE the press
@@ -24715,6 +26646,12 @@ static int x11_dispatch_event(
                  * and arrow presses that merely move the highlight write nothing.
                  */
                 t9_before = bounce_app_flow_settings_t9_enabled(&app->flow);
+                /*
+                 * STEP CONTINUE-RETURN -- AND THE MAIN MENU ARRIVAL IS SAMPLED TOO.
+                 * bounce_app_flow_enter_menu() resets the menu, so this flag has to be
+                 * re-derived on every arrival rather than only the two that already were.
+                 */
+                was_menu = app->flow.state == BOUNCE_APP_STATE_MENU;
 
                 if (bounce_ui_shell_handle_press(
                         &app->flow,
@@ -24737,6 +26674,74 @@ static int x11_dispatch_event(
                  * the same edge for the same reason.
                  */
                 app_commit_t9_change(app, t9_before);
+                /*
+                 * STEP CONTINUE-RETURN -- RE-DERIVE CONTINUE ON EVERY ARRIVAL AT THE
+                 * MAIN MENU. THIS IS THE FIX.
+                 *
+                 * THE BUG, AS REPORTED: play a level, press Escape back to the menu
+                 * (Continue is live and selected), walk into Settings or High Score or
+                 * Instructions, come back -- and Continue is GREYED OUT even though the
+                 * snapshot is still in the store with b1 == 1. The only way to get it
+                 * back was to play again.
+                 *
+                 * WHY. app_refresh_continue_availability() was wired to exactly two
+                 * arrivals: the splash -> menu transition, and the Escape edge out of
+                 * canonical gameplay. Every OTHER route into the main menu -- BACK out of
+                 * Settings, out of High Score, out of Instructions, out of About, out of
+                 * Level Select -- went through bounce_app_flow_enter_menu(), which calls
+                 * bounce_app_flow_reset_menu(), which sets continue_available back to
+                 * false and enabled_item_count back to six. Nothing re-read the store, so
+                 * a save that was sitting there the whole time stopped being offered.
+                 *
+                 * The flag was not stale because anything had written to the store. It
+                 * was stale because the only thing that could refresh it was never
+                 * called on this path. Nothing here is repaired after the fact: the row
+                 * was absent, not wrong.
+                 *
+                 * The Reset to Default row made this much more visible rather than
+                 * causing it. A reset deletes Record 3, so it is SUPPOSED to leave
+                 * Continue greyed; the surrounding menu behaviour had always been wrong
+                 * in a way nobody had a live save on hand to notice.
+                 *
+                 * WHY IT IS HERE AND NOT IN THE FLOW. app_flow.c performs no I/O
+                 * anywhere, so it cannot read the store to re-derive the fact, and the
+                 * shell cannot either -- it only ever has the flow. This is the same
+                 * reasoning as app_commit_theme_change() and app_commit_t9_change() on
+                 * this edge: a change the player just caused, committed at the edge, by
+                 * the layer that owns the store.
+                 *
+                 * WHY THE ARRIVAL IS SAMPLED RATHER THAN EVERY PRESS. The condition is
+                 * "the flow was somewhere else and is now at the menu", so a press made
+                 * while already in the menu cannot re-read the store. That matters: a
+                 * refresh on every menu press would perform a file read on ordinary
+                 * navigation, which is the exact defect app_commit_theme_change() exists
+                 * to avoid, and it would let the row flicker as the player walked past
+                 * it.
+                 *
+                 * Java's shape, for comparison: ShowMainMenu() is called on every
+                 * arrival and reads K and J itself, so the source has no distinction
+                 * between the two arrivals at all. Native has to re-derive explicitly,
+                 * and the rule "derive once per arrival" is what makes them agree.
+                 */
+                if (!was_menu && app->flow.state == BOUNCE_APP_STATE_MENU)
+                    app_refresh_continue_availability(app);
+                /*
+                 * STEP 38-RESET -- and carry out a confirmed reset, if this press was
+                 * one. The flag is read through the consume accessor, so it clears as
+                 * it is read and the deletions in app_apply_reset_to_default() cannot
+                 * run twice from one press.
+                 *
+                 * It sits with the two commit helpers rather than beside the menu
+                 * handoff below because it is the same kind of edge: a change the
+                 * player just confirmed, committed at the moment it was confirmed so
+                 * a crash cannot lose it. Those two are guarded by a compare-before-
+                 * write because ordinary navigation must not perform I/O at all; this
+                 * one is not guarded, because arriving here with the flag set means a
+                 * destructive action was deliberately confirmed and doing nothing
+                 * would be the bug.
+                 */
+                if (bounce_app_flow_consume_reset_to_default(&app->flow))
+                    app_apply_reset_to_default(app);
                 /*
                  * STEP G-R3-R2 -- THE MENU-TO-RESUME HANDOFF.
                  *
@@ -24795,13 +26800,41 @@ static int x11_dispatch_event(
                  * so a press that does not leave the terminal state releases
                  * nothing, matching the Escape edge.
                  */
-                if (was_game_end && app->flow.state == BOUNCE_APP_STATE_MENU) {
+                if (was_terminal_screen && app->flow.state == BOUNCE_APP_STATE_MENU) {
                     /*
-                     * STEP G-R3-R2 -- second production menu arrival: the game-end
+                     * STEP G-R3-R2 -- second production menu arrival: the terminal
                      * form's OK command (ui_shell.c:1319 -> EVENT_MENU). Placed
                      * inside the same guard that already releases the finished run,
                      * so it cannot fire for a press that did not reach the menu.
+                     *
+                     * BOTH terminal states are covered, and app_capture_resume_snapshot()
+                     * maps each of them to b1 == 0 on its own, so the state is not
+                     * named here -- see the K = 3 reasoning in that function. Only
+                     * GAME_END was listed here before; see the sampling comment above
+                     * for why GAME_OVER belongs on this edge too. Concretely, that
+                     * omission left the death form's OK press unable to invalidate
+                     * Continue, so the store kept the previous in-level b1 == 1 and
+                     * the main menu offered to resume a run that had just ended --
+                     * the same stale-Continue class the Escape edge already fixes.
+                     *
+                     * ORDER IS NOW LOAD-BEARING, exactly as on the Escape edge: the
+                     * capture WRITES b1 == 0, and the refresh READS the store to
+                     * decide whether Continue is offered. Refreshing first would
+                     * re-derive availability from the stale record and then leave it
+                     * stale, because nothing re-derives it again until the next menu
+                     * arrival. Before, the two calls were in the other order and the
+                     * single state that reached here happened to refresh correctly
+                     * only because GAME_END's record was already inert.
                      */
+                    app_capture_resume_snapshot(app, app->flow.state);
+                    /*
+                     * THE WRITE THAT WAS MISSING -- see
+                     * app_persist_resume_snapshot_for_continue() below. Without it
+                     * the capture never reached the store, the refresh re-read the
+                     * PREVIOUS session's b1 == 1, and a finished run kept offering a
+                     * Continue that resumed a level the player had already left.
+                     */
+                    app_persist_resume_snapshot_for_continue(app);
                     app_refresh_continue_availability(app);
                     /*
                      * STEP G-R3-T2 -- capture before the release. This is the
@@ -24836,15 +26869,10 @@ static int x11_dispatch_event(
                      * THE CORRECT CONCLUSION. K == 3 is neither K == 1 nor K == 5,
                      * so WriteToStore(3) (BounceGame.java:355-358) writes b1 = 0:
                      * GAME_END produces an INERT record, exactly like GAME_OVER.
-                     * It does NOT preserve K = 5. The state is still passed
-                     * explicitly so the mapping is stated at the call site rather
-                     * than falling out of a default, and the mapping itself lives
-                     * with the capture in app_capture_resume_snapshot().
+                     * It does NOT preserve K = 5. The mapping itself lives with the
+                     * capture in app_capture_resume_snapshot(), which is why the
+                     * capture above is now passed the live state and not a literal.
                      */
-                    app_capture_resume_snapshot(
-                        app,
-                        BOUNCE_APP_STATE_GAME_END
-                    );
                     app_end_canonical_gameplay(app);
                 }
                 if (app->flow.menu.pending_action == BOUNCE_MENU_ACTION_EXIT) {
@@ -25020,6 +27048,14 @@ static int x11_dispatch_event(
                      */
                     app_capture_resume_snapshot(app, menu_from_state);
                     /*
+                     * THE WRITE THAT WAS MISSING -- see
+                     * app_persist_resume_snapshot_for_continue() below. This is the
+                     * edge that leaves a LIVE session for the menu, so it is also
+                     * the edge that must keep the stored snapshot fresh while the
+                     * player still has lives.
+                     */
+                    app_persist_resume_snapshot_for_continue(app);
+                    /*
                      * D-19 -- THE GAMEPLAY -> MENU HALF OF THE CLEAR.
                      *
                      * JAVA EVIDENCE, the second of the tree's only two `aq.a()` sites,
@@ -25189,8 +27225,61 @@ static int x11_dispatch_event(
                 }
             }
         } else if (event->type == ClientMessage) {
-            if ((Atom)event->xclient.data.l[0] == context->delete_window_atom)
+            if ((Atom)event->xclient.data.l[0] == context->delete_window_atom) {
+                /*
+                 * THE WINDOW-CLOSE EDGE IS destroyApp, SO IT MUST COMMIT.
+                 *
+                 * This is the native counterpart of Bounce.destroyApp
+                 * (Bounce.java:23-27), which is the ONLY caller of
+                 * WriteToStore(3) in the whole tree. In Java ME that method runs
+                 * whenever the MIDlet is torn down, and a player who closes the
+                 * game mid-level tears it down mid-level: K is still 1, so
+                 * WriteToStore(3) writes b1 = 1 and the next launch offers
+                 * Continue at that exact spot. Nothing in the source restricts
+                 * that write to the main menu's Exit command -- the menu command
+                 * is simply the only *menu* route to it.
+                 *
+                 * Before this, the window close took the same shape as a bare
+                 * `context->running = 0`: it committed NOTHING. So closing the
+                 * window with the pointer while playing silently discarded the
+                 * mid-level snapshot, and could also discard a color profile or a
+                 * keypad setting whose change-time write had not happened or had
+                 * failed. That made the one route a player is most likely to take
+                 * by accident the only route guaranteed to lose state, and it was
+                 * inconsistent with the two edges above it: the Exit menu row
+                 * commits all three, and XK_q commits the two settings.
+                 *
+                 * WHAT IS COMMITTED, AND WHY EACH PART:
+                 *
+                 *   Record 3  Captured from the flow state the close interrupts,
+                 *             which is what selects b1. A live gameplay session
+                 *             therefore yields b1 == 1 and a genuinely resumable
+                 *             record; the level-complete screen yields b1 == 2; the
+                 *             two terminal forms and every UI state yield the
+                 *             inert b1 == 0, exactly as the Escape edge's capture
+                 *             already does. The capture is a pure read of live state
+                 *             and the write is the store call that Java's
+                 *             destroyApp makes, so nothing new is invented here --
+                 *             both are existing functions on existing paths.
+                 *
+                 *   Theme     Same argument as the Exit row: this is the last
+                 *   Keypad    commit point, so a last attempt cannot be skipped.
+                 *
+                 * WHAT IS DELIBERATELY NOT HERE: no capture-then-release, no
+                 * app_end_canonical_gameplay(), and no state transition. The
+                 * process is about to leave the frame loop and fall into the
+                 * cleanup block, which already destroys the presentation, the
+                 * renderer, the visual assets, the audio player and the game.
+                 * Releasing the level here as well would be a second release of
+                 * the same resources, and choosing an in-game destination for a
+                 * window close would invent a route the source does not have.
+                 */
+                app_capture_resume_snapshot(app, app->flow.state);
+                app_write_resume_snapshot(app);
+                app_persist_theme(app);
+                app_persist_t9_setting(app);
                 context->running = 0;
+            }
         }
     }
     return 0;
@@ -25534,6 +27623,8 @@ static int verify_x11_dispatch_event(void)
     bool d19_other_key_ok;
     bool theme_written_ok;
     bool theme_other_key_ok;
+    bool profile_written_ok;
+    bool close_stops_ok;
     int32_t stored = -1;
     int bad = 0;
 
@@ -25716,6 +27807,64 @@ static int verify_x11_dispatch_event(void)
     theme_other_key_ok = (stored == 3);
     bounce_game_shutdown(&app);
 
+    /*
+     * (iv) THE WINDOW-CLOSE EDGE MUST COMMIT.
+     *
+     * The Close button is the desktop counterpart of Bounce.destroyApp
+     * (Bounce.java:23-27), the only caller of WriteToStore(3) in the tree, so it
+     * must reach the store exactly as the Exit menu row and XK_q do. Two properties
+     * are asserted, because either alone is satisfied by a degenerate
+     * implementation:
+     *
+     *   profile_written_ok  Record 4 moves from a primed 3 to 7. Priming matters:
+     *                        without it a branch that wrote nothing, or wrote the
+     *                        default, would be indistinguishable from a commit.
+     *
+     *   close_stops_ok      The close still terminates. The commit must not have
+     *                        been bought by giving up the exit, and this is the
+     *                        negative control for that: it is the one assertion a
+     *                        `return` added in the wrong place would break while
+     *                        the store check above still passed.
+     *
+     * The negative control for "every ClientMessage commits" is the existing
+     * theme_other_key case above: a different event type on the same app changes
+     * nothing, so the commit is attributable to this branch.
+     */
+    if (bounce_persistence_save_theme_index(3) != 0)
+        goto failure;
+    if (dispatch_fixture_gameplay(&app) != 0)
+        goto failure;
+    if (bounce_app_flow_restore_persisted_theme(&app.flow, 7) != 0) {
+        bounce_game_shutdown(&app);
+        goto failure;
+    }
+    dispatch_fixture_context(&context);
+    memset(&event, 0, sizeof event);
+    event.type = ClientMessage;
+    event.xclient.display = context.display;
+    event.xclient.data.l[0] = (long) context.delete_window_atom;
+    if (x11_dispatch_event(&context, &app, &event, 0) != 0) {
+        bounce_game_shutdown(&app);
+        goto failure;
+    }
+    stored = -1;
+    if (bounce_persistence_load_theme_index(&stored) != 0 || stored != 7) {
+        fprintf(stderr,
+                "dispatch: window close did not commit the profile,"
+                " store=%ld\n",
+                (long)stored);
+        ++bad;
+    }
+    profile_written_ok = (stored == 7);
+    if (context.running != 0) {
+        fprintf(stderr,
+                "dispatch: window close did not terminate running=%d\n",
+                context.running);
+        ++bad;
+    }
+    close_stops_ok = (context.running == 0);
+    bounce_game_shutdown(&app);
+
     if (saved_ok)
         (void)setenv("XDG_DATA_HOME", saved, 1);
     else
@@ -25724,7 +27873,8 @@ static int verify_x11_dispatch_event(void)
     printf("X11-DISPATCH d21_armed=%s d21_no_af=%s d21_wrong_state=%s"
            " d19_cleared=%s d19_other_key=%s"
            " theme_written=%s theme_other_key=%s"
-           " expected=yes yes yes yes yes yes yes %s\n",
+           " close_written=%s close_stops=%s"
+           " expected=yes yes yes yes yes yes yes yes yes %s\n",
            d21_armed_ok ? "yes" : "no",
            d21_no_af_ok ? "yes" : "no",
            d21_wrong_state_ok ? "yes" : "no",
@@ -25732,6 +27882,8 @@ static int verify_x11_dispatch_event(void)
            d19_other_key_ok ? "yes" : "no",
            theme_written_ok ? "yes" : "no",
            theme_other_key_ok ? "yes" : "no",
+           profile_written_ok ? "yes" : "no",
+           close_stops_ok ? "yes" : "no",
            bad == 0 ? "PASS" : "FAIL");
     return bad == 0 ? 0 : -1;
 
@@ -26455,12 +28607,30 @@ static int verify_keypad_godmode_alias(void)
     bounce_game_shutdown(&app);
 
     /*
-     * KEYPAD 5 IS STILL INERT. XK_KP_5 and XK_KP_Begin have no source and must
-     * not reach the automaton; it must also not become a "5" column, which would
-     * mean a second, invented digit arm.
+     * KEYPAD 5 IS STILL INERT. XK_KP_5 and XK_KP_Begin must not reach the automaton;
+     * it must also not become a "5" column, which would mean a second, invented digit
+     * arm.
+     *
+     * STEP 38-RESET -- THE KEYPAD IS PINNED OFF FOR THIS ASSERTION, and the pinning
+     * is the point rather than a workaround.
+     *
+     * These keys are not unmapped. x11_keysym_to_source() has always mapped them, to
+     * BOUNCE_INPUT_SOURCE_KP_CONFIRM, which is what makes a numeric keypad
+     * driveable at all. What made `held_sources` come back empty before is that the
+     * keypad default was OFF, so nothing applied the source.
+     *
+     * The default is now ON, so the same assertion has to say which case it is about.
+     * Pinning it OFF keeps it testing exactly what it always tested -- "with the
+     * keypad disabled, these keys are inert and in particular never reach the GodMode
+     * automaton" -- and the ON counterpart is already covered by the KEYPAD-FULL
+     * check, which asserts that with the keypad enabled the same keys DO steer and
+     * jump. Splitting the two by an explicit setting is what stops this assertion
+     * from silently changing meaning the next time a default moves, which is exactly
+     * how it would have broken now.
      */
     if (dispatch_fixture_gameplay(&app) != 0)
         return -1;
+    (void)bounce_app_flow_restore_persisted_t9(&app.flow, false);
     dispatch_fixture_context(&ctx);
     if (god_press(&ctx, &app, XK_KP_5, &g, &god) != 0 || g != 0 || god
         || god_press(&ctx, &app, XK_KP_Begin, &g, &god) != 0 || g != 0 || god
@@ -26547,7 +28717,7 @@ static int verify_keypad_godmode_alias(void)
             if (app.flow.level_selection.selected_index != 3u) {
                 fprintf(stderr,
                         "keypad godmode: keypad digit %u moved level"
-                        " selection to %u\\n",
+                        " selection to %u\n",
                         i, app.flow.level_selection.selected_index);
                 ok = false;
             }
@@ -26555,7 +28725,7 @@ static int verify_keypad_godmode_alias(void)
         if (!ok) {
             fprintf(stderr,
                     "keypad godmode: the top-row digits or a keypad digit"
-                    " broke level selection\\n");
+                    " broke level selection\n");
             bad++;
         }
         level_untouched = 1;
@@ -27909,6 +30079,20 @@ static int verify_keypad_full_range(void)
                     bad++;
                     break;
                 }
+                /*
+                 * STEP 38-RESET -- "WITH THE SETTING OFF" has to actually turn it
+                 * off.
+                 *
+                 * This block used to get the off state from the launch default,
+                 * which was OFF. The shipped default is now ON -- a new install
+                 * drives from the keypad -- so without the pin every one of the
+                 * twenty keysyms below is live and the block reports all of them as
+                 * non-inert. A heading that says "with the setting off" must be
+                 * accompanied by code that sets it off, or the heading is a claim
+                 * rather than a description. The ON counterpart is asserted earlier
+                 * in this same routine, so both halves of the setting stay covered.
+                 */
+                (void)bounce_app_flow_restore_persisted_t9(&app.flow, false);
                 bounce_input_reset(&app.input);
                 memset(&probe, 0, sizeof probe);
                 if (keypad_probe_press(&app, key, &probe) != 0
@@ -28869,6 +31053,1425 @@ static void print_usage(const char *program)
  * Nothing here touches the filesystem: it drives the flow only, so it cannot
  * reach the player's real store.
  */
+/*
+ * =============================================================================
+ * STEP 38-RESET -- verify_default_state()
+ *
+ * WHY THIS IS A SEPARATE CHECK AND NOT A LINE IN AN EXISTING ONE.
+ *
+ * Four places now have to agree about what a new install looks like: the constants
+ * in app_flow.h, bounce_app_flow_init(), the Reset to Default row, and the store's
+ * own idea of a fresh file. Every assertion that already existed is about ONE of
+ * those sites -- "the toggle walks", "a store restores", "the page has two rows".
+ * None of them is about the SET. So a default changed in three places and not the
+ * fourth leaves the whole suite green, and the disagreement surfaces to a player as
+ * a first minute of play that does not match the documented defaults, which is the
+ * one thing this check exists to prevent.
+ *
+ * WHAT IS ASSERTED, AND WHY EACH LINE EARNS ITS PLACE:
+ *
+ *   state                    SPLASH. A launch is a splash; anything else means the
+ *                            fixture skipped a stage.
+ *   high_score               0. Nothing has been played.
+ *   available_level_count    BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT. THE ONE THAT
+ *                            CHANGED. It was 0, which is the recovered Java's own
+ *                            default, and 0 makes Level Select unreachable forever
+ *                            because the New Game gate at BounceGame.java:241 is
+ *                            `MaxLevels > 1`. Now 2, so levels 1 and 2 are playable
+ *                            and 3..11 stay gated.
+ *   theme indices            0 and 0. Index 0 IS the default color profile; both
+ *                            the highlight and the applied value are checked so the
+ *                            Theme page cannot claim a profile the game is not in.
+ *   audio_enabled            BOUNCE_DEFAULT_AUDIO_ENABLED.
+ *   t9_input_enabled         BOUNCE_DEFAULT_T9_INPUT_ENABLED. ALSO CHANGED, from
+ *                            false. The numeric keypad is a native addition with
+ *                            no recovered default to be faithful to, so this is a
+ *                            product decision, and it is now ON.
+ *   applied language         BOUNCE_DEFAULT_LANGUAGE_INDEX -- English.
+ *   continue_available       false. There is no snapshot, so there is nothing to
+ *                            continue FROM. Asserting the flag alone would also be
+ *                            satisfied by deleting the row, so the menu shape is
+ *                            checked separately below.
+ *   reset_to_default_pending false. Nothing has been confirmed yet, which is what
+ *                            keeps a fresh install from deleting a store it never
+ *                            wrote to.
+ *
+ * THE MENU SHAPE, because "Continue off and only New Game below it" is a claim
+ * about what the player SEES. Continue must still be row 1 and disabled -- visible
+ * but not selectable -- with New Game as row 2 and enabled. Then New Game is
+ * actually pressed, and it must land on LEVEL SELECT rather than starting level 1
+ * outright. That is the observable consequence of the shipped count of 2, and it is
+ * the same route verify_gameplay_entry_boundary() drives; asserting it here as well
+ * is deliberate, because this is the check that owns the DEFAULT and that route is
+ * only reachable from the default.
+ *
+ * NO I/O. This check runs on a flow that has touched no store, so it cannot reach
+ * the player's real save.
+ */
+static int verify_default_state(void)
+{
+    BounceAppFlow flow;
+    unsigned int step;
+    int bad = 0;
+
+    /*
+     * THE DOCUMENTED NUMBERS, AS LITERALS, BEFORE THE FLOW IS EVEN BUILT.
+     *
+     * This block exists because of a hole the first version of this check had. Every
+     * assertion below compares the flow against the BOUNCE_DEFAULT_* constants, and
+     * bounce_app_flow_init() fills the flow from those same constants -- so changing
+     * 2 to 1 moved both sides at once and the whole check stayed green. A negative
+     * control that set the shipped count to 1 was caught by nothing, which is exactly
+     * the kind of test that reads as coverage and proves nothing.
+     *
+     * The constants are part of the shipped contract -- they are what "a new install"
+     * means to anyone reading this file -- so the contract has to be written down
+     * somewhere the compiler cannot move, and this is that somewhere. Keeping the
+     * numbers here and the constants in the flow means a default can be changed in
+     * one place and the change is reported by name, rather than being silently
+     * adopted by both sides of a comparison.
+     */
+    if (BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT != 2) {
+        fprintf(stderr,
+                "default: the documented unlocked level count is %d, not 2\n",
+                BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT);
+        bad++;
+    }
+    if (!BOUNCE_DEFAULT_T9_INPUT_ENABLED) {
+        fprintf(stderr,
+                "default: the documented keypad default is ON\n");
+        bad++;
+    }
+    if (!BOUNCE_DEFAULT_AUDIO_ENABLED) {
+        fprintf(stderr,
+                "default: the documented audio default is ON\n");
+        bad++;
+    }
+    if (BOUNCE_DEFAULT_LANGUAGE_INDEX != 0u) {
+        fprintf(stderr,
+                "default: the documented default language is index 0 (English),"
+                " not %u\n",
+                BOUNCE_DEFAULT_LANGUAGE_INDEX);
+        bad++;
+    }
+
+    memset(&flow, 0, sizeof flow);
+    bounce_app_flow_init(&flow);
+
+    if (flow.state != BOUNCE_APP_STATE_SPLASH) {
+        fprintf(stderr, "default: a fresh flow is not on the splash\n");
+        bad++;
+    }
+    if (bounce_app_flow_high_score(&flow) != 0) {
+        fprintf(stderr, "default: a fresh flow already has a high score\n");
+        bad++;
+    }
+    if (bounce_app_flow_available_level_count(&flow)
+        != BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT) {
+        fprintf(stderr,
+                "default: unlocked level count is %u, not %d\n",
+                bounce_app_flow_available_level_count(&flow),
+                BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT);
+        bad++;
+    }
+    if (bounce_app_flow_settings_applied_theme_index(&flow) != 0u
+        || flow.settings.theme_index != 0u) {
+        fprintf(stderr, "default: the color profile is not the default one\n");
+        bad++;
+    }
+    if (bounce_app_flow_settings_audio_enabled(&flow)
+        != BOUNCE_DEFAULT_AUDIO_ENABLED) {
+        fprintf(stderr, "default: audio is not at its shipped default\n");
+        bad++;
+    }
+    if (bounce_app_flow_settings_t9_enabled(&flow)
+        != BOUNCE_DEFAULT_T9_INPUT_ENABLED) {
+        fprintf(stderr, "default: the numeric keypad is not at its shipped default\n");
+        bad++;
+    }
+    if (bounce_app_flow_settings_applied_language_index(&flow)
+        != BOUNCE_DEFAULT_LANGUAGE_INDEX
+        || flow.settings.language_index != 0u) {
+        fprintf(stderr, "default: the language is not the default English resource\n");
+        bad++;
+    }
+    if (flow.menu.continue_available) {
+        fprintf(stderr, "default: Continue is offered with no snapshot to resume\n");
+        bad++;
+    }
+    if (flow.settings.reset_to_default_pending) {
+        fprintf(stderr, "default: a confirmed reset is pending before any press\n");
+        bad++;
+    }
+
+    /*
+     * THE MENU SHAPE. Continue is asserted PRESENT and DISABLED rather than absent,
+     * because a deleted row would satisfy a bare flag check while quietly changing
+     * the screen the player is looking at.
+     *
+     * Note the two different numberings, which is the easiest thing to get wrong
+     * here. bounce_app_flow_menu_item_enabled() takes a ROW, where 0 is Continue and
+     * 1 is New Game. bounce_app_flow_menu_row_for_selection() takes a SELECTION
+     * index, and a disabled Continue is skipped entirely -- so on a fresh install the
+     * highlight starts at selection 0, which is row 1. "Only New Game below it" is
+     * therefore the statement that row 0 is the disabled Continue, row 1 is New Game,
+     * and the very first press lands on New Game with no Continue in between.
+     */
+    if (bounce_app_flow_menu_item_enabled(&flow, 0u)) {
+        fprintf(stderr, "default: the Continue row is enabled on a fresh install\n");
+        bad++;
+    }
+    if (!bounce_app_flow_menu_item_enabled(&flow, 1u)) {
+        fprintf(stderr, "default: the New Game row is disabled on a fresh install\n");
+        bad++;
+    }
+    if (bounce_app_flow_menu_row_for_selection(&flow, 0u) != 1u) {
+        fprintf(stderr,
+                "default: the first press does not land on New Game (row=%u)\n",
+                bounce_app_flow_menu_row_for_selection(&flow, 0u));
+        bad++;
+    }
+
+    /*
+     * AND THE CONSEQUENCE. Getting from SPLASH to MENU takes the splash's own tick
+     * count, and the count is read from the constant rather than hard-coded so that
+     * changing it cannot quietly shorten or lengthen this walk.
+     */
+    /*
+     * The splash hands over on the tick AFTER its limit, so the limit is spent first
+     * and the transition comes from one more. Both loops are bounded by the
+     * constant rather than by a literal count, which is what keeps this walk
+     * correct if the splash duration is ever changed.
+     */
+    for (step = 0u; step <= BOUNCE_APP_SPLASH_TIMER_LIMIT; ++step) {
+        if (bounce_app_flow_tick(&flow) != 0
+            || flow.state != BOUNCE_APP_STATE_SPLASH) {
+            fprintf(stderr,
+                    "default: the splash ended before its timer limit (step=%u)\n",
+                    step);
+            bad++;
+            break;
+        }
+    }
+    if (bounce_app_flow_tick(&flow) != 1
+        || flow.state != BOUNCE_APP_STATE_MENU) {
+        fprintf(stderr, "default: the splash did not hand over to the menu\n");
+        bad++;
+    }
+    /*
+     * And nothing is skipped on the way down. With the Continue row disabled the
+     * highlight starts already on New Game, so one DOWN moves to High Score -- a
+     * second pressable row and NOT a second pass over Continue. Asserting the count
+     * of enabled rows as well as the one mapping is what stops a menu that reached
+     * New Game by accident from passing.
+     */
+    if (flow.menu.selected_index != 0u
+        || flow.menu.enabled_item_count != BOUNCE_MENU_ROW_COUNT - 1u) {
+        fprintf(stderr,
+                "default: the fresh menu is not six selectable rows"
+                " (index=%u count=%u)\n",
+                flow.menu.selected_index, flow.menu.enabled_item_count);
+        bad++;
+    }
+    if (bounce_app_flow_menu_move(&flow, BOUNCE_MENU_DIRECTION_DOWN) != 0
+        || flow.menu.selected_index != 1u
+        || bounce_app_flow_menu_row_for_selection(&flow, 1u) != 2u) {
+        fprintf(stderr,
+                "default: one DOWN from the top does not reach High Score\n");
+        bad++;
+    }
+    if (bounce_app_flow_menu_move(&flow, BOUNCE_MENU_DIRECTION_UP) != 0
+        || flow.menu.selected_index != 0u) {
+        fprintf(stderr, "default: UP from High Score does not return to New Game\n");
+        bad++;
+    }
+    /*
+     * And the count of 2 is what makes this press open Level Select rather than
+     * stage level 1 directly. If this ever reports ACTION_BOUNDARY, the shipped
+     * count has gone back to 0 or 1 and Level Select is unreachable again.
+     */
+    /*
+     * And the consequence of the shipped count of 2: the press opens Level Select
+     * rather than staging level 1 directly. If this ever reports ACTION_BOUNDARY,
+     * the count has gone back to 0 or 1 and Level Select has become unreachable
+     * again -- which is the exact regression the default was changed to fix, and the
+     * reason it needs an assertion rather than a comment.
+     */
+    if (bounce_app_flow_menu_select(&flow) != BOUNCE_MENU_ACTION_NEW_GAME
+        || flow.state != BOUNCE_APP_STATE_LEVEL_SELECTION) {
+        fprintf(stderr,
+                "default: New Game on a fresh install does not open Level Select"
+                " (state=%d count=%u)\n",
+                (int)flow.state,
+                bounce_app_flow_available_level_count(&flow));
+        bad++;
+    }
+    /*
+     * Finally, the list itself: two rows, and both of them reachable. This is the
+     * "levels 1 and 2 unlocked" half stated as navigation rather than as a count,
+     * so a list of two entries that happens to be positions 1 and 7 would fail.
+     */
+    if (bounce_app_flow_available_level_count(&flow)
+        != (unsigned int)BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT
+        || bounce_app_flow_level_selection_selected_index(&flow) != 0u) {
+        fprintf(stderr, "default: the fresh Level Select list is not two rows at 0\n");
+        bad++;
+    }
+    if (bounce_app_flow_level_selection_move(
+            &flow, BOUNCE_MENU_DIRECTION_DOWN) != 0
+        || bounce_app_flow_level_selection_selected_index(&flow) != 1u
+        || bounce_app_flow_level_selection_move(
+            &flow, BOUNCE_MENU_DIRECTION_DOWN) != 0
+        || bounce_app_flow_level_selection_selected_index(&flow) != 1u) {
+        fprintf(stderr,
+                "default: Level Select does not offer exactly levels 1 and 2\n");
+        bad++;
+    }
+
+    if (bad == 0) {
+        printf("DEFAULT-STATE splash=yes high_score=%d levels=%d theme=0"
+               " audio=on t9=on language=%u continue=off reset_pending=off"
+               " newgame=level-select PASS\n",
+               bounce_app_flow_high_score(&flow),
+               (int)BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT,
+               BOUNCE_DEFAULT_LANGUAGE_INDEX);
+    }
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * =============================================================================
+ * STEP 38-RESET -- verify_reset_to_default()
+ *
+ * THE CLAIM. Pressing Settings -> Reset to Default -> Confirm restores every value
+ * a fresh install carries, and removes the snapshot that would otherwise let the
+ * player return to the run they just wiped.
+ *
+ * WHY IT IS DRIVEN THROUGH x11_dispatch_event() AND NOT THROUGH THE FLOW.
+ *
+ * bounce_app_flow_reset_to_default() only edits memory. It cannot delete Record 3
+ * and cannot rewrite records 1, 2, 4 and 5, because those are the shell's files and
+ * the flow deliberately has no business knowing them. That is the right split, and
+ * it has a testing consequence that has bitten this suite before: a check that calls
+ * the flow function directly is satisfied by the flow function alone and says
+ * nothing about whether the store is ever touched. The first version of a
+ * theme-commit check was green with the commit removed for exactly this reason.
+ *
+ * So the keystrokes go in the front door -- MENU, three DOWNs to Settings, five
+ * DOWNs to the last root row, SELECT, SELECT -- and the assertions read the FILES
+ * afterwards. The consume-then-apply edge is the same three lines the running game
+ * executes, so a negative control that deletes that call fails here.
+ *
+ * THE FIXTURE IS PRIMED TO HAVE SOMETHING TO LOSE, and each part of it is asserted
+ * BEFORE the reset rather than assumed. A reset check against an already-default
+ * flow proves nothing: every field would match whether or not the reset ran. So the
+ * store starts with nine unlocked levels, a high score, a non-default color profile,
+ * the keypad switched OFF and a live Record 3, and the pre-reset block confirms the
+ * flow actually adopted all five. Only then is the reset meaningful.
+ *
+ * CONFIRMATION IS PART OF THE CLAIM, so it is driven both ways. Reaching the
+ * Confirm row and leaving it alone must change nothing, including the store; the Back
+ * row must leave the page without resetting anything; and only Confirm may act. That is
+ * what makes the feature safe to put next to the Audio setting, and a reset that
+ * required no confirmation would fail here even though every field still matched.
+ *
+ * THE PLAYER'S REAL SAVE IS NEVER TOUCHED. Every store access in this function runs
+ * under the discipline bounce_persistence_verify() uses: a private mkdtemp root
+ * published through XDG_DATA_HOME, with the caller's environment restored before
+ * returning on every path, including the failure ones.
+ */
+static int verify_reset_to_default(void)
+{
+    static const char template[] = "/tmp/bounce-reset-XXXXXX";
+    char root[sizeof template];
+    /* persistence.h keeps BOUNCE_PERSISTENCE_PATH_MAX private to its own
+     * translation unit, so the saved value is copied into a local buffer. */
+    char saved[1024];
+    int saved_ok;
+    X11PresentationContext context;
+    XEvent event;
+    BounceApp app;
+    BouncePersistenceRecords primed;
+    BouncePersistenceRecords after;
+    BouncePersistenceRecord3 record;
+    BouncePersistenceRecord3 back;
+    bool present = false;
+    unsigned int step;
+    bool primed_ok;
+    bool pre_ok;
+    bool back_untouched;
+    bool confirm_flow_ok;
+    bool record3_gone;
+    bool records_ok;
+    bool theme_ok;
+    bool t9_ok;
+    int bad = 0;
+    int32_t theme_after = -1;
+    int32_t t9_after = -1;
+
+    memset(&app, 0, sizeof app);
+    memcpy(root, template, sizeof template);
+    if (mkdtemp(root) == NULL) {
+        fprintf(stderr, "reset: could not create a private store root\n");
+        return -1;
+    }
+    saved_ok = (getenv("XDG_DATA_HOME") != NULL);
+    if (saved_ok)
+        (void)snprintf(saved, sizeof saved, "%s", getenv("XDG_DATA_HOME"));
+    if (setenv("XDG_DATA_HOME", root, 1) != 0) {
+        fprintf(stderr, "reset: could not publish the private store root\n");
+        return -1;
+    }
+
+    /* ---- STEP 1: give the store something worth losing ---- */
+    memset(&primed, 0, sizeof primed);
+    primed.max_levels = 9;
+    primed.high_score = 4321;
+    memset(&record, 0, sizeof record);
+    record.b1 = BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL;
+    record.level = 7u;
+    record.score = 98765;
+    record.lives = 2;
+    record.ball_size = 16u;
+    record.unk_x = 144;
+    record.unk_y = 96;
+
+    primed_ok = bounce_persistence_save(&primed) == 0
+        && bounce_persistence_save_theme_index(5) == 0
+        && bounce_persistence_save_t9_enabled(0) == 0
+        && bounce_persistence_save_record3(&record) == 0;
+    if (!primed_ok) {
+        fprintf(stderr, "reset: could not prime the private store\n");
+        bad++;
+    }
+
+    /* ---- STEP 2: launch, and confirm the flow adopted every primed value ---- */
+    if (bounce_game_init(&app) != 0 || bounce_game_enter_menu(&app) != 0) {
+        fprintf(stderr, "reset: the app could not reach the menu\n");
+        bounce_game_shutdown(&app);
+        goto finish;
+    }
+    /*
+     * THE SAME RESTORE CALL main() MAKES, in the same place. bounce_game_init()
+     * deliberately does NOT read the store -- main() owns that, so a verifier that
+     * skipped it would boot a player whose save is silently ignored, and the fixture
+     * would be asserting against fresh defaults with a primed store sitting on disk.
+     * That is precisely the vacuous shape this check exists to avoid, so the boot
+     * sequence is reproduced rather than approximated.
+     */
+    app_restore_persisted_settings(&app);
+    /*
+     * AUDIO AND THE KEYPAD ARE SET IN MEMORY, and the reason is a property of the
+     * store rather than a shortcut in the fixture.
+     *
+     * Audio is never written to the store at all -- it is a per-session choice -- so
+     * there is nothing on disk to prime, and the only honest way to give the reset
+     * something to undo is to switch it off as the Audio page would.
+     *
+     * The keypad IS written, but only in one direction: app_restore_persisted_settings()
+     * turns it ON when the record is set and has no branch that turns it back off, so
+     * a store holding "disabled" still boots enabled. A fixture that primed the record
+     * and then asserted "the keypad is off before the reset" would be asserting
+     * something the boot path cannot produce, and the reset's effect on the keypad
+     * would go untested. So the same call the Input page's SELECT makes is used
+     * instead -- which is the state a player who switched it off is actually in.
+     */
+    (void)bounce_app_flow_restore_persisted_t9(&app.flow, false);
+    app.flow.settings.audio_enabled = false;
+    /*
+     * The snapshot is live, so Continue must be OFFERED here. That is asserted
+     * because the whole feature turns on Continue being removed: if this press did
+     * not make the row available, the later assertion that the reset cleared it
+     * would be trivially true.
+     */
+    app_refresh_continue_availability(&app);
+    if (!app.flow.menu.continue_available) {
+        fprintf(stderr,
+                "reset: the fixture did not produce an available Continue row\n");
+        bad++;
+    }
+    pre_ok = bounce_app_flow_available_level_count(&app.flow) == 9u
+        && bounce_app_flow_high_score(&app.flow) == 4321
+        && bounce_app_flow_settings_applied_theme_index(&app.flow) == 5u
+        && !bounce_app_flow_settings_audio_enabled(&app.flow)
+        && !bounce_app_flow_settings_t9_enabled(&app.flow);
+    if (!pre_ok) {
+        fprintf(stderr,
+                "reset: the flow did not adopt the primed store"
+                " (levels=%u high=%d theme=%u audio=%d t9=%d)\n",
+                bounce_app_flow_available_level_count(&app.flow),
+                bounce_app_flow_high_score(&app.flow),
+                bounce_app_flow_settings_applied_theme_index(&app.flow),
+                (int)bounce_app_flow_settings_audio_enabled(&app.flow),
+                (int)bounce_app_flow_settings_t9_enabled(&app.flow));
+        bad++;
+    }
+
+    /* ---- STEP 3: navigate to the Confirm row WITHOUT pressing it ---- */
+    dispatch_fixture_context(&context);
+    /*
+     * FOUR DOWNs, because Continue is AVAILABLE in this fixture, so every row is
+     * selectable and Settings -- row 4 -- is selection 4 as well. The fresh-install
+     * menu, which is where row 4 is selection 3, is the other case and is covered by
+     * verify_native_extension_ui(); hard-coding either number here would silently
+     * test the wrong menu the next time the other one changed.
+     */
+    for (step = 0u; step < 4u; ++step) {
+        fill_key_event(&event, KeyPress, 116u, 1u, 100u);
+        if (x11_dispatch_event(&context, &app, &event, XK_Down) != 0)
+            bad++;
+    }
+    fill_key_event(&event, KeyPress, 36u, 1u, 100u);
+    if (x11_dispatch_event(&context, &app, &event, XK_Return) != 0
+        || app.flow.state != BOUNCE_APP_STATE_SETTINGS
+        || app.flow.settings.page != BOUNCE_SETTINGS_PAGE_ROOT
+        || app.flow.settings.selected_index != 0u) {
+        fprintf(stderr, "reset: could not open the Settings root from the menu\n");
+        bad++;
+    }
+    /* The last root row is the reset row. Walking down to it and stopping there must
+     * leave the store exactly as it was: reaching a page is not confirming it. */
+    for (step = 0u; step < BOUNCE_SETTINGS_ROOT_ITEM_COUNT - 1u; ++step) {
+        fill_key_event(&event, KeyPress, 116u, 1u, 100u);
+        if (x11_dispatch_event(&context, &app, &event, XK_Down) != 0)
+            bad++;
+    }
+    fill_key_event(&event, KeyPress, 36u, 1u, 100u);
+    if (x11_dispatch_event(&context, &app, &event, XK_Return) != 0
+        || app.flow.settings.page != BOUNCE_SETTINGS_PAGE_RESET) {
+        fprintf(stderr, "reset: the last Settings row did not open the Reset page\n");
+        bad++;
+    }
+    /*
+     * THE CONFIRM ROW IS THE ONE THE HIGHLIGHT LANDS ON. The clamp in
+     * bounce_app_flow_settings_select() is what puts it there: the root row number
+     * was 5 and the page has two rows, so without the clamp SELECT would have been
+     * rejected outright and this feature would be unreachable.
+     */
+    if (app.flow.settings.selected_index != BOUNCE_SETTINGS_RESET_ROW_CONFIRM) {
+        fprintf(stderr,
+                "reset: the Reset page does not open on the Confirm row"
+                " (index=%u)\n",
+                app.flow.settings.selected_index);
+        bad++;
+    }
+    if (bounce_persistence_load(&after) != 0
+        || after.max_levels != 9
+        || after.high_score != 4321
+        || bounce_persistence_load_theme_index(&theme_after) != 0
+        || theme_after != 5) {
+        fprintf(stderr, "reset: merely opening the Reset page rewrote the store\n");
+        bad++;
+    }
+
+    /*
+     * STEP 4 -- THE BACK ROW LEAVES WITHOUT RESETTING.
+     *
+     * This row used to be CANCEL and it used to do nothing at all. It is now the Back
+     * action, wired to bounce_app_flow_settings_back(), so SELECT on it navigates to the
+     * Settings root -- which is the whole point of the change and is asserted here: the
+     * page it leaves is asserted, not just the absence of damage.
+     *
+     * "Does not reset" is still the property that matters, and it is asserted against
+     * the flow AND the store, because a reset that reached one and not the other would
+     * be the more interesting bug.
+     */
+    fill_key_event(&event, KeyPress, 116u, 1u, 100u);
+    if (x11_dispatch_event(&context, &app, &event, XK_Down) != 0)
+        bad++;
+    if (app.flow.settings.selected_index != BOUNCE_SETTINGS_RESET_ROW_BACK) {
+        fprintf(stderr, "reset: the Back row is not reachable\n");
+        bad++;
+    }
+    fill_key_event(&event, KeyPress, 36u, 1u, 100u);
+    if (x11_dispatch_event(&context, &app, &event, XK_Return) != 0)
+        bad++;
+    back_untouched
+        = !app.flow.settings.reset_to_default_pending
+        && app.flow.settings.page == BOUNCE_SETTINGS_PAGE_ROOT
+        && bounce_app_flow_settings_selected_index(&app.flow) == 0u
+        && bounce_app_flow_available_level_count(&app.flow) == 9u
+        && bounce_app_flow_high_score(&app.flow) == 4321
+        && bounce_app_flow_settings_applied_theme_index(&app.flow) == 5u
+        && app.flow.menu.continue_available;
+    if (!back_untouched) {
+        fprintf(stderr,
+                "reset: Back on the Back row did not leave cleanly (page=%d"
+                " idx=%u levels=%u high=%d theme=%u continue=%d)\n",
+                (int)app.flow.settings.page,
+                bounce_app_flow_settings_selected_index(&app.flow),
+                bounce_app_flow_available_level_count(&app.flow),
+                bounce_app_flow_high_score(&app.flow),
+                bounce_app_flow_settings_applied_theme_index(&app.flow),
+                (int)app.flow.menu.continue_available);
+        bad++;
+    }
+    if (bounce_persistence_load(&after) != 0
+        || after.max_levels != 9
+        || after.high_score != 4321
+        || bounce_persistence_load_record3(&back, &present) != 0
+        || !present) {
+        fprintf(stderr, "reset: Back on the Back row rewrote the store\n");
+        bad++;
+    }
+
+    /*
+     * STEP 5 -- GO BACK IN AND CONFIRM. The page is reopened from the root rather than
+     * walked back to from the row above, so this also checks that coming back to the
+     * Reset page lands on CONFIRM again. It would otherwise be able to land on BACK and
+     * quietly leave every later press in this check doing nothing.
+     */
+    for (step = 0u; step < BOUNCE_SETTINGS_ROOT_ITEM_COUNT - 1u; ++step) {
+        fill_key_event(&event, KeyPress, 116u, 1u, 100u);
+        if (x11_dispatch_event(&context, &app, &event, XK_Down) != 0)
+            bad++;
+    }
+    fill_key_event(&event, KeyPress, 36u, 1u, 100u);
+    if (x11_dispatch_event(&context, &app, &event, XK_Return) != 0
+        || app.flow.settings.page != BOUNCE_SETTINGS_PAGE_RESET
+        || app.flow.settings.selected_index != BOUNCE_SETTINGS_RESET_ROW_CONFIRM) {
+        fprintf(stderr,
+                "reset: reopening the Reset page did not land on Confirm"
+                " (page=%d idx=%u)\n",
+                (int)app.flow.settings.page,
+                bounce_app_flow_settings_selected_index(&app.flow));
+        bad++;
+    }
+    fill_key_event(&event, KeyPress, 36u, 1u, 100u);
+    if (x11_dispatch_event(&context, &app, &event, XK_Return) != 0)
+        bad++;
+
+    /*
+     * IN THE FLOW FIRST, because that is the half a player sees on the next frame.
+     * Every value is compared to the shared constants rather than to the numbers
+     * the fixture started from, so this check and verify_default_state() cannot
+     * disagree about what "default" means.
+     */
+    confirm_flow_ok
+        = !app.flow.settings.reset_to_default_pending
+        && bounce_app_flow_available_level_count(&app.flow)
+            == (unsigned int)BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT
+        && bounce_app_flow_high_score(&app.flow) == 0
+        && bounce_app_flow_settings_applied_theme_index(&app.flow) == 0u
+        && app.flow.settings.theme_index == 0u
+        && bounce_app_flow_settings_audio_enabled(&app.flow)
+            == BOUNCE_DEFAULT_AUDIO_ENABLED
+        && bounce_app_flow_settings_t9_enabled(&app.flow)
+            == BOUNCE_DEFAULT_T9_INPUT_ENABLED
+        && bounce_app_flow_settings_applied_language_index(&app.flow)
+            == BOUNCE_DEFAULT_LANGUAGE_INDEX
+        && !app.flow.menu.continue_available
+        && !app.flow.new_high_score;
+    if (!confirm_flow_ok) {
+        fprintf(stderr,
+                "reset: Confirm did not restore the defaults in the flow"
+                " (levels=%u high=%d theme=%u audio=%d t9=%d lang=%u"
+                " continue=%d)\n",
+                bounce_app_flow_available_level_count(&app.flow),
+                bounce_app_flow_high_score(&app.flow),
+                bounce_app_flow_settings_applied_theme_index(&app.flow),
+                (int)bounce_app_flow_settings_audio_enabled(&app.flow),
+                (int)bounce_app_flow_settings_t9_enabled(&app.flow),
+                bounce_app_flow_settings_applied_language_index(&app.flow),
+                (int)app.flow.menu.continue_available);
+        bad++;
+    }
+    /*
+     * AND THE FLAG IS CLEARED BY BEING READ. bounce_app_flow_consume_reset_to_default()
+     * returns true exactly once per confirmed reset; a second press that happened to
+     * re-enter the page must not find it still raised, or the store would be deleted
+     * twice from one confirmation.
+     */
+    if (bounce_app_flow_consume_reset_to_default(&app.flow)) {
+        fprintf(stderr, "reset: the pending flag survived the press that consumed it\n");
+        bad++;
+    }
+
+    /*
+     * THEN THE STORE, which is the half the flow cannot do. Record 3 first: a
+     * snapshot left behind is the one failure with no visible symptom, because the
+     * menu looks correct while the player is still one Escape away from the run they
+     * just erased.
+     */
+    if (bounce_persistence_load_record3(&back, &present) != 0) {
+        fprintf(stderr, "reset: could not read Record 3 after the reset\n");
+        bad++;
+        record3_gone = false;
+    } else {
+        record3_gone = !present;
+        if (present) {
+            fprintf(stderr,
+                    "reset: the reset left a snapshot behind (b1=%u level=%u)\n",
+                    back.b1, back.level);
+            bad++;
+        }
+    }
+
+    records_ok = bounce_persistence_load(&after) == 0
+        && after.max_levels == (int32_t)BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT
+        && after.high_score == 0;
+    if (!records_ok) {
+        fprintf(stderr,
+                "reset: records were not rewritten to the defaults"
+                " (max_levels=%ld high_score=%ld)\n",
+                (long)after.max_levels, (long)after.high_score);
+        bad++;
+    }
+
+    theme_ok = bounce_persistence_load_theme_index(&theme_after) == 0
+        && theme_after == 0;
+    if (!theme_ok) {
+        fprintf(stderr,
+                "reset: the color profile was not reset in the store (%ld)\n",
+                (long)theme_after);
+        bad++;
+    }
+    /*
+     * The keypad is stored as "1 means enabled", so the reset has to WRITE 1 here.
+     * It is read back through the same record the Input page is restored from, and
+     * a store left at 0 would silently un-keypad the game on the next launch while
+     * every in-memory assertion above still passed.
+     */
+    t9_ok = bounce_persistence_load_t9_enabled(&t9_after) == 0 && t9_after == 1;
+    if (!t9_ok) {
+        fprintf(stderr,
+                "reset: the keypad setting was not reset in the store (%ld)\n",
+                (long)t9_after);
+        bad++;
+    }
+
+    bounce_game_shutdown(&app);
+
+    if (bad == 0) {
+        printf("RESET-TO-DEFAULT primed=levels9/high4321/theme5/audio-off"
+               "/keypad-off/snapshot-live back=leaves-clean confirm=restored"
+               " record3=%s records=max_levels%d/high0 theme=0 keypad=1"
+               " continue=off PASS\n",
+               record3_gone ? "deleted" : "PRESENT",
+               BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT);
+    }
+
+finish:
+    if (saved_ok)
+        (void)setenv("XDG_DATA_HOME", saved, 1);
+    else
+        (void)unsetenv("XDG_DATA_HOME");
+    /*
+     * The root is left in place, exactly as verify_record3_terminal_b1_contract()
+     * leaves its own. It is not empty -- the store wrote a bounce/ subdirectory
+     * under it -- so rmdir() would fail with ENOTEMPTY, and reaching past this
+     * point to unlink the tree by hand would be the first place in this file that
+     * deletes files it did not create. The environment is restored either way, so
+     * nothing downstream can reach this root.
+     */
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * =============================================================================
+ * STEP 38-RESET-UI -- verify_reset_page_pointer_and_hint()
+ *
+ * THE CLAIM. The Reset page behaves like every other Settings page for a pointer, and
+ * it is the only Settings page that does not print the ESC BACK hint.
+ *
+ * WHY THIS IS NOT COVERED BY verify_reset_to_default(). That check drives the keyboard
+ * and reads the store. It cannot see the two things that changed here, because both are
+ * about how the page is PRESENTED: whether a click reaches the row, and whether the
+ * footer words are on the screen. A click handler that returned 0 for every coordinate
+ * and a renderer that drew the hint anyway would both leave that check completely
+ * green, and each of those is a real defect a player would hit on the screen whose only
+ * job is to ask whether to delete their save.
+ *
+ * THE BUG THIS FOUND, WHICH IS THE REASON IT IS WORTH HAVING ITS OWN CHECK.
+ *
+ * bounce_ui_shell_handle_click() carried a PRIVATE copy of the Settings root row
+ * positions, five values long, at a 44/60/76/92 pitch, while the renderer drew the rows
+ * at 28/42/56/70/84/98. Three separate defects:
+ *
+ *   1. THE ARRAY WAS TOO SHORT. It was sized by BOUNCE_SETTINGS_ROOT_ITEM_COUNT, which
+ *      is six since the Reset row was added, but only five initialisers were given. C
+ *      zero-fills the sixth, so the Reset row's hit band was at y = 0 -- the new row was
+ *      unreachable by mouse no matter where the pointer was.
+ *   2. THE PITCH WAS WRONG FOR EVERY ROW BUT THE FIRST, by +2, +4, +6 and +8 px.
+ *   3. A wrong-but-near-miss band is worse than a dead one, because a player reads it as
+ *      the game highlighting the wrong line rather than as two tables disagreeing.
+ *
+ * Both sides now read one table, ui_settings_root_row_y, so there is no second copy to
+ * fall out of date. What is asserted below is not "the click lands on the Reset row" but
+ * the stronger statement: EVERY root row is reachable, and at the y the renderer
+ * actually draws it. Row 5 is the one that was silently dead, and a loop over all six
+ * rows is what stops a future row from being dead the same way.
+ *
+ * THE FOOTER IS CHECKED AS PIXELS, NOT AS A FLAG. The renderer decides whether to draw
+ * the hint, so reading a flag would test the flag and not the screen. Instead the band
+ * the hint occupies is sampled and required to be empty of ink on the Reset page while
+ * every other Settings page still fills it. Both halves matter: dropping the hint
+ * everywhere would leave the Reset page correct and every other page broken.
+ *
+ * The baseline is captured from the panel's own background colour rather than assumed,
+ * so this does not depend on the current palette. What it depends on is that the hint is
+ * centred text at y = 115 and therefore paints rows 112..118 -- a band the panel border
+ * at y = 123 and the Reset action rows at 101..122 do not intrude into. That separation
+ * is the reason the sample can be as small as it is.
+ *
+ * NO I/O. Nothing here reads or writes the store.
+ */
+static int verify_reset_page_pointer_and_hint(void)
+{
+    BounceAppFlow flow;
+    BounceSurface *surface;
+    BounceRenderer *renderer;
+    uint32_t hint_color = 0u;
+    uint32_t panel_background = 0u;
+    bool have_baseline = false;
+    unsigned int index;
+    unsigned int clicked;
+    int footer_ink[BOUNCE_SETTINGS_PAGE_RESET + 1];
+    int bad = 0;
+
+    memset(&flow, 0, sizeof flow);
+    bounce_app_flow_init(&flow);
+    /*
+     * TO THE MENU FIRST. bounce_app_flow_enter_settings() is guarded on MENU, so a flow
+     * sitting on the splash cannot open Settings at all. The splash is left by its own
+     * tick count rather than by poking flow->state, because a test that sets the state
+     * directly is a test that never proves the guard exists.
+     */
+    for (index = 0u; index <= BOUNCE_APP_SPLASH_TIMER_LIMIT; ++index) {
+        if (bounce_app_flow_tick(&flow) != 0)
+            break;
+    }
+    if (bounce_app_flow_tick(&flow) != 1
+        || flow.state != BOUNCE_APP_STATE_MENU) {
+        fprintf(stderr, "reset-ui: could not leave the splash\n");
+        bounce_app_flow_init(&flow);
+        return -1;
+    }
+    surface = bounce_surface_create();
+    if (surface == NULL)
+        return -1;
+    renderer = bounce_renderer_create(surface);
+    if (renderer == NULL) {
+        bounce_surface_destroy(surface);
+        return -1;
+    }
+
+    /*
+     * EVERY ROOT ROW IS REACHABLE, AT THE Y THE RENDERER DRAWS IT.
+     *
+     * The click is made at the top of the row's drawn band, y - 2, which is where the
+     * highlight rectangle starts. Probing the top edge rather than the middle is
+     * deliberate: it is the pixel row most likely to fall into a neighbouring row's band
+     * under a wrong pitch, so it is the one that catches this class of bug. A second
+     * probe at the bottom edge of the band covers the other direction.
+     *
+     * Each click is followed by a return to the root selection so the walk is not
+     * cumulative, and the probe asserts the SELECTION rather than the effect -- this loop
+     * is about "does the pointer reach the row", and verify_reset_to_default() is about
+     * what happens next.
+     */
+    if (bounce_app_flow_enter_settings(&flow) != 0
+        || bounce_app_flow_settings_page(&flow) != BOUNCE_SETTINGS_PAGE_ROOT) {
+        fprintf(stderr, "reset-ui: could not open the Settings root\n");
+        bad++;
+    }
+    for (index = 0u; index < BOUNCE_SETTINGS_ROOT_ITEM_COUNT; ++index) {
+        int row_y = bounce_ui_shell_settings_root_row_y(index);
+
+        /*
+         * STARTING OVER TAKES TWO CALLS: bounce_app_flow_return_to_menu() to leave
+         * whatever page the previous iteration opened, then enter_settings() to come
+         * back.
+         *
+         * bounce_app_flow_settings_back() is the obvious choice here and it is the wrong
+         * one twice over. From the ROOT it does not return to the root, it leaves
+         * Settings for the main menu -- correct for the Back key, and it meant the first
+         * iteration ran in SETTINGS while every later one ran in MENU, where a click at a
+         * root row's y lands on empty space. From a sub-page it returns to the root but
+         * leaves the state at SETTINGS, and enter_settings() is guarded on MENU.
+         *
+         * return_to_menu() accepts both, so it is the one call that makes the loop
+         * position-independent. Going through the menu is also the route the player's own
+         * BACK key takes, which makes this the same journey rather than a shortcut.
+         */
+        if (bounce_app_flow_return_to_menu(&flow) != 0
+            || bounce_app_flow_enter_settings(&flow) != 0
+            || bounce_app_flow_settings_page(&flow) != BOUNCE_SETTINGS_PAGE_ROOT) {
+            fprintf(stderr, "reset-ui: could not re-open the Settings root\n");
+            bad++;
+            break;
+        }
+        /* Neutral: a click that reaches the row must not also activate a wrong one. */
+        clicked = bounce_ui_shell_handle_click(
+            &flow,
+            24,
+            row_y - 2
+        );
+        if (!clicked
+            || bounce_app_flow_settings_selected_index(&flow) != index) {
+            fprintf(stderr,
+                    "reset-ui: a click at the top of Settings root row %u did not"
+                    " reach it (clicked=%u index=%u)\n",
+                    index,
+                    clicked,
+                    bounce_app_flow_settings_selected_index(&flow));
+            bad++;
+            continue;
+        }
+        /*
+         * ACTIVATE, WHICH MAY ALREADY HAVE HAPPENED.
+         *
+         * Row 0 starts highlighted, so its first click opens it; every other row needs a
+         * second click to activate after the first one moved the highlight. The loop
+         * clicks once and then only clicks again if the page is still the root, rather
+         * than assuming a fixed number of clicks.
+         *
+         * Assuming "two clicks, always" was wrong and hid a real asymmetry: it made row
+         * 0 look broken, because the second click lands on the page row 0 opened and
+         * correctly does nothing.
+         */
+        if (bounce_app_flow_settings_page(&flow) == BOUNCE_SETTINGS_PAGE_ROOT)
+            clicked = bounce_ui_shell_handle_click(&flow, 24, row_y - 2);
+        if (!clicked || bounce_app_flow_settings_page(&flow)
+                != (BounceSettingsPage)((int)index + 1)) {
+            fprintf(stderr,
+                    "reset-ui: Settings root row %u did not open its page"
+                    " (clicked=%u page=%d)\n",
+                    index,
+                    clicked,
+                    (int)bounce_app_flow_settings_page(&flow));
+            bad++;
+        }
+    }
+    /*
+     * AND NOTHING ELSE IN THE ROOT LIST IS CLICKABLE. A stray click in the gap under
+     * the last row must not select a row, because the band geometry above is asserted
+     * in pixels and a click handler that accepted everything would pass every one of
+     * those assertions.
+     */
+    if (bounce_app_flow_return_to_menu(&flow) != 0
+        || bounce_app_flow_enter_settings(&flow) != 0
+        || bounce_app_flow_settings_page(&flow) != BOUNCE_SETTINGS_PAGE_ROOT) {
+        fprintf(stderr, "reset-ui: could not re-open the Settings root\n");
+        bad++;
+    } else {
+        /*
+         * A CLICK THAT MUST SELECT NOTHING. The probe is the empty strip between the
+         * title separator at y = 18 and the first row's band at y = 26, NOT the space
+         * below the last row: below it lies the Back band, which is a real control on
+         * this screen and answers a click correctly. The first version of this probe
+         * sat at y = 113 and reported that the strip below the list selected a row,
+         * which was the Back band working.
+         *
+         * A handler that accepted every coordinate would pass all six row assertions
+         * above, so this is what stops that loop from passing for the wrong reason.
+         */
+        clicked = bounce_ui_shell_handle_click(&flow, 24, 22);
+        if (clicked
+            || bounce_app_flow_settings_selected_index(&flow) != 0u) {
+            fprintf(stderr,
+                    "reset-ui: a click on the empty strip above the list was"
+                    " accepted (clicked=%u index=%u)\n",
+                    clicked,
+                    bounce_app_flow_settings_selected_index(&flow));
+            bad++;
+        }
+    }
+
+    /*
+     * THE RESET PAGE'S TWO ROWS, BY POINTER.
+     *
+     * CONFIRM first, and it is asserted to require the two-click form: the first click
+     * moves the highlight, and the reset only happens on the second. That is the same
+     * rule the root list follows, and verify_reset_to_default() proves the keyboard
+     * route still confirms in one press from the highlighted row -- so the two pages
+     * agree about what a click means.
+     */
+    if (bounce_app_flow_return_to_menu(&flow) != 0
+        || bounce_app_flow_enter_settings(&flow) != 0) {
+        fprintf(stderr, "reset-ui: could not re-open Settings for the Reset page\n");
+        bad++;
+    }
+    for (index = 0u; index < BOUNCE_SETTINGS_ROOT_ITEM_COUNT - 1u; ++index) {
+        if (bounce_app_flow_settings_move(&flow, BOUNCE_MENU_DIRECTION_DOWN) != 0)
+            bad++;
+    }
+    if (bounce_app_flow_settings_select(&flow) != 0
+        || bounce_app_flow_settings_page(&flow) != BOUNCE_SETTINGS_PAGE_RESET) {
+        fprintf(stderr, "reset-ui: could not open the Reset page by keyboard\n");
+        bad++;
+    } else if (bounce_ui_shell_handle_click(
+                   &flow, 24, bounce_ui_shell_reset_row_y(0) - 2) != 1) {
+        fprintf(stderr, "reset-ui: a click on Confirm was not accepted\n");
+        bad++;
+    } else if (!bounce_app_flow_consume_reset_to_default(&flow)) {
+        /*
+         * ONE CLICK, NOT TWO.
+         *
+         * Confirm is the highlighted row the moment the page opens, so a click on it
+         * acts immediately -- the same rule every list in the shell follows, where a
+         * click on the already-highlighted row activates it. The earlier version of this
+         * check expected a move-then-activate pair and read the one-click behaviour as a
+         * bug, which was reading it backwards.
+         *
+         * Requiring two clicks here was also considered and rejected on the merits: it
+         * would make the button that deletes a save behave differently in kind from
+         * every other button in the shell, in exchange for protecting against a mis-click
+         * on a row whose label says CONFIRM, on a page that takes a deliberate two-press
+         * walk to reach. The flag is read here rather than acted on so this check still
+         * touches no store.
+         */
+        fprintf(stderr,
+                "reset-ui: a click on Confirm did not arm the reset\n");
+        bad++;
+    }
+    /*
+     * BACK by pointer. It must LEAVE the page, and leave without resetting. The page
+     * change is asserted because that is the whole behaviour change of this step; the
+     * "without resetting" half is the pending flag, which must still be clear.
+     */
+    if (bounce_ui_shell_handle_click(
+            &flow, 24, bounce_ui_shell_reset_row_y(1) - 2) != 1
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_RESET_ROW_BACK) {
+        fprintf(stderr, "reset-ui: a click on Back did not land on Back\n");
+        bad++;
+    } else if (bounce_app_flow_consume_reset_to_default(&flow)) {
+        /*
+         * AND MOVING THE HIGHLIGHT TO BACK MUST NOT ARM ANYTHING. This is the
+         * mis-click protection that the one-click Confirm does not provide: a stray
+         * click on the lower row cannot reset, and the destructive row is not the one
+         * the pointer is on.
+         */
+        fprintf(stderr,
+                "reset-ui: a click on Back armed the reset\n");
+        bad++;
+    } else if (bounce_ui_shell_handle_click(
+                   &flow, 24, bounce_ui_shell_reset_row_y(1) - 2) != 1
+        || bounce_app_flow_settings_page(&flow) != BOUNCE_SETTINGS_PAGE_ROOT
+        || bounce_app_flow_consume_reset_to_default(&flow)) {
+        fprintf(stderr,
+                "reset-ui: Back by pointer did not leave the Reset page cleanly"
+                " (page=%d)\n",
+                (int)bounce_app_flow_settings_page(&flow));
+        bad++;
+    }
+
+    /*
+     * THE FOOTER, BY THE COLOUR THE HINT IS DRAWN IN.
+     *
+     * Counting every non-background pixel in the footer's rows does not work on this
+     * page, and the first version of this check proved it: it reported 738 pixels of
+     * "hint" on the Reset page, all of which were the BACK row's own highlight band and
+     * label sitting in the same rows. The ESC hint is centred text at y = 115, so rows
+     * 112..118 hold it -- and the two action rows have to live between the divider at
+     * y = 98 and the panel edge at y = 123, which puts the BACK row's band at
+     * 112..122. There is no sub-band of 112..118 that the Reset page leaves empty.
+     *
+     * So the test is about the HINT'S OWN COLOUR rather than about ink. The hint is drawn
+     * in the accent role, and on both pages being compared -- the Settings root and the
+     * Reset page -- the accent role is used for that hint and nothing else. The root rows
+     * are highlight, selected_text and text; the Reset value rows are muted, text and
+     * border. Counting pixels equal to the accent colour therefore counts the hint, and
+     * on the Reset page there must be none of them.
+     *
+     * The accent colour is CALIBRATED from the screen rather than hard-coded, so this
+     * keeps working under any of the thirteen color profiles and will not need touching
+     * when one of them changes. Calibration reads the ROOT page, whose last row band ends
+     * at y = 107 and which therefore has nothing but the hint below that.
+     *
+     * This is a stronger claim than "the band got emptier": it names the thing that must
+     * be gone. A band that lost pixels for any other reason would still pass a
+     * before-and-after comparison.
+     */
+    flow.settings.page = BOUNCE_SETTINGS_PAGE_ROOT;
+    if (bounce_ui_shell_render_settings(surface, renderer, &flow) != 0) {
+        fprintf(stderr, "reset-ui: could not render the Settings root\n");
+        bad++;
+    } else {
+        int y;
+        int x;
+
+        /*
+         * The panel background is sampled rather than assumed. The first version of this
+         * calibration tested `pixel != 0`, which is true of the background too -- it is
+         * 0xff121a30, not zero -- so it "found" the background and then measured the
+         * Reset page's highlight band as if it were hint text. Reading the panel's own
+         * colour is what makes the comparison mean anything.
+         *
+         * The sample point is x = 118, y = 105: inside the panel, past the right edge of
+         * every 104 px highlight band and 11 px row, and below the last root row at
+         * y = 98. Nothing is drawn there on any Settings page.
+         */
+        if (bounce_surface_get_pixel(surface, 118, 105, &panel_background) != 0) {
+            fprintf(stderr, "reset-ui: could not read the panel background\n");
+            bad++;
+        } else {
+            bool found = false;
+
+            /*
+             * The window is x 10..117, y 110..121: inside the panel's border on all four
+             * sides (the frame is at x = 4 and x = 123, y = 4 and y = 123), below the
+             * Settings root rows which end at y = 107, and above the panel's bottom edge.
+             * Excluding the border matters and did not at first: the scan began at x = 4,
+             * where the vertical frame sits, so it calibrated the border colour and then
+             * reported the Reset page's own frame as 150 pixels of "hint".
+             */
+            for (y = 110; y < 122 && !found; ++y) {
+                for (x = 10; x < 118; ++x) {
+                    uint32_t pixel = 0u;
+
+                    if (bounce_surface_get_pixel(surface, x, y, &pixel) != 0)
+                        break;
+                    /*
+                     * The first pixel that is not the panel IS a hint pixel: the root
+                     * list ends at y = 107 and nothing else on this page is drawn
+                     * between there and the bottom of the panel.
+                     *
+                     * `found` is what stops the search. Breaking out of the inner loop
+                     * alone let the outer loop keep scanning and overwrite the colour
+                     * with the last thing it found instead of the first, which is how a
+                     * calibration meant to pick out hint text ended up holding the
+                     * highlight colour and reporting 480 pixels of it on a page with no
+                     * hint at all.
+                     */
+                    if (pixel != panel_background) {
+                        hint_color = pixel;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            have_baseline = found;
+        }
+        if (!have_baseline) {
+            fprintf(stderr,
+                    "reset-ui: the Settings root does not draw the ESC BACK hint,"
+                    " so the hint colour cannot be calibrated\n");
+            bad++;
+        }
+    }
+
+    for (index = BOUNCE_SETTINGS_PAGE_ROOT;
+         index <= BOUNCE_SETTINGS_PAGE_RESET;
+         ++index) {
+        int ink = 0;
+        int y;
+
+        if (!have_baseline) {
+            bad++;
+            break;
+        }
+        flow.settings.page = (BounceSettingsPage)index;
+        if (bounce_ui_shell_render_settings(surface, renderer, &flow) != 0) {
+            fprintf(stderr, "reset-ui: could not render Settings page %u\n", index);
+            bad++;
+            continue;
+        }
+        for (y = 110; y < 122; ++y) {
+            int x;
+
+            for (x = 10; x < 118; ++x) {
+                uint32_t pixel = 0u;
+
+                if (bounce_surface_get_pixel(surface, x, y, &pixel) != 0) {
+                    bad++;
+                    break;
+                }
+                if (pixel == hint_color)
+                    ++ink;
+            }
+        }
+        footer_ink[index] = ink;
+        if (index == BOUNCE_SETTINGS_PAGE_RESET) {
+            if (ink != 0) {
+                fprintf(stderr,
+                        "reset-ui: the Reset page still draws the ESC BACK hint"
+                        " (%d pixels of the hint colour)\n",
+                        ink);
+                bad++;
+            }
+        } else if (ink <= 0) {
+            fprintf(stderr,
+                    "reset-ui: Settings page %u lost its ESC BACK hint (%d pixels)\n",
+                    index,
+                    ink);
+            bad++;
+        }
+    }
+
+    bounce_renderer_destroy(renderer);
+    bounce_surface_destroy(surface);
+
+    if (bad == 0) {
+        printf("RESET-PAGE-UI root_rows_clickable=%u dead_row=none"
+               " confirm_one_click=yes back_row_click=yes back_leaves=yes"
+               " footer_hint=reset-only"
+               " footer_ink_reset=%d footer_ink_root=%d PASS\n",
+               BOUNCE_SETTINGS_ROOT_ITEM_COUNT,
+               footer_ink[BOUNCE_SETTINGS_PAGE_RESET],
+               footer_ink[BOUNCE_SETTINGS_PAGE_ROOT]);
+    }
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * =============================================================================
+ * STEP CONTINUE-RETURN -- verify_continue_survives_submenus()
+ *
+ * THE BUG, AS REPORTED. Play a level, press Escape back to the main menu, walk into
+ * one of the sub-screens, come back -- and the Continue row is GREYED OUT, so the run
+ * cannot be resumed and the player has to start over. They still had lives, the
+ * snapshot was still in the store, and nothing had deleted it.
+ *
+ * WHY THE EXISTING CHECKS COULD NOT SEE IT.
+ *
+ * verify_continue_entry_wiring() drives Continue from a menu it built and never leaves.
+ * verify_continue_publication() asserts the store is written correctly at a terminal
+ * arrival. verify_record3_terminal_b1_contract() round-trips a record. All three are
+ * about the record and the handoff, and all three would stay green while the row was
+ * hidden on the one path a player actually walks.
+ *
+ * The gap is a PAIR of responsibilities that never met:
+ *
+ *   bounce_app_flow_enter_menu() RESETS the menu. bounce_app_flow_reset_menu() sets
+ *   continue_available = false and enabled_item_count = 6, because ShowMainMenu()
+ *   rebuilds the list and BounceGame.java:116 decides the Continue row from the live K
+ *   and J. Correct in isolation, and it is why the row is right on the way IN and wrong
+ *   on the way OUT.
+ *
+ *   app_refresh_continue_availability() DERIVES the row from the store. It was wired to
+ *   exactly two arrivals -- the splash -> menu transition and the Escape edge out of
+ *   canonical gameplay -- so every other arrival into the menu rebuilt the row as absent
+ *   and nothing put it back.
+ *
+ * The fix re-derives on any arrival that was not already at the menu. What has to be
+ * asserted is therefore not "Continue works" but the ROUND TRIP: a menu with a live
+ * snapshot -> a sub-screen -> the menu again -> still live. That is the thing which was
+ * broken, and it is a claim no existing assertion made.
+ *
+ * EVERY SUB-SCREEN IS WALKED, not just one. Settings, High Score, Instructions and
+ * About all leave through the same BACK edge, so one of them would prove the mechanism,
+ * and all four prove it is not attached to a single destination by accident. Level
+ * Select is included for a different reason: it is reachable from New Game, which is one
+ * row BELOW Continue, so a player who takes that route has to come back twice.
+ *
+ * THE FIXTURE IS PRIMED AND THEN PROVEN, so "still available" cannot be satisfied by a
+ * flag that was never cleared either. The pre-condition is a live Record 3 in the store
+ * AND a menu that reports Continue as available; a reset-in-place would pass the whole
+ * check with the row permanently absent.
+ *
+ * AND THE OPPOSITE IS ASSERTED TOO, because a fix that simply always showed the row
+ * would also pass every assertion above. With no snapshot in the store, the row must be
+ * unavailable on the same round trip. Both halves together are what makes this a test of
+ * the derivation rather than of a constant.
+ *
+ * THE PLAYER'S REAL SAVE IS NEVER TOUCHED. Every store access runs under the discipline
+ * bounce_persistence_verify() uses: a private mkdtemp root published through
+ * XDG_DATA_HOME, restored on every path including the failure ones.
+ */
+static int verify_continue_survives_submenus(void)
+{
+    static const char template[] = "/tmp/bounce-continue-XXXXXX";
+    char root[sizeof template];
+    char saved[1024];
+    int saved_ok;
+    X11PresentationContext context;
+    XEvent event;
+    BounceApp app;
+    BouncePersistenceRecord3 prime;
+    BouncePersistenceRecord3 back;
+    bool present = false;
+    bool primed_ok;
+    bool available_before = false;
+    bool all_survived = true;
+    bool absent_is_greyed = true;
+    unsigned int leg;
+    unsigned int step;
+    int bad = 0;
+
+    memset(&app, 0, sizeof app);
+    memcpy(root, template, sizeof template);
+    if (mkdtemp(root) == NULL) {
+        fprintf(stderr, "continue-return: could not create a private store root\n");
+        return -1;
+    }
+    saved_ok = (getenv("XDG_DATA_HOME") != NULL);
+    if (saved_ok)
+        (void)snprintf(saved, sizeof saved, "%s", getenv("XDG_DATA_HOME"));
+    if (setenv("XDG_DATA_HOME", root, 1) != 0) {
+        fprintf(stderr, "continue-return: could not publish the private store root\n");
+        return -1;
+    }
+
+    memset(&prime, 0, sizeof prime);
+    prime.b1 = BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL;
+    prime.level = 4u;
+    prime.score = 31415;
+    prime.lives = 2;
+    prime.ball_size = 12u;
+    prime.unk_x = 168;
+    prime.unk_y = 72;
+    primed_ok = bounce_persistence_save_record3(&prime) == 0;
+    if (!primed_ok) {
+        fprintf(stderr, "continue-return: could not prime the private store\n");
+        bad++;
+    }
+
+    if (bounce_game_init(&app) != 0 || bounce_game_enter_menu(&app) != 0) {
+        fprintf(stderr, "continue-return: the app could not reach the menu\n");
+        bounce_game_shutdown(&app);
+        goto finish;
+    }
+    app_restore_persisted_settings(&app);
+    /*
+     * THE SAME DERIVATION THE ESCAPE EDGE RUNS, so the fixture starts in the state the
+     * reported walk started in: a menu that is offering a live save.
+     */
+    app_refresh_continue_availability(&app);
+    available_before = app.flow.menu.continue_available
+        && bounce_app_flow_menu_row_for_selection(&app.flow, 0u) == 0u;
+    if (!available_before) {
+        fprintf(stderr,
+                "continue-return: the fixture did not produce an available"
+                " Continue row\n");
+        bad++;
+    }
+
+    dispatch_fixture_context(&context);
+    /*
+     * FOUR ROUND TRIPS. Each leg moves the highlight down to one destination, activates
+     * it, presses BACK, and requires the row to still be there.
+     *
+     * The row indices are the SELECTION indices of a menu whose Continue IS available,
+     * so they match the row numbers: 1 New game, 2 High score, 3 Instructions, 4
+     * Settings, 5 About. Settings is at 4 here and at 3 without Continue, which is why
+     * the offsets are written out rather than derived from a shared constant that would
+     * be wrong for half of them.
+     */
+    for (leg = 0u; leg < 4u; ++leg) {
+        unsigned int steps;
+        unsigned int step;
+        int state_after_back;
+        int enabled_after_back;
+        unsigned int row0_after_back;
+
+        /* Walk back to the top of the menu first, so each leg is independent. */
+        for (step = 0u; step < leg + 1u; ++step)
+            (void)bounce_app_flow_menu_move(&app.flow, BOUNCE_MENU_DIRECTION_UP);
+
+        for (steps = 0u; steps <= leg; ++steps) {
+            if (bounce_app_flow_menu_move(
+                    &app.flow, BOUNCE_MENU_DIRECTION_DOWN) != 0)
+                bad++;
+        }
+        fill_key_event(&event, KeyPress, 36u, 1u, 100u);
+        if (x11_dispatch_event(&context, &app, &event, XK_Return) != 0)
+            bad++;
+        if (app.flow.state == BOUNCE_APP_STATE_MENU) {
+            fprintf(stderr,
+                    "continue-return: leg %u did not leave the menu"
+                    " (selection=%u)\n",
+                    leg,
+                    app.flow.menu.selected_index);
+            bad++;
+            all_survived = false;
+            continue;
+        }
+        fill_key_event(&event, KeyPress, 9u, 1u, 100u);
+        if (x11_dispatch_event(&context, &app, &event, XK_Escape) != 0)
+            bad++;
+        state_after_back = (int)app.flow.state;
+        enabled_after_back = (int)bounce_app_flow_menu_item_enabled(&app.flow, 0u);
+        row0_after_back
+            = bounce_app_flow_menu_row_for_selection(&app.flow, 0u);
+
+        if (state_after_back != (int)BOUNCE_APP_STATE_MENU
+            || !app.flow.menu.continue_available
+            || enabled_after_back != 1
+            || row0_after_back != 0u
+            || app.flow.menu.enabled_item_count != BOUNCE_MENU_ROW_COUNT) {
+            fprintf(stderr,
+                    "continue-return: Continue did not survive leg %u"
+                    " (state=%d avail=%d row0_enabled=%d row0=%u"
+                    " enabled_count=%u)\n",
+                    leg,
+                    state_after_back,
+                    (int)app.flow.menu.continue_available,
+                    enabled_after_back,
+                    row0_after_back,
+                    app.flow.menu.enabled_item_count);
+            bad++;
+            all_survived = false;
+        }
+        /*
+         * AND THE SNAPSHOT MUST STILL BE THERE. A row that is offered while the record
+         * behind it has gone is worse than a missing row, because pressing it then
+         * refuses at the handoff.
+         */
+        if (bounce_persistence_load_record3(&back, &present) != 0 || !present
+            || back.b1 != BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL
+            || back.level != prime.level
+            || back.score != prime.score) {
+            fprintf(stderr,
+                    "continue-return: the snapshot was disturbed by leg %u\n",
+                    leg);
+            bad++;
+        }
+    }
+
+    /*
+     * THE OPPOSITE HALF. Delete the record, take one more round trip, and the row must
+     * be absent. Without this the whole check would also be satisfied by a row that is
+     * permanently present, which is the other way to get this wrong.
+     */
+    (void)bounce_persistence_delete_record3();
+    fill_key_event(&event, KeyPress, 9u, 1u, 100u);
+    /* Leave the menu state cleanly: go to High Score and come back. */
+    for (step = 0u; step < 3u; ++step)
+        (void)bounce_app_flow_menu_move(&app.flow, BOUNCE_MENU_DIRECTION_UP);
+    (void)bounce_app_flow_menu_move(&app.flow, BOUNCE_MENU_DIRECTION_DOWN);
+    (void)bounce_app_flow_menu_move(&app.flow, BOUNCE_MENU_DIRECTION_DOWN);
+    fill_key_event(&event, KeyPress, 36u, 1u, 100u);
+    if (x11_dispatch_event(&context, &app, &event, XK_Return) != 0
+        || app.flow.state == BOUNCE_APP_STATE_MENU) {
+        fprintf(stderr, "continue-return: could not reach a sub-screen to leave\n");
+        bad++;
+    }
+    fill_key_event(&event, KeyPress, 9u, 1u, 100u);
+    if (x11_dispatch_event(&context, &app, &event, XK_Escape) != 0
+        || app.flow.state != BOUNCE_APP_STATE_MENU
+        || app.flow.menu.continue_available
+        || bounce_app_flow_menu_item_enabled(&app.flow, 0u) != 0
+        || app.flow.menu.enabled_item_count != BOUNCE_MENU_ROW_COUNT - 1u) {
+        fprintf(stderr,
+                "continue-return: Continue was still offered with no snapshot"
+                " (state=%d avail=%d row0_enabled=%d enabled_count=%u)\n",
+                (int)app.flow.state,
+                (int)app.flow.menu.continue_available,
+                (int)bounce_app_flow_menu_item_enabled(&app.flow, 0u),
+                app.flow.menu.enabled_item_count);
+        bad++;
+        absent_is_greyed = false;
+    }
+
+    bounce_game_shutdown(&app);
+
+    if (bad == 0) {
+        printf("CONTINUE-RETURN primed=level4/score31415/lives2 legs=4"
+               " survived=%s snapshot_intact=yes absent_is_greyed=%s PASS\n",
+               all_survived ? "yes" : "no",
+               absent_is_greyed ? "yes" : "no");
+    }
+
+finish:
+    if (saved_ok)
+        (void)setenv("XDG_DATA_HOME", saved, 1);
+    else
+        (void)unsetenv("XDG_DATA_HOME");
+    return bad == 0 ? 0 : -1;
+}
+
 static int verify_persistence_flow(void)
 {
     BounceAppFlow flow;
@@ -28876,9 +32479,30 @@ static int verify_persistence_flow(void)
     memset(&flow, 0, sizeof flow);
     bounce_app_flow_init(&flow);
 
-    /* Fresh install: LoadRecords() leaves everything at its default. */
+    /*
+     * Fresh install: LoadRecords() leaves everything at its default.
+     *
+     * STEP 38-RESET -- THE UNLOCKED COUNT IS NOW PART OF THAT DEFAULT, and this is
+     * one of the two places the shipped value is asserted; verify_default_state() is
+     * the other, and it additionally pins high score, theme, audio, keypad and
+     * language.
+     *
+     * The old assertion was `available_level_count == 0`, which said "a fresh install
+     * publishes no level count at all" -- true while the Java-faithful store left the
+     * count for the store to supply, and no longer true now that a new install ships
+     * with levels 1 and 2 playable. The comment above the line is the reason to be
+     * careful: it claims LoadRecords() left things alone, and it still does. What
+     * changed is what a fresh flow carries BEFORE any record is read, which is a
+     * documented default rather than an absence of one.
+     *
+     * The constant is used instead of a literal so that a future change to the shipped
+     * default has to be made in one place, and so that this assertion cannot drift
+     * away from the value that is actually shipped while still looking like it is
+     * checking something.
+     */
     if (flow.high_score != 0
-        || flow.level_selection.available_level_count != 0u)
+        || flow.level_selection.available_level_count
+            != BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT)
         return -1;
     if (bounce_app_flow_high_score(&flow) != 0)
         return -1;
@@ -29496,6 +33120,63 @@ int main(int argc, char **argv)
     }
     if (verify_production_game_routing() != 0) {
         fprintf(stderr, "production main-loop routing verification failed\n");
+        goto cleanup;
+    }
+    if (verify_tick_cadence() != 0) {
+        fprintf(stderr, "game tick cadence verification failed\n");
+        goto cleanup;
+    }
+    if (verify_arrival_is_playable() != 0) {
+        fprintf(stderr, "arrival playability verification failed\n");
+        goto cleanup;
+    }
+    if (verify_big_ball_spawn_fit() != 0) {
+        fprintf(stderr, "big ball spawn fit verification failed\n");
+        goto cleanup;
+    }
+    if (verify_lives_ladder() != 0) {
+        fprintf(stderr, "lives ladder verification failed\n");
+        goto cleanup;
+    }
+    /*
+     * STEP 38-RESET. Registered together, and immediately after the check that
+     * walks the same two Settings rows, because the two halves of the feature are
+     * one claim: verify_default_state() pins what a fresh install is, and
+     * verify_reset_to_default() proves Confirm puts the flow and the store back to
+     * exactly that. Running the second without the first would let the two drift
+     * apart -- a reset that restores something no fresh install has would still
+     * pass every field assertion in isolation.
+     */
+    if (verify_default_state() != 0) {
+        fprintf(stderr, "fresh-install default state verification failed\n");
+        goto cleanup;
+    }
+    if (verify_reset_to_default() != 0) {
+        fprintf(stderr, "reset to default verification failed\n");
+        goto cleanup;
+    }
+    if (verify_reset_page_pointer_and_hint() != 0) {
+        fprintf(stderr, "reset page pointer and hint verification failed\n");
+        goto cleanup;
+    }
+    if (verify_continue_survives_submenus() != 0) {
+        fprintf(stderr, "continue-survives-submenus verification failed\n");
+        goto cleanup;
+    }
+    if (verify_continue_publication() != 0) {
+        fprintf(stderr, "continue publication verification failed\n");
+        goto cleanup;
+    }
+    if (verify_door_resets_between_levels() != 0) {
+        fprintf(stderr, "between-level door reset verification failed\n");
+        goto cleanup;
+    }
+    if (verify_hoop_counter_no_double_count() != 0) {
+        fprintf(stderr, "hoop counter double-count verification failed\n");
+        goto cleanup;
+    }
+    if (verify_door_waits_for_hoops() != 0) {
+        fprintf(stderr, "door/hoop gate verification failed\n");
         goto cleanup;
     }
     if (verify_w1_completion_request_latch() != 0) {

@@ -75,7 +75,26 @@ typedef enum BounceSettingsPage {
      * NATIVE EXTENSION: the temporary runtime UI color profiles. No original
      * Nokia Bounce screen or setting corresponds to this page.
      */
-    BOUNCE_SETTINGS_PAGE_THEME = 5
+    BOUNCE_SETTINGS_PAGE_THEME = 5,
+    /*
+     * STEP 38-RESET -- NATIVE ADDITION. The Reset to Default destination, and the
+     * confirmation screen it opens.
+     *
+     * THE VALUE IS NOT ARBITRARY. bounce_app_flow_settings_select() maps a Settings
+     * root row onto a page with `(BounceSettingsPage)(selected_index + 1)`, so the
+     * page a row opens is fixed by its position: row 0 -> DISPLAY(1), row 1 ->
+     * INPUT(2), and so on. Row 5 must therefore be 6 for the mapping to keep working
+     * unchanged, which is why this is appended rather than slotted in next to the
+     * other setting pages. Inserting it anywhere else would either renumber every
+     * page after it or need a parallel lookup table that does not exist.
+     *
+     * It resets the whole documented fresh-install state, not one setting: the
+     * Continue snapshot, the unlocked-level count, the high score, the color
+     * profile, the audio gate, the keypad gate and the language. That is why it is a
+     * page of its own rather than another two-row toggle -- a toggle cannot express
+     * "make this look like a new install".
+     */
+    BOUNCE_SETTINGS_PAGE_RESET = 6
 } BounceSettingsPage;
 
 typedef enum BounceAppEvent {
@@ -126,8 +145,11 @@ typedef enum BounceAppEvent {
 #define BOUNCE_MENU_ROW_COUNT 7u
 /* First row index that is a native extension rather than a source-backed row. */
 #define BOUNCE_MENU_FIRST_NATIVE_ROW 4u
-/* NATIVE EXTENSION: the Settings root list is deliberately small. */
-#define BOUNCE_SETTINGS_ROOT_ITEM_COUNT 5u
+/*
+ * STEP 38-RESET. Six rows: the four original native Settings destinations, the
+ * Theme page, and Reset to Default. It was five before this stage.
+ */
+#define BOUNCE_SETTINGS_ROOT_ITEM_COUNT 6u
 /*
  * NATIVE EXTENSION: the runtime UI color profiles. Index 0 is the default and is
  * what every fresh launch uses; nothing is persisted. Must stay equal to
@@ -148,6 +170,12 @@ typedef enum BounceAppEvent {
 #define BOUNCE_SETTINGS_ROW_AUDIO 2u
 #define BOUNCE_SETTINGS_ROW_LANGUAGE 3u
 #define BOUNCE_SETTINGS_ROW_THEME 4u
+/*
+ * STEP 38-RESET. Row 5, which is the last root row and therefore the one
+ * bounce_app_flow_settings_select() turns into BOUNCE_SETTINGS_PAGE_RESET via its
+ * `selected_index + 1` mapping.
+ */
+#define BOUNCE_SETTINGS_ROW_RESET 5u
 /*
  * The Language list length: the four ORIGINAL SOURCE-BACKED recovered resources
  * plus Indonesian, a NATIVE EXTENSION that has no resource file. This is a
@@ -234,6 +262,42 @@ typedef struct BounceLevelSelectionState {
 } BounceLevelSelectionState;
 
 /*
+ * STEP 38-RESET -- THE DOCUMENTED FRESH-INSTALL STATE.
+ *
+ * These four numbers are the whole of "what a new install looks like", and they are
+ * named rather than written inline at each site because three separate places have
+ * to agree on them: bounce_app_flow_init() for a launch with no store,
+ * bounce_app_flow_reset_to_default() for the Reset to Default row, and the verifier
+ * that asserts a fresh install and a reset produce the same state. A literal in one
+ * of them and a constant in the others is how the three drift apart.
+ *
+ * TWO OF THE FOUR DIFFER FROM WHAT THE RECOVERED SOURCE WOULD PRODUCE, and both
+ * differences were asked for explicitly.
+ *
+ *   max_levels = 2, not 0. BounceGame.java:276-279 shows that when the store holds
+ *   no records LoadRecords() writes three zero-filled records and reads none of
+ *   them, so MaxLevels keeps its Java default of 0 from :21. With 0 the New Game gate
+ *   at :241 (`MaxLevels > 1`) is false, so `a(true, 1)` runs and the first level
+ *   starts directly -- the Level Select screen is unreachable on a fresh install, and
+ *   a second level is unreachable forever. Two is the smallest count that makes both
+ *   levels 1 and 2 selectable while still leaving 3..11 gated behind progress.
+ *
+ *   t9_input_enabled = true, not false. The native keypad is not a recovered feature
+ *   at all (see the field's own comment), so its default is a product decision rather
+ *   than a reconstruction, and it is now ON so that a new install drives entirely
+ *   from the numeric keypad.
+ *
+ * high_score = 0 and the color profile's index 0 are not listed here because they
+ * are already 0 in every sense that matters: bounce_app_flow_init() zeroes the whole
+ * context, and index 0 IS the default profile. They are asserted by the verifier
+ * rather than given a constant, so there is no second place for a default to hide.
+ */
+#define BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT 2
+#define BOUNCE_DEFAULT_T9_INPUT_ENABLED true
+#define BOUNCE_DEFAULT_AUDIO_ENABLED true
+#define BOUNCE_DEFAULT_LANGUAGE_INDEX 0u
+
+/*
  * NATIVE EXTENSION state for the Settings destination. It records navigation
  * only: which page is current, which row is selected, and which recovered
  * language resource row is highlighted. It deliberately holds no applied
@@ -298,6 +362,29 @@ typedef struct BounceSettingsState {
      * about how the shipped keys behave.
      */
     bool t9_input_enabled;
+    /*
+     * STEP 38-RESET -- the one-shot "the player confirmed a reset" intent.
+     *
+     * WHY IT LIVES HERE AND NOT IN THE RESULT. bounce_app_flow_settings_select() only
+     * receives a BounceAppFlow*, so it can reset flow state but it cannot touch the
+     * store: deleting Record 3 and rewriting records 1, 2, 4 and 5 is I/O, and the
+     * flow layer does no I/O anywhere. This is the same split the rest of this file
+     * already uses -- bounce_app_flow_menu_set_continue_available() records a fact
+     * and the shell acts on it, and bounce_app_flow_consume_new_game_score_reset() is
+     * a one-shot flag read and cleared by its consumer.
+     *
+     * It is a FLAG rather than a return value because the caller cannot act on a
+     * return value: bounce_ui_shell_handle_press() collapses every settings action
+     * into "handled / not handled", so a "reset happened" signal has to survive until
+     * the shell looks for it.
+     *
+     * ONE-SHOT BY CONSTRUCTION. It is set only by
+     * bounce_app_flow_settings_select() on the Confirm row, and it is read only
+     * through bounce_app_flow_consume_reset_to_default(), which clears it as it
+     * reads. A stale true could therefore never carry into a later press, which
+     * matters because the consumer performs deletions.
+     */
+    bool reset_to_default_pending;
 } BounceSettingsState;
 
 /*
@@ -548,6 +635,55 @@ int bounce_app_flow_settings_move(
 int bounce_app_flow_settings_select(BounceAppFlow *flow);
 int bounce_app_flow_settings_back(BounceAppFlow *flow);
 
+/*
+ * STEP 38-RESET -- restore the documented fresh-install state.
+ *
+ * WHAT IT RESETS, and what it deliberately does not:
+ *
+ *   level_selection.available_level_count  -> BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT
+ *   level_selection.selected_index         -> 0
+ *   high_score                             -> 0
+ *   new_high_score                         -> false
+ *   settings.applied_theme_index           -> 0   (the default profile)
+ *   settings.theme_index                   -> 0   (the highlight, too, so the
+ *                                                 Theme page agrees with it)
+ *   settings.audio_enabled                 -> BOUNCE_DEFAULT_AUDIO_ENABLED
+ *   settings.t9_input_enabled              -> BOUNCE_DEFAULT_T9_INPUT_ENABLED
+ *   settings.applied_language_index        -> BOUNCE_DEFAULT_LANGUAGE_INDEX
+ *   settings.language_index                -> 0   (highlight, same reason)
+ *   menu.continue_available                -> false
+ *   menu.selected_index                    -> 0
+ *
+ * NOT RESET, deliberately: flow->state (the caller decides where the player lands
+ * afterwards), level_id, pending_level_id, the gameplay-entry block, the splash
+ * countdown and instructions_scroll. None of those is part of "a new install", and
+ * clearing level_id in particular would break the staged entry this can be reached
+ * from. instructions_scroll is left alone for the same reason it is reset on ENTRY
+ * to the Instructions page rather than on leaving it.
+ *
+ * IT DOES NOT DELETE Record 3. That is the consumer's job, because it is I/O: this
+ * function sets reset_to_default_pending and the shell removes the snapshot. A flow
+ * that claimed the record was gone while it was still on disk would produce exactly
+ * the stale-Continue defect that app_persist_resume_snapshot_for_continue() was added
+ * to close.
+ *
+ * Returns 0, or -1 for a NULL flow or a flow that is not in the Settings
+ * destination -- the same two refusals every other settings entry point has, so a
+ * caller cannot reset the game from an unexpected screen.
+ */
+int bounce_app_flow_reset_to_default(BounceAppFlow *flow);
+
+/*
+ * STEP 38-RESET -- consume the one-shot reset intent.
+ *
+ * Returns the flag AND clears it in the same operation, so a reset can be performed
+ * at most once per confirmation. There is deliberately no plain getter: a getter
+ * would let a caller read the flag without clearing it, and the consumer DELETES a
+ * saved snapshot, so a repeated read would delete it twice and a leaked true would
+ * delete it on an unrelated press. Returns false for a NULL flow.
+ */
+bool bounce_app_flow_consume_reset_to_default(BounceAppFlow *flow);
+
 /* Read-only accessors for the native Settings navigation state. */
 BounceSettingsPage bounce_app_flow_settings_page(const BounceAppFlow *flow);
 unsigned int bounce_app_flow_settings_selected_index(const BounceAppFlow *flow);
@@ -627,6 +763,42 @@ bool bounce_app_flow_settings_audio_enabled(
 #define BOUNCE_SETTINGS_T9_VALUE_COUNT 2u
 #define BOUNCE_SETTINGS_T9_ROW_ON  0u
 #define BOUNCE_SETTINGS_T9_ROW_OFF 1u
+
+/*
+ * STEP 38-RESET -- the Reset to Default confirmation screen's two rows.
+ *
+ * CONFIRM IS ROW 0, and row 0 is where the highlight starts. Opening the page and
+ * pressing SELECT therefore resets immediately, which is the safe direction to make
+ * the easy one only because the page cannot be reached by accident: it takes a
+ * deliberate walk to the last Settings row and then another press to open it.
+ *
+ * STEP 38-RESET-UI -- ROW 1 IS NAMED BACK, NOT CANCEL, AND IT IS NO LONGER A NO-OP.
+ *
+ * It used to be a Cancel row that returned success without doing anything, which read
+ * as a dead button: it was highlighted, it accepted SELECT, and the only thing it did
+ * was nothing. What the player wanted from that row was the thing every other screen
+ * in the shell calls Back, so that is what it now is.
+ *
+ * The one behavioural consequence is deliberate and worth stating plainly, because
+ * this is a confirmation screen and the distinction is the whole point of it: SELECT on
+ * BACK navigates and SELECT on CONFIRM destroys. Previously the safe row also had no
+ * navigation behaviour of its own, so "leave without resetting" was only ever reachable
+ * through the ESC key. A pointer user had no way out of this page at all. Now both rows
+ * are clickable, and BACK leaves without resetting.
+ *
+ * Both routes still land on the Settings root and neither one clears a thing:
+ * bounce_app_flow_settings_back() has never touched progress, theme, audio, keypad,
+ * language or the store. Renaming the row therefore makes the safe choice clickable
+ * without giving the destructive one anything new.
+ *
+ * The count stays 2. Making this page a single button was considered and rejected: the
+ * Back row is what lets a pointer user leave without a keyboard, and a page that can
+ * only be left with the key that is deliberately not labelled on it would be worse than
+ * the one-row version.
+ */
+#define BOUNCE_SETTINGS_RESET_VALUE_COUNT 2u
+#define BOUNCE_SETTINGS_RESET_ROW_CONFIRM 0u
+#define BOUNCE_SETTINGS_RESET_ROW_BACK    1u
 
 /*
  * NATIVE ADDITION. Whether the numeric keypad drives the game. NATIVE SETTING,

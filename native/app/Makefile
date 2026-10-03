@@ -72,6 +72,24 @@ SOURCES = \
 	../renderer/renderer.c \
 	../renderer/presentation.c
 
+# STEP 38-RESET -- THE HEADERS ARE PREREQUISITES TOO.
+#
+# bounce_vertical_slice was built from $(SOURCES) alone, so make compared the binary
+# against the .c files only. Every header in the tree was therefore invisible to the
+# dependency check, and editing one left a stale binary in place with no warning.
+#
+# That is not a tidiness complaint. It is what makes a negative control lie: four of
+# the controls for this feature change a default that lives in app_flow.h, and each
+# one was reported as "not caught" simply because make declined to rebuild. A test
+# suite whose injected bugs are silently ignored by the build cannot demonstrate that
+# the tests would notice a real bug, so the build has to be honest before the tests
+# can be.
+#
+# The whole program is compiled in one command rather than to objects, so -MMD would
+# have no per-object .d file to produce. The wildcard is evaluated when the Makefile
+# is read, which is correct here because the header set is fixed in the tree.
+HEADERS := $(wildcard *.h ../level/*.h ../renderer/*.h ../assets/*.h)
+
 .PHONY: all check check-rtpl check-audio-event check-audio-synth \
         check-audio-backend check-audio-backend-alsa check-audio-player \
         check-audio-player-alsa check-audio-lifecycle \
@@ -79,7 +97,7 @@ SOURCES = \
 
 all: bounce_vertical_slice
 
-bounce_vertical_slice: $(SOURCES)
+bounce_vertical_slice: $(SOURCES) $(HEADERS)
 	$(CC) $(CPPFLAGS) $(X11_CFLAGS) $(PNG_CFLAGS) $(GAME_AUDIO_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(SOURCES) $(X11_LIBS) $(PNG_LIBS) $(GAME_AUDIO_LIBS) -lpthread -lm $(LDLIBS)
 
 check: bounce_vertical_slice

@@ -70,7 +70,14 @@ static void bounce_app_flow_reset_settings(BounceSettingsState *settings)
     /* STEP 34-F-K. Default ON: matches the pre-existing no-setting behaviour. */
     settings->audio_enabled = true;
     /* NATIVE ADDITION: the keypad is off until a player asks for it. */
-    settings->t9_input_enabled = false;
+    /*
+     * STEP 38-RESET. ON, not off -- the keypad default is a product decision, and
+     * this is the other half of it besides the level count above. bounce_persistence
+     * still treats an ABSENT record as off, which is a different question: absence
+     * means "a store written before the setting existed", while this is the value a
+     * launch with no store at all starts from.
+     */
+    settings->t9_input_enabled = BOUNCE_DEFAULT_T9_INPUT_ENABLED;
 }
 
 /*
@@ -216,7 +223,13 @@ void bounce_app_flow_init(BounceAppFlow *flow)
     flow->splash_timer = 0u;
     flow->splash_skip_requested = false;
     flow->next_tick_ms = 0;
-    flow->level_selection.available_level_count = 0u;
+    /*
+     * STEP 38-RESET. Two, not the source's zero -- see the
+     * BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT comment in app_flow.h for why a fresh
+     * install is given levels 1 and 2 rather than none.
+     */
+    flow->level_selection.available_level_count =
+        (unsigned int)BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT;
     flow->level_selection.selected_index = 0u;
     flow->pending_level_id = 0;
     /* STEP 37 PERSIST -- Java HighScore default. BounceGame.java declares it at
@@ -703,6 +716,12 @@ unsigned int bounce_app_flow_settings_list_count(const BounceAppFlow *flow)
      */
     if (flow->settings.page == BOUNCE_SETTINGS_PAGE_INPUT)
         return BOUNCE_SETTINGS_T9_VALUE_COUNT;
+    /*
+     * STEP 38-RESET. Two rows, Confirm and Cancel, which is the same shape as the
+     * Audio and Input pages: a highlight plus a SELECT that acts.
+     */
+    if (flow->settings.page == BOUNCE_SETTINGS_PAGE_RESET)
+        return BOUNCE_SETTINGS_RESET_VALUE_COUNT;
     return 0u;
 }
 
@@ -759,6 +778,62 @@ int bounce_app_flow_settings_move(
         ++flow->settings.selected_index;
     }
     return 0;
+}
+
+/*
+ * STEP 38-RESET -- the Reset to Default action, and the consume half of its
+ * one-shot intent. bounce_app_flow_reset_to_default() carries the reasoning for
+ * what each field becomes and, more importantly, for the three it leaves alone;
+ * see app_flow.h.
+ */
+int bounce_app_flow_reset_to_default(BounceAppFlow *flow)
+{
+    if (flow == NULL || flow->state != BOUNCE_APP_STATE_SETTINGS)
+        return -1;
+
+    flow->level_selection.available_level_count =
+        (unsigned int)BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT;
+    flow->level_selection.selected_index = 0u;
+    flow->high_score = 0;
+    /* The "new high score" notice is a claim about the run that just ended. */
+    flow->new_high_score = false;
+
+    flow->settings.applied_theme_index = 0u;
+    /* The highlight follows the applied value, or the Theme page would claim a
+     * profile the game is not using -- the same defect the restore path documents. */
+    flow->settings.theme_index = 0u;
+    flow->settings.audio_enabled = BOUNCE_DEFAULT_AUDIO_ENABLED;
+    flow->settings.t9_input_enabled = BOUNCE_DEFAULT_T9_INPUT_ENABLED;
+    flow->settings.applied_language_index = BOUNCE_DEFAULT_LANGUAGE_INDEX;
+    flow->settings.language_index = 0u;
+
+    flow->menu.continue_available = false;
+    flow->menu.selected_index = 0u;
+    /*
+     * Leave the player on the page they confirmed from, with the highlight on
+     * Confirm, so the screen they are looking at still describes what they just did
+     * rather than silently jumping somewhere else mid-press.
+     */
+    flow->settings.page = BOUNCE_SETTINGS_PAGE_RESET;
+    flow->settings.selected_index = BOUNCE_SETTINGS_RESET_ROW_CONFIRM;
+    /*
+     * Raised for the shell, which is the only layer that can delete Record 3 and
+     * rewrite records 1, 2, 4 and 5. See the field's comment in app_flow.h.
+     */
+    flow->settings.reset_to_default_pending = true;
+    return 0;
+}
+
+bool bounce_app_flow_consume_reset_to_default(BounceAppFlow *flow)
+{
+    bool pending;
+
+    if (flow == NULL)
+        return false;
+    pending = flow->settings.reset_to_default_pending;
+    /* Cleared as it is read, so the consumer's deletions cannot run twice. */
+    flow->settings.reset_to_default_pending = false;
+    return pending;
 }
 
 int bounce_app_flow_settings_select(BounceAppFlow *flow)
@@ -819,15 +894,65 @@ int bounce_app_flow_settings_select(BounceAppFlow *flow)
             = (flow->settings.selected_index == BOUNCE_SETTINGS_T9_ROW_ON);
         return 0;
     }
+    /*
+     * STEP 38-RESET-UI. Two rows, and they now do genuinely different things: CONFIRM
+     * destroys, BACK navigates.
+     *
+     * BACK DELEGATES TO bounce_app_flow_settings_back() rather than re-implementing
+     * "leave this page". That is the point of naming the row Back: the ESC key, the
+     * clickable band along the bottom of the screen and this row are then three inputs
+     * into one function, so none of them can drift. The old row was a bare `return 0`,
+     * which is why it read as a dead button -- it was not wired to the one function
+     * that already did the job.
+     *
+     * It is safe to delegate even though this is a confirmation screen, because
+     * bounce_app_flow_settings_back() is pure navigation. It leaves the page, the
+     * highlight and the Settings root; it does not restore anything, clear anything,
+     * or touch the store. The reset is reachable from CONFIRM and from nowhere else,
+     * which is unchanged.
+     *
+     * CONFIRM delegates to bounce_app_flow_reset_to_default() so there is still exactly
+     * one definition of the fresh-install state rather than two.
+     */
+    if (flow->settings.page == BOUNCE_SETTINGS_PAGE_RESET) {
+        if (flow->settings.selected_index >= count)
+            return -1;
+        if (flow->settings.selected_index == BOUNCE_SETTINGS_RESET_ROW_CONFIRM)
+            return bounce_app_flow_reset_to_default(flow);
+        return bounce_app_flow_settings_back(flow);
+    }
     if (flow->settings.page != BOUNCE_SETTINGS_PAGE_ROOT)
         return -1;
     if (flow->settings.selected_index >= BOUNCE_SETTINGS_ROOT_ITEM_COUNT)
         return -1;
 
-    /* Root rows map in order onto the page enum values 1..4. */
+    /* Root rows map in order onto the page enum values 1..5. */
     flow->settings.page = (BounceSettingsPage)(
         (int)flow->settings.selected_index + 1
     );
+    /*
+     * STEP 38-RESET -- AND THE HIGHLIGHT IS CLAMPED INTO THE PAGE JUST OPENED.
+     *
+     * What this fixes: selected_index is the ROOT row number, and the root has six
+     * rows while the pages it opens have two or none. Carrying the root number into
+     * the page left the highlight off the end of the new list, which is not cosmetic
+     * -- bounce_app_flow_settings_select() rejects any index at or past the page's
+     * row count, so Audio (root row 2 of two) had an unusable page and Reset (root
+     * row 5 of two) would have had one too. The player would have navigated to the
+     * setting, seen no row highlighted, and had SELECT do nothing.
+     *
+     * Why it is a clamp to 0 and not a clamp to the last row: the Audio, Input and
+     * Reset pages both present their list as "ON then OFF" or "Confirm then Cancel",
+     * so row 0 is the value a reset or a fresh visit should land on. It is also what
+     * bounce_app_flow_settings_back() has always produced on the way out, so
+     * re-entering a page now agrees with coming back from it.
+     *
+     * A page with no rows (Display) keeps index 0, which its own render and its own
+     * "SELECT fails" checks already assumed.
+     */
+    count = bounce_app_flow_settings_list_count(flow);
+    if (flow->settings.selected_index >= count)
+        flow->settings.selected_index = 0u;
     return 0;
 }
 

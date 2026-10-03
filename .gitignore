@@ -42,3 +42,6 @@ bin/
 .DS_Store
 # Native build artifact
 native/app/bounce_vertical_slice
+
+# Python bytecode from native/app/tools/ (gen_script_font.py, test_translations.py)
+__pycache__/

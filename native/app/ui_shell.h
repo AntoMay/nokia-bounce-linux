@@ -274,6 +274,21 @@ int bounce_ui_shell_render_settings(
 );
 
 /*
+ * STEP 38-RESET-UI -- THE Y OF EACH ROW ON THE TWO SETTINGS SCREENS THAT HAVE ONE.
+ *
+ * Exposed so that a verifier can ask where a row is DRAWN and click exactly there,
+ * instead of keeping a private copy of the geometry. That private copy is the defect
+ * this pair exists to prevent: bounce_ui_shell_handle_click() had its own table, five
+ * entries long at a different pitch from the one the renderer used, so the sixth root
+ * row -- the Reset row -- had a hit band at y = 0 and could not be clicked at all.
+ *
+ * Both return -1 for an out-of-range index rather than a number, so a caller that loops
+ * wrong reads a failure instead of silently probing y = 0, which is a real coordinate.
+ */
+int bounce_ui_shell_settings_root_row_y(unsigned int index);
+int bounce_ui_shell_reset_row_y(unsigned int index);
+
+/*
  * NATIVE EXTENSION: render the About destination. It shows only facts already
  * established in this repository and deliberately contains no project URL,
  * author, contact, or social line, because none is established anywhere.

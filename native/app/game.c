@@ -564,6 +564,62 @@ int bounce_game_load_level_entry(BounceGame *game, int level_id)
      * function with the latch already false is unaffected.
      */
     game->deferred_init = false;
+    /*
+     * b.java:239 -- CreateTiles(this.exitX, this.exitY, this.Sprites[SpriteIDs.EXIT]),
+     * called from inside LoadLevelId, immediately after the exit coordinates are
+     * read and immediately before HoopsTotal. That three-argument overload is
+     * b.java:809-817:
+     *
+     *     public void CreateTiles(int tileX, int tileY, Image paramImage) {
+     *         this.tileX = tileX;
+     *         this.tileY = tileY;
+     *         this.o = paramImage;
+     *         this.aa = Image.createImage(24, 24);
+     *         this.b = 0;          // <-- the door animation offset
+     *         p();
+     *         this.M = false;      // <-- the door-open latch
+     *     }
+     *
+     * SO THE DOOR IS RE-ARMED BY EVERY LEVEL LOAD IN THE ORIGINAL, not by the
+     * gameplay entry, not by a respawn and not by the tick. `b` is the field the
+     * e.java:292 `h()` call advances and that p() uses as the source Y of the
+     * 24x24 window, and `M` is the latch f.java:601 tests before it completes the
+     * level. Both are per-level state in Java because both are fields of the single
+     * long-lived `b`, and Java gets them back to zero only here.
+     *
+     * WHY THIS FUNCTION HAD TO GAIN IT. There are two native level loaders and only
+     * one of them carried the reset. bounce_game_load_level() -- the all-in-one
+     * loader used by the legacy diagnostic route and by the deferred-init branch --
+     * has always cleared door_image_offset and door_open_flag. This function, the
+     * staged entry loader, is the one the PRODUCTION chain reaches: New Game, Level
+     * Select and the post-completion Continue all go
+     * app_advance_gameplay_entry_to_level_loaded() -> bounce_game_load_level_entry().
+     * It reset nothing but ownership, level_id and the deferred_init latch, so a
+     * level reached by FINISHING the previous one inherited that level's door.
+     *
+     * The consequence was exactly that, and it was invisible to every existing
+     * check because of how the checks reach a level. A fresh app loading level N
+     * starts from a zeroed context, so it always saw a shut door. But a player
+     * never reaches level 2 by loading it -- they reach it by completing level 1 --
+     * and on that route door_open_flag was still true and door_image_offset still
+     * 24. So levels 2 through 11 all began with the exit already drawn in its open
+     * frame and already passable, while level 1, the only level reachable without
+     * a predecessor, behaved correctly. That is the whole of the reported symptom.
+     *
+     * IT IS A NO-OP FOR EVERY OTHER ENTRY. On New Game, Level Select and a resumed
+     * session the door state is already 0/false, because bounce_game_initialize()
+     * zeroes the context and bounce_game_load_level() sets these two explicitly.
+     * Nothing else in this function changes, no state is added, and the level,
+     * level_id and deferred_init writes above are untouched.
+     *
+     * TODO_ExitUnlocked is deliberately NOT added here. It is not a Java
+     * CreateTiles field, it has the separate source-backed clear at e.java:87, and
+     * on this route it is already false -- bounce_game_mark_level_complete() writes
+     * it at game.c:1286, which is e.java:315. Adding a second writer for it here
+     * would invent a reset the source does not have.
+     */
+    game->door_image_offset = 0;
+    game->door_open_flag = false;
     return 0;
 }
 

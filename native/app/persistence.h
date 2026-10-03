@@ -314,6 +314,25 @@ int bounce_persistence_save_records_12_preserving_record3(
     const BouncePersistenceRecords *in);
 
 /*
+ * STEP 38-RESET -- delete Record 3, the Continue snapshot.
+ *
+ * Record 3's ABSENCE is a normal, already-handled state: the loader reports
+ * present == false and the container validates without it, because a fresh install
+ * and a legacy version-1 save both have none. This is how a caller reaches that state
+ * deliberately. Writing a zeroed record instead would NOT do, because the record
+ * would still be present and every reader would have to treat an empty payload as
+ * absent.
+ *
+ * RECORDS 1, 2, 4 AND 5 ARE PRESERVED. This function removes exactly one record and
+ * touches nothing else, like every other writer in this module, so it composes with
+ * a caller that has just written new values for them.
+ *
+ * Returns 0 on success and -1 on failure, and a failure is never fatal: the record
+ * may survive, which leaves a stale Continue rather than a broken game.
+ */
+int bounce_persistence_delete_record3(void);
+
+/*
  * TUGAS 2b -- read the persisted color-profile index.
  *
  * Returns 0 whenever the answer is well-defined, which includes "there is no

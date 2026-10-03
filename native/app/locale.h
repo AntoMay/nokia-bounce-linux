@@ -240,6 +240,44 @@ typedef enum BounceLocaleKey {
      * unknown-glyph box in Chinese or Thai is worse than an English one.
      */
     BOUNCE_LOCALE_T9_INPUT,
+    /*
+     * NATIVE ADDITION -- the "Reset to Default" Settings destination and its
+     * confirmation row. Appended after T9_INPUT so no existing enumerator value
+     * moves: the table in locale.c is positional and every row must gain the entry
+     * in the same place, so inserting anywhere else would silently re-label every
+     * later string in all five languages.
+     *
+     * NOT A RECOVERY. The recovered game has no Settings screen at all, so there is
+     * no Translation id for any of these. Like every other native-extension row they
+     * are translated into all five languages rather than left English, because a
+     * label that renders as an unknown-glyph box in Chinese or Thai is worse than an
+     * English one -- and these are the most important native strings in the build,
+     * since they are the only way to undo everything else.
+     *
+     * CONFIRM IS THE DEFAULT ROW. bounce_app_flow_reset_to_default() is only reached
+     * from the Confirm row and the highlight starts on row 0, so opening the page and
+     * pressing SELECT straight away is the destructive path.
+     *
+     * STEP 38-RESET-UI -- THERE IS NO "CANCEL" STRING ANY MORE. The second row of the
+     * page is the Back ACTION, and it borrows the existing BOUNCE_LOCALE_BACK key
+     * rather than introducing a third string for the same word.
+     *
+     * Reusing that key is not a convenience, it is the point. BOUNCE_LOCALE_BACK
+     * already means "the way out of this screen" everywhere in the shell -- it is the
+     * Input page's BACK/ESCAPE fact row, and the same word the ESC BACK hint spells
+     * out -- so a CANCEL key here created a second English word for one action and two
+     * translations per language to keep in step. Deleting the key from all five
+     * positional columns leaves the remaining entries aligned, which is why this is a
+     * removal and not a rename: renaming in place would have been less code and would
+     * have left a key whose name and whose neighbours disagreed.
+     *
+     * What this key change does NOT do is change behaviour. The Back row and the
+     * Cancel row did the same thing -- nothing -- and both still do: the reset only
+     * ever happens from CONFIRM. The visible difference is the label and the fact that
+     * the action now has a name that matches every other screen.
+     */
+    BOUNCE_LOCALE_RESET_DEFAULT,
+    BOUNCE_LOCALE_RESET_CONFIRM,
     BOUNCE_LOCALE_KEY_COUNT
 } BounceLocaleKey;
 

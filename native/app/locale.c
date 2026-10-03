@@ -262,7 +262,9 @@ static const char *const locale_text[BOUNCE_LANGUAGE_COUNT][BOUNCE_LOCALE_KEY_CO
          * renders on every row of the table with the same pixels the rest of
          * this page already uses.
          */
-        /* BOUNCE_LOCALE_T9_INPUT */ "NUMPAD"
+        /* BOUNCE_LOCALE_T9_INPUT */ "NUMPAD",
+        /* BOUNCE_LOCALE_RESET_DEFAULT */ "RESET TO DEFAULT",
+        /* BOUNCE_LOCALE_RESET_CONFIRM */ "CONFIRM"
     },
     /* ------- INDONESIAN: NATIVE EXTENSION, from ENGLISH ------- */
     [BOUNCE_LANGUAGE_ID] = {
@@ -366,7 +368,9 @@ static const char *const locale_text[BOUNCE_LANGUAGE_COUNT][BOUNCE_LOCALE_KEY_CO
          * row here. No lang.id resource exists. */
         /* BOUNCE_LOCALE_NEW_HIGH_SCORE */ "REKOR BARU!",
         /* BOUNCE_LOCALE_LEVEL_COMPLETED */ "Level %U selesai!",
-        /* BOUNCE_LOCALE_T9_INPUT */ "NUMPAD"
+        /* BOUNCE_LOCALE_T9_INPUT */ "NUMPAD",
+        /* BOUNCE_LOCALE_RESET_DEFAULT */ "ATURAN ULANG KE BAWAAN",
+        /* BOUNCE_LOCALE_RESET_CONFIRM */ "KONFIRMASI"
     },
     /* ------- ZH_CN: TEMPORARY TEST TABLE, NOT A RECOVERED RESOURCE ------- */
     [BOUNCE_LANGUAGE_ZH_CN] = {
@@ -464,7 +468,9 @@ static const char *const locale_text[BOUNCE_LANGUAGE_COUNT][BOUNCE_LOCALE_KEY_CO
         /* BOUNCE_LOCALE_NEW_HIGH_SCORE */ "新最高分！",
         /* STEP 13G-A, Translation id 10, lang.zh-CN verbatim, newline INCLUDED. */
         /* BOUNCE_LOCALE_LEVEL_COMPLETED */ "级别%U\n已完成",
-        /* BOUNCE_LOCALE_T9_INPUT */ "数字键盘"
+        /* BOUNCE_LOCALE_T9_INPUT */ "数字键盘",
+        /* BOUNCE_LOCALE_RESET_DEFAULT */ "重置为默认",
+        /* BOUNCE_LOCALE_RESET_CONFIRM */ "确认"
     },
     /* ------- ZH_TW: TEMPORARY TEST TABLE, NOT A RECOVERED RESOURCE ------- */
     [BOUNCE_LANGUAGE_ZH_TW] = {
@@ -562,7 +568,9 @@ static const char *const locale_text[BOUNCE_LANGUAGE_COUNT][BOUNCE_LOCALE_KEY_CO
         /* BOUNCE_LOCALE_NEW_HIGH_SCORE */ "刷新紀錄！",
         /* STEP 13G-A, Translation id 10, lang.zh-TW verbatim, newline INCLUDED. */
         /* BOUNCE_LOCALE_LEVEL_COMPLETED */ "等級%U\n已完成！",
-        /* BOUNCE_LOCALE_T9_INPUT */ "數字鍵盤"
+        /* BOUNCE_LOCALE_T9_INPUT */ "數字鍵盤",
+        /* BOUNCE_LOCALE_RESET_DEFAULT */ "設為預設"
+        /* BOUNCE_LOCALE_RESET_CONFIRM */ "確認"
     },
     /* ------- TH_TH: TEMPORARY TEST TABLE, NOT A RECOVERED RESOURCE ------- */
     [BOUNCE_LANGUAGE_TH_TH] = {
@@ -660,7 +668,9 @@ static const char *const locale_text[BOUNCE_LANGUAGE_COUNT][BOUNCE_LOCALE_KEY_CO
         /* BOUNCE_LOCALE_NEW_HIGH_SCORE */ "คะแนน​สูงสุด ใหม่!",
         /* STEP 13G-A, Translation id 10, lang.th-TH verbatim. */
         /* BOUNCE_LOCALE_LEVEL_COMPLETED */ "ผ่านระดับ %U!",
-        /* BOUNCE_LOCALE_T9_INPUT */ "แป้นตัวเลข"
+        /* BOUNCE_LOCALE_T9_INPUT */ "แป้นตัวเลข",
+        /* BOUNCE_LOCALE_RESET_DEFAULT */ "รีเซ็ตเป็นค่าเริ่มต้น",
+        /* BOUNCE_LOCALE_RESET_CONFIRM */ "ยืนยัน"
     }
 };
 

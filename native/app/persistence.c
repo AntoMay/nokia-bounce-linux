@@ -1048,6 +1048,54 @@ int bounce_persistence_save_record3(const BouncePersistenceRecord3 *in)
         &records12, in, true, theme, true, t9, have_t9);
 }
 
+/*
+ * STEP 38-RESET -- remove Record 3, the Continue snapshot, from the store.
+ *
+ * WHY A DELETE EXISTS AT ALL. Every writer in this module replaces one record and
+ * preserves the rest, so until now there was no way to express "this record should
+ * not exist". Record 3's absence is already a defined, normal state --
+ * bounce_persistence_load_record3() reports present == false for it and
+ * bounce_persistence_is_well_formed() accepts the container without it -- because a
+ * fresh install and a legacy version-1 save both lack it. Reset to Default needs to
+ * reach that state deliberately, and overwriting Record 3 with zeroes would NOT be
+ * the same thing: the record would still be present, and the resume path would have
+ * to treat a zeroed payload as absent. Removing it makes the store say what it means.
+ *
+ * RECORDS 1, 2, 4 AND 5 ARE PRESERVED, exactly as every other writer here preserves
+ * them. That is deliberate and is what makes this composable with the reset: the
+ * shell writes the new records 1 and 2, the default theme and the default keypad,
+ * and calls this to drop the snapshot. Nothing in this function may overwrite a value
+ * the reset has just written, so a caller that resets the store must not expect this
+ * to clear anything else.
+ *
+ * FAILURE IS NOT FATAL, for the same reason as every other write here: Java's
+ * WriteToStore() swallows its IOException (BounceGame.java:413-414) and the game
+ * carries on. A snapshot that survives a failed delete is a stale Continue, which is
+ * the defect this stage is partly about -- so the caller is expected to re-derive
+ * availability from what it reads back, which bounce_app_flow's menu refresh already
+ * does on every arrival.
+ */
+int bounce_persistence_delete_record3(void)
+{
+    BouncePersistenceRecords records12;
+    int32_t theme = 0;
+    int32_t t9 = 0;
+    bool have_t9;
+
+    if (bounce_persistence_load(&records12) != 0) {
+        records12.max_levels = 0;
+        records12.high_score = 0;
+    }
+    if (bounce_persistence_load_theme_index(&theme) != 0)
+        theme = 0;
+    have_t9 = bounce_persistence_load_t9_enabled(&t9) == 0 && t9 != 0;
+    if (!have_t9)
+        t9 = 0;
+    /* have_record3 == false: the record is omitted from the directory entirely. */
+    return write_container(
+        &records12, NULL, false, theme, true, t9, have_t9);
+}
+
 int bounce_persistence_save_records_12_preserving_record3(
     const BouncePersistenceRecords *in)
 {

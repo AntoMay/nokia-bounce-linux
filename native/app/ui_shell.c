@@ -292,6 +292,125 @@ const BounceUiPalette *bounce_ui_shell_palette(void)
 #define BOUNCE_UI_THEME_ROW_PITCH 20
 #define BOUNCE_UI_THEME_ROW_HIT_H 16
 
+/*
+ * STEP 38-RESET-UI -- ONE TABLE FOR THE SETTINGS ROOT ROWS, USED BY THE RENDERER AND
+ * BY THE CLICK HANDLER.
+ *
+ * There used to be two, and they disagreed. The renderer drew the root list at
+ *
+ *     static const int root_y[BOUNCE_SETTINGS_ROOT_ITEM_COUNT] = { 28, 42, ... };
+ *
+ * inside bounce_ui_shell_render_settings(), while bounce_ui_shell_handle_click() had its
+ * own
+ *
+ *     static const int settings_row_y[BOUNCE_SETTINGS_ROOT_ITEM_COUNT] = {
+ *         28, 44, 60, 76, 92
+ *     };
+ *
+ * Three separate things were wrong with the click copy, and each one had to be found
+ * separately because the visible symptom was only the third:
+ *
+ *   1. IT WAS TOO SHORT. It listed five values in an array sized by
+ *      BOUNCE_SETTINGS_ROOT_ITEM_COUNT, which has been six since the Reset row was
+ *      added. C zero-fills the missing sixth element, so the Reset row's hit band sat
+ *      at y = 0 and no click anywhere on screen could ever reach it. The new row was
+ *      invisible to the mouse.
+ *
+ *   2. THE PITCH WAS WRONG FOR EVERY ROW BUT THE FIRST. 44, 60, 76, 92 against the
+ *      rendered 42, 56, 70, 84 -- offsets of +2, +4, +6, +8 px. The 16 px hit height
+ *      was wide enough to mostly absorb this, so clicks landed on the right row most of
+ *      the time and on the wrong one near the edges. That is worse than being broken:
+ *      a Settings row that highlights the wrong line most of the time is read as the
+ *      game being wrong rather than as two tables being out of date.
+ *
+ *   3. THE TWO TABLES COULD NOT DISAGREE AGAIN, because now there is one.
+ *
+ * The values are the RENDERER's, unchanged: nothing on screen moved. The six rows are
+ * at 28, 42, 56, 70, 84, 98 with a 14 px pitch, the last row's band reaching y = 107,
+ * which clears the panel edge at 124 exactly as the renderer's own comment describes.
+ *
+ * The hit band now starts at the same row - 2 the highlight rectangle is drawn at, and
+ * is one pitch tall, so the clickable area of every row is exactly the rectangle the
+ * player can see. See BOUNCE_UI_SETTINGS_ROOT_ROW_HIT_H for what the 16 px band it
+ * replaced got wrong.
+ */
+#define BOUNCE_UI_SETTINGS_ROOT_ROW_Y0 28
+#define BOUNCE_UI_SETTINGS_ROOT_ROW_PITCH 14
+/*
+ * THE HIT BAND IS THE DRAWN BAND. The highlight rectangle is drawn at row - 2 with
+ * height 11, so the band starts at row - 2, and a hit height of one pitch makes the
+ * bands contiguous and each one exactly the rectangle the player can see.
+ *
+ * The band used to be 16 px starting at row, which put it 2 px below the rectangle and
+ * 2 px past the next row's start. First-match-wins resolved that overlap in favour of
+ * the earlier row, so a click in the last 2 px before a row highlighted the row above
+ * it. 14 px at row - 2 has no overlap and no dead pixel.
+ */
+#define BOUNCE_UI_SETTINGS_ROOT_ROW_HIT_H 14
+
+static const int ui_settings_root_row_y[BOUNCE_SETTINGS_ROOT_ITEM_COUNT] = {
+    28, 42, 56, 70, 84, 98
+};
+
+/*
+ * STEP 38-RESET-UI -- AND THE RESET PAGE'S TWO ACTION ROWS GET THE SAME TREATMENT: one
+ * geometry, used by the renderer and by the click handler.
+ *
+ * The rows used to sit at y = 104 + row * 12, which put BACK at y = 116 with a 12 px
+ * highlight band reaching y = 128 -- eight pixels past the bottom of the 128 px panel
+ * and five pixels through the border drawn at y = 123. The bottom action row on the
+ * confirmation screen was therefore drawn partly outside the panel and partly on top of
+ * its own frame. It was not obvious on screen because the second row was never
+ * highlighted until it was selected, and by then the overflow was behind the highlight
+ * colour rather than behind text.
+ *
+ * Removing the ESC BACK hint from this page is what made room to fix it. The hint was
+ * the reason the rows had to be squeezed into the last 26 px at a 12 px pitch; with it
+ * gone the two rows fit at an 11 px pitch ending exactly on the panel's bottom border.
+ *
+ * Rows land at 103 and 114. Their highlight bands are drawn at row - 2 with height 11,
+ * so the bands are 101..111 and 112..122 -- contiguous, no dead pixel between them, and
+ * the last one stops one pixel short of the border.
+ *
+ * The hit height is 11 to match, so a click maps to exactly the band that is drawn and
+ * the two rows partition the area between them. A wider band here would overlap the
+ * panel border and the row above.
+ */
+#define BOUNCE_UI_RESET_ROW_Y0 103
+#define BOUNCE_UI_RESET_ROW_PITCH 11
+#define BOUNCE_UI_RESET_ROW_HIT_H 11
+#define BOUNCE_UI_RESET_ROW_BAND_H 11
+
+static int ui_reset_action_row_y(unsigned int row)
+{
+    return BOUNCE_UI_RESET_ROW_Y0 + (int)row * BOUNCE_UI_RESET_ROW_PITCH;
+}
+
+/*
+ * STEP 38-RESET-UI -- THE PUBLIC FACE OF THE TWO ROW TABLES.
+ *
+ * These exist so a verifier can click a row where the renderer draws it. The verifier
+ * still asserts literal y values for the rows it cares about, because "both sides read
+ * one table" is only structural: it proves they cannot DISAGREE, not that the geometry
+ * is the geometry the design calls for. The literal assertions are what keep a change
+ * to the pitch from being accepted just because it was applied to both sides at once.
+ *
+ * -1 out of range, not 0. See the header note.
+ */
+int bounce_ui_shell_settings_root_row_y(unsigned int index)
+{
+    if (index >= BOUNCE_SETTINGS_ROOT_ITEM_COUNT)
+        return -1;
+    return ui_settings_root_row_y[index];
+}
+
+int bounce_ui_shell_reset_row_y(unsigned int index)
+{
+    if (index >= BOUNCE_SETTINGS_RESET_VALUE_COUNT)
+        return -1;
+    return ui_reset_action_row_y(index);
+}
+
 static unsigned int theme_first_row(unsigned int count, unsigned int selected)
 {
     int first;
@@ -1622,9 +1741,6 @@ int bounce_ui_shell_handle_click(
     static const int menu_row_y[BOUNCE_MENU_ROW_COUNT] = {
         30, 42, 54, 66, 78, 90, 102
     };
-    static const int settings_row_y[BOUNCE_SETTINGS_ROOT_ITEM_COUNT] = {
-        28, 44, 60, 76, 92
-    };
     static const int level_row_y[BOUNCE_APP_LAST_LEVEL_ID] = {
         24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104
     };
@@ -1638,8 +1754,26 @@ int bounce_ui_shell_handle_click(
      * The Back band. Every destination that already has a Back action draws its
      * hint on the same row, so one band covers all of them. The main menu has no
      * Back action in the recovered source (only Exit), so it is excluded.
+     *
+     * STEP 38-RESET-UI -- AND THE RESET PAGE IS EXCLUDED FROM IT.
+     *
+     * This band is y 112..127 and it is tested FIRST, before any row. The Reset page's
+     * own BACK row occupies y 112..122, so the band swallowed every click on it: the
+     * pointer pressed Back correctly and did exactly what the button says, which is to
+     * leave the page -- but the row's highlight never moved, so the row looked dead and
+     * a second click did the same thing again with no visible effect.
+     *
+     * Excluding the page is the right fix rather than shrinking the band, because the
+     * band exists to cover a region of the screen that has no control on it, and on this
+     * screen that region no longer exists: the page carries a BACK row of its own and
+     * does not print the hint that gives the band its meaning. Two overlapping ways to
+     * do the same thing on one screen is the problem, not the solution.
+     *
+     * The Reset page still has two ways out -- its BACK row and the ESC key -- so
+     * nothing is taken away from a pointer user or a keyboard user.
      */
     if (y >= 112 && y < 128 && x >= 4 && x < 124
+        && bounce_app_flow_settings_page(flow) != BOUNCE_SETTINGS_PAGE_RESET
         && (flow->state == BOUNCE_APP_STATE_INSTRUCTIONS
             || flow->state == BOUNCE_APP_STATE_HIGH_SCORE
             || flow->state == BOUNCE_APP_STATE_LEVEL_SELECTION
@@ -1710,7 +1844,17 @@ int bounce_ui_shell_handle_click(
             return 0;
         if (bounce_app_flow_settings_page(flow) == BOUNCE_SETTINGS_PAGE_ROOT) {
             for (index = 0u; index < BOUNCE_SETTINGS_ROOT_ITEM_COUNT; ++index) {
-                if (!ui_point_in_row(y, settings_row_y[index], 16))
+                /*
+                 * STEP 38-RESET-UI -- THE SAME TABLE THE RENDERER DRAWS WITH. This used
+                 * to be a private copy, five values long, at a different pitch, so the
+                 * sixth row -- the one this feature added -- had a hit band at y = 0
+                 * and could never be clicked. See ui_settings_root_row_y for the whole
+                 * account.
+                 */
+                if (!ui_point_in_row(
+                        y,
+                        ui_settings_root_row_y[index] - 2,
+                        BOUNCE_UI_SETTINGS_ROOT_ROW_HIT_H))
                     continue;
                 if (bounce_app_flow_settings_selected_index(flow) == index) {
                     input = BOUNCE_UI_INPUT_SELECT;
@@ -1765,6 +1909,58 @@ int bounce_ui_shell_handle_click(
                     return 1;
                 }
                 return bounce_ui_shell_handle_press(flow, input) == 0 ? 1 : 0;
+            }
+            return 0;
+        }
+        /*
+         * STEP 38-RESET-UI -- THE RESET PAGE TAKES THE POINTER TOO.
+         *
+         * It previously took no clicks at all: the loop above covers ROOT, LANGUAGE and
+         * THEME, and everything else in the SETTINGS state fell through to `return 0`.
+         * That made this page the one destination in the shell that a mouse could enter
+         * and not leave -- which is not a missing convenience on a screen whose only job
+         * is to ask whether to delete a save.
+         *
+         * BOTH ROWS ARE CLICKABLE AND THEY DO DIFFERENT THINGS. Row 0 confirms and
+         * row 1 goes back, so the pointer reaches both the destructive action and the
+         * way out of it. There is deliberately no "click again to activate" two-step
+         * here, the way the root list and Level Select have, and that asymmetry needs a
+         * reason: this is a page with exactly two rows, both already meaningful, and
+         * requiring a second click before a click has any effect would make the button
+         * that deletes progress feel different in kind from every other button in the
+         * shell in exchange for protecting against a mis-click on a row whose label says
+         * CONFIRM. The label, and the fact that the page is two deliberate presses away
+         * from anywhere, are the protection.
+         *
+         * Leaving through the band along the bottom still works too: the Back-band test
+         * at the top of this function matches on BOUNCE_APP_STATE_SETTINGS, which is the
+         * state on every Settings page including this one. That path is now redundant
+         * with the BACK row rather than removed, so a pointer user has two ways out and
+         * a keyboard user has three.
+         */
+        if (bounce_app_flow_settings_page(flow) == BOUNCE_SETTINGS_PAGE_RESET) {
+            unsigned int count = bounce_app_flow_settings_list_count(flow);
+
+            for (index = 0u; index < count; ++index) {
+                if (!ui_point_in_row(
+                        y,
+                        ui_reset_action_row_y(index) - 2,
+                        BOUNCE_UI_RESET_ROW_HIT_H))
+                    continue;
+                /*
+                 * Move first, activate second. A click on the row that is not already
+                 * highlighted only moves the highlight, so a mis-click that lands on
+                 * BACK cannot also trigger CONFIRM and a mis-click that lands on CONFIRM
+                 * still cannot reset before the player has seen the row light up.
+                 */
+                if (bounce_app_flow_settings_selected_index(flow) != index) {
+                    flow->settings.selected_index = index;
+                    return 1;
+                }
+                return bounce_ui_shell_handle_press(flow, BOUNCE_UI_INPUT_SELECT)
+                    == 0
+                    ? 1
+                    : 0;
             }
             return 0;
         }
@@ -2646,16 +2842,28 @@ int bounce_ui_shell_render_settings(
         BOUNCE_LOCALE_AUDIO,
         BOUNCE_LOCALE_LANGUAGE,
         /* NATIVE EXTENSION: temporary runtime UI color profiles. */
-        BOUNCE_LOCALE_THEME
+        BOUNCE_LOCALE_THEME,
+        /* STEP 38-RESET: the whole-state reset destination. */
+        BOUNCE_LOCALE_RESET_DEFAULT
     };
     /*
      * Five rows now: the four original native Settings destinations plus the
      * temporary Theme page. Spacing is 16 px so the last row still clears the
      * ESC BACK hint at y = 115 and the highlight band never overlaps it.
      */
-    static const int root_y[BOUNCE_SETTINGS_ROOT_ITEM_COUNT] = {
-        28, 44, 60, 76, 92
-    };
+    /*
+     * STEP 38-RESET. Six rows now. Spacing stays 16 px, so the last row lands at
+     * y = 108 and its highlight band (row - 2, height 11) reaches y = 107. The
+     * panel ends at y = 124 and the ESC BACK hint is drawn below the panel, so the
+     * band still clears both -- which is why the spacing was NOT reduced to fit a
+     * seventh row later. If another root row is ever added, the list has to be
+     * re-spaced or the panel grown, not squeezed.
+     *
+     * STEP 38-RESET-UI -- THE ROW POSITIONS LIVE IN ui_settings_root_row_y NOW, not
+     * here, because the click handler needs the same numbers. See the comment on that
+     * table for the two copies that used to disagree. The values are the ones this
+     * function drew anyway, so nothing on screen moved.
+     */
 const uint32_t background = ui->background;
 const uint32_t panel = ui->panel;
 const uint32_t border = ui->border;
@@ -2691,6 +2899,10 @@ const uint32_t back = ui->accent;
         case BOUNCE_SETTINGS_PAGE_THEME:
             title = tr(BOUNCE_LOCALE_THEME);
             break;
+        /* STEP 38-RESET: the confirmation screen reuses the destination's name. */
+        case BOUNCE_SETTINGS_PAGE_RESET:
+            title = tr(BOUNCE_LOCALE_RESET_DEFAULT);
+            break;
         default:
             return -1;
     }
@@ -2721,12 +2933,17 @@ const uint32_t back = ui->accent;
         for (index = 0u; index < BOUNCE_SETTINGS_ROOT_ITEM_COUNT; ++index) {
             if (index == bounce_app_flow_settings_selected_index(flow)
                 && bounce_renderer_fill_rect(
-                       renderer, 12, root_y[index] - 2, 104, 11, highlight) != 0)
+                       renderer,
+                       12,
+                       ui_settings_root_row_y[index] - 2,
+                       104,
+                       11,
+                       highlight) != 0)
                 return -1;
             if (draw_placeholder_text(
                     renderer,
                     24,
-                    root_y[index],
+                    ui_settings_root_row_y[index],
                     tr(root_label_keys[index]),
                     index == bounce_app_flow_settings_selected_index(flow)
                         ? selected_text
@@ -2886,6 +3103,137 @@ const uint32_t back = ui->accent;
                        renderer, 36, y, tr(value_keys[row]), row_color) != 0)
                 return -1;
         }
+    } else if (bounce_app_flow_settings_page(flow)
+               == BOUNCE_SETTINGS_PAGE_RESET) {
+        /*
+         * STEP 38-RESET -- the confirmation screen.
+         *
+         * IT STATES WHAT IT IS ABOUT TO DO, because that is the whole reason this
+         * page exists. A confirmation that only asks "are you sure?" asks the player
+         * to trust the program; one that lists what it is about to change asks them
+         * to check a claim they can verify. Every row is drawn from the flow's
+         * CURRENT value through the same accessors the rest of the Settings pages
+         * use, so the screen cannot claim a value the flow does not hold -- and
+         * after a second reset it honestly shows the things already at their
+         * defaults.
+         *
+         * NOTHING HERE WRITES. The Confirm row does the work through
+         * bounce_app_flow_reset_to_default(); a renderer that computed or applied a
+         * value would be a second source of truth, and the disagreement would only
+         * surface after a reset.
+         *
+         * CONFIRM IS ROW 0 and the highlight starts there, which is where
+         * BOUNCE_SETTINGS_RESET_ROW_CONFIRM points. The page cannot be reached
+         * without deliberately walking to the last Settings row and pressing SELECT
+         * once to open it, so making the easy key the intended one here costs
+         * nothing, and BACK is one key away.
+         *
+         * STEP 38-RESET-UI -- THE SECOND ROW IS DRAWN WITH BOUNCE_LOCALE_BACK, the key
+         * every other screen in the shell already uses for the way out. There is no
+         * CANCEL label left in this file: see the note on BOUNCE_LOCALE_RESET_CONFIRM
+         * in locale.h for why the key was deleted from all five languages rather than
+         * renamed.
+         *
+         * The two rows are the whole page now that the ESC BACK hint below it is gone
+         * (see the end of this function), so BACK being visible here is not cosmetic.
+         * It is what lets a player with a mouse leave this screen at all.
+         */
+        static const BounceLocaleKey value_keys[BOUNCE_SETTINGS_RESET_VALUE_COUNT]
+            = {
+                BOUNCE_LOCALE_RESET_CONFIRM,
+                BOUNCE_LOCALE_BACK
+            };
+        const unsigned int count = bounce_app_flow_settings_list_count(flow);
+        const unsigned int limit
+            = count < BOUNCE_SETTINGS_RESET_VALUE_COUNT
+                  ? count
+                  : BOUNCE_SETTINGS_RESET_VALUE_COUNT;
+        const unsigned int selected = bounce_app_flow_settings_selected_index(flow);
+        unsigned int row;
+        int y;
+
+        if (draw_placeholder_text(
+                   renderer, 16, 30, tr(BOUNCE_LOCALE_CONTINUE), muted) != 0
+            || draw_placeholder_text(
+                   renderer,
+                   112,
+                   30,
+                   flow->menu.continue_available
+                       ? tr(BOUNCE_LOCALE_ON)
+                       : tr(BOUNCE_LOCALE_OFF),
+                   muted) != 0
+            || draw_placeholder_text(
+                   renderer, 16, 42, tr(BOUNCE_LOCALE_LEVEL_SELECT), muted) != 0
+            || draw_placeholder_text(
+                   renderer,
+                   112,
+                   42,
+                   bounce_app_flow_available_level_count(flow) != 0u
+                       ? tr(BOUNCE_LOCALE_ON)
+                       : tr(BOUNCE_LOCALE_OFF),
+                   muted) != 0
+            || draw_placeholder_text(
+                   renderer, 16, 54, tr(BOUNCE_LOCALE_HIGH_SCORE), muted) != 0
+            || draw_placeholder_text(
+                   renderer,
+                   112,
+                   54,
+                   bounce_app_flow_high_score(flow) != 0
+                       ? tr(BOUNCE_LOCALE_ON)
+                       : tr(BOUNCE_LOCALE_OFF),
+                   muted) != 0
+            || draw_placeholder_text(
+                   renderer, 16, 66, tr(BOUNCE_LOCALE_THEME), muted) != 0
+            || draw_placeholder_text(
+                   renderer,
+                   112,
+                   66,
+                   bounce_app_flow_settings_applied_theme_index(flow) == 0u
+                       ? tr(BOUNCE_LOCALE_ON)
+                       : tr(BOUNCE_LOCALE_OFF),
+                   muted) != 0
+            || draw_placeholder_text(
+                   renderer, 16, 78, tr(BOUNCE_LOCALE_AUDIO), muted) != 0
+            || draw_placeholder_text(
+                   renderer,
+                   112,
+                   78,
+                   bounce_app_flow_settings_audio_enabled(flow)
+                       ? tr(BOUNCE_LOCALE_ON)
+                       : tr(BOUNCE_LOCALE_OFF),
+                   muted) != 0
+            || draw_placeholder_text(
+                   renderer, 16, 90, tr(BOUNCE_LOCALE_T9_INPUT), muted) != 0
+            || draw_placeholder_text(
+                   renderer,
+                   112,
+                   90,
+                   bounce_app_flow_settings_t9_enabled(flow)
+                       ? tr(BOUNCE_LOCALE_ON)
+                       : tr(BOUNCE_LOCALE_OFF),
+                   muted) != 0
+            || bounce_renderer_fill_rect(renderer, 12, 98, 104, 1, border) != 0) {
+            return -1;
+        }
+
+        for (row = 0u; row < limit; ++row) {
+            const uint32_t row_color
+                = (row == selected) ? selected_text : text;
+
+            y = ui_reset_action_row_y(row);
+            if (row == selected
+                && bounce_renderer_fill_rect(
+                       renderer,
+                       12,
+                       y - 2,
+                       104,
+                       BOUNCE_UI_RESET_ROW_BAND_H,
+                       highlight) != 0)
+                return -1;
+            if (draw_placeholder_text(
+                    renderer, 24, y, tr(value_keys[row]), row_color) != 0)
+                return -1;
+        }
     } else if (bounce_app_flow_settings_page(flow) == BOUNCE_SETTINGS_PAGE_THEME) {
         /*
          * NATIVE EXTENSION: the temporary runtime UI color profiles. Selecting a
@@ -3024,7 +3372,34 @@ const uint32_t back = ui->accent;
             return -1;
     }
 
-    if (draw_centered_placeholder_text(renderer, 115, tr(BOUNCE_LOCALE_ESC_BACK), back) != 0)
+    /*
+     * STEP 38-RESET-UI -- THE ESC BACK HINT IS NOT DRAWN ON THE RESET PAGE.
+     *
+     * Every other destination draws it, and that is what makes one band of the screen
+     * mean "the way out" everywhere. This page is the exception, and it is the one page
+     * where the hint is both redundant and slightly wrong:
+     *
+     *   REDUNDANT, because the page now carries an explicit BACK row. Naming the action
+     *   on the row and again in the footer would say it twice on a screen with only two
+     *   rows on it.
+     *
+     *   WRONG, because the footer text spells out "ESC BACK" on a page whose BACK row
+     *   is clickable. A pointer user reading it is being told the exit needs a key they
+     *   do not have, on the one screen where the exit is the decision they came to
+     *   avoid making. The row says BACK and the row is clickable; the footer would be
+     *   asserting something narrower.
+     *
+     * What is NOT removed is the way out. The band along the bottom of the screen is
+     * still a live hit target -- bounce_ui_shell_handle_click() lists
+     * BOUNCE_APP_STATE_SETTINGS in its Back band regardless of page -- and the ESC key
+     * still goes through bounce_app_flow_settings_back(). Only the words are gone.
+     *
+     * The check is on the PAGE, not the state, so the other six Settings pages keep
+     * their hint and their behaviour untouched.
+     */
+    if (bounce_app_flow_settings_page(flow) != BOUNCE_SETTINGS_PAGE_RESET
+        && draw_centered_placeholder_text(
+               renderer, 115, tr(BOUNCE_LOCALE_ESC_BACK), back) != 0)
         return -1;
     return 0;
 }
