@@ -93,8 +93,14 @@ must not read the real save. It is not the default: a save outside
 at a terminal is the more specific of the two. `DIR` does not have to exist:
 `DIR/bounce/` is created, including any missing parent directories.
 
-`--save-path` writes one throwaway record, prints where the store resolved to,
-and exits. It is how `--check` finds out which file a run would have written.
+`--save-path` prints where the store resolved to and exits. If no store is
+there yet it writes one throwaway record first, so `--check` can confirm which
+file a run would really write; if a store **is** already there it writes
+nothing and only prints. Running it therefore cannot cost you your save.
+
+`--save-plant` force-writes a known store. It exists for `--check`, which uses
+it to plant a store containing a live session so it can prove the point above,
+and it will overwrite whatever is at the resolved path.
 
 ```
 ./native/app/bounce_vertical_slice --save-path

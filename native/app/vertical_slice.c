@@ -85,6 +85,8 @@
 #define BOUNCE_SAVE_DIR_FLAG_LENGTH 7u
 /* A high score no real path reaches, used to prove a file is this run's. */
 #define BOUNCE_SAVE_PROBE_MARKER 424242
+/* Distinct from the probe marker so a planted store can never equal a probed one. */
+#define BOUNCE_SAVE_PLANT_MARKER 515151
 #define BOUNCE_LEVEL008_PATH \
     "src/main/resources/levels/J2MElvl.008"
 #define BOUNCE_LEVEL001_WIDTH 112u
@@ -31324,8 +31326,11 @@ static void print_usage(const char *program)
         "           The named device is used or audio init fails -- there is\n"
         "           no probing and no fallback to another device.)\n"
         "       %s   (with NBB_DEBUG=0|1|2|3 for the terminal debug tracker)\n"
-        "       %s --save-path   (write one probe record and print the store's\n"
-        "                            resolved path; used by --check)\n"
+        "       %s --save-path   (print the store's resolved path; writes a probe\n"
+        "                            record ONLY if no store is there yet, so an\n"
+        "                            existing save is never overwritten)\n"
+        "       %s --save-plant   (force-write a known store; used by --check to\n"
+        "                            prove --save-path preserves an existing one)\n"
         "       %s --save=DIR   (put records.bin under DIR/bounce/ instead of\n"
         "                            $XDG_DATA_HOME; same as the environment\n"
         "                            variable BOUNCE_SAVE_DIR)\n"
@@ -31333,6 +31338,7 @@ static void print_usage(const char *program)
         "                            the images in screenshots/ are made this way,\n"
         "                            and the store is redirected so it cannot\n"
         "                            touch the player's save)\n",
+        program != NULL ? program : "bounce_vertical_slice",
         program != NULL ? program : "bounce_vertical_slice",
         program != NULL ? program : "bounce_vertical_slice",
         program != NULL ? program : "bounce_vertical_slice",
@@ -33709,6 +33715,36 @@ static int bounce_shot_capture(
  * checked for the absence of a store after an XDG-only run.
  */
 /*
+ * STEP SAVE-DIR -- an FNV-1a digest of a whole file, used only by case 5 below.
+ *
+ * FNV-1a rather than a real hash because the claim being checked is "these bytes are
+ * the same bytes", which any deterministic function answers, and this program already
+ * links libpng rather than a crypto library. 0 is returned for "could not read it",
+ * which no content can produce, so an unreadable file never compares equal to a
+ * readable one.
+ */
+static uint64_t digest_file(const char *path)
+{
+    unsigned char buffer[512];
+    FILE *file = fopen(path, "rb");
+    uint64_t hash = 1469598103934665603ull;
+    size_t got;
+
+    if (file == NULL)
+        return 0u;
+    while ((got = fread(buffer, 1u, sizeof buffer, file)) > 0u) {
+        size_t index;
+
+        for (index = 0u; index < got; index++) {
+            hash ^= (uint64_t)buffer[index];
+            hash *= 1099511628211ull;
+        }
+    }
+    (void)fclose(file);
+    return hash;
+}
+
+/*
  * STEP SAVE-DIR -- THE CHILD MODE THE PRECEDENCE CHECK RUNS.
  *
  * It resolves the store, writes one record, prints the path it used, and exits. Three
@@ -33728,6 +33764,62 @@ static int bounce_shot_capture(
  * IT PRINTS THE PATH. That is what makes the check able to tell "the override won"
  * from "both roots were written", which a positive assertion about one file cannot.
  */
+static int bounce_save_plant_probe(void)
+{
+    BouncePersistenceRecords planted;
+    BouncePersistenceRecord3 snapshot;
+    const char *path = bounce_persistence_path();
+
+    if (path == NULL) {
+        fprintf(stderr, "no save path could be resolved\n");
+        return -1;
+    }
+    /*
+     * WHY A SECOND CHILD MODE. Case 5 needs a store whose bytes are NOT the probe's, so
+     * that a probe which overwrites it can be detected by comparing content. Planting it
+     * with the probe itself does not work: the probe is deterministic, so the "before"
+     * and "after" files would be identical whether or not the overwrite happened, and
+     * the comparison would pass either way. An earlier version of case 5 did exactly
+     * that and its negative control was reported NOT CAUGHT, which is what caught it.
+     *
+     * So this writes a store that no probe run produces: a different high score, and a
+     * Record 3 with a live session in it. That is also the honest shape of the claim --
+     * what a player loses is a snapshot and a score, not an empty container.
+     */
+    /*
+     * WRITTEN IN THREE STEPS, because the container holds more than
+     * BouncePersistenceRecords does: records 1 and 2 come from bounce_persistence_save(),
+     * Record 3 from bounce_persistence_save_record3(), and the color profile from
+     * bounce_persistence_save_theme_index(). Each of the latter two is a
+     * read-modify-write of the whole container and preserves the others, so calling them
+     * in this order leaves all four records present.
+     *
+     * All four is the point. A probe writes records 1 and 2 and nothing else, so a store
+     * carrying a snapshot and a theme is guaranteed to be distinguishable from anything
+     * a probe run could leave behind -- which is the whole basis on which case 5 can
+     * detect an overwrite at all.
+     */
+    memset(&planted, 0, sizeof planted);
+    planted.max_levels = BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT;
+    planted.high_score = BOUNCE_SAVE_PLANT_MARKER;
+    memset(&snapshot, 0, sizeof snapshot);
+    snapshot.b1 = BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL;
+    snapshot.level = 7u;
+    snapshot.score = BOUNCE_SAVE_PLANT_MARKER;
+    snapshot.lives = 2;
+    snapshot.ball_size = 12u;
+    snapshot.unk_x = 168;
+    snapshot.unk_y = 72;
+    if (bounce_persistence_save(&planted) != 0
+        || bounce_persistence_save_record3(&snapshot) != 0
+        || bounce_persistence_save_theme_index(3) != 0) {
+        fprintf(stderr, "could not plant the save probe at %s\n", path);
+        return -1;
+    }
+    printf("%s\n", path);
+    return 0;
+}
+
 static int bounce_save_path_probe(void)
 {
     BouncePersistenceRecords probe;
@@ -33744,6 +33836,27 @@ static int bounce_save_path_probe(void)
      */
     probe.max_levels = BOUNCE_DEFAULT_UNLOCKED_LEVEL_COUNT;
     probe.high_score = BOUNCE_SAVE_PROBE_MARKER;
+
+    /*
+     * STEP SAVE-DIR -- DO NOT TOUCH A STORE THAT ALREADY EXISTS.
+     *
+     * This guard exists because the first version of this function destroyed the
+     * player's save. --save-path is documented as "write one probe record and print the
+     * store's resolved path", and against a fresh root that is harmless -- it is how
+     * verify_save_directory_precedence() proves the writer followed the resolver. Run
+     * by a person against a real install it overwrote their progress, score, unlocked
+     * levels, theme and keypad with a zeroed record, and the suite could not catch it
+     * because every one of its roots is a mkdtemp directory that starts empty.
+     *
+     * A command whose whole purpose is to answer "where does my save live" must never
+     * cost the player their save. Reading the answer does not require writing, and where
+     * writing IS required -- the self-test, on a root it just created -- the file does
+     * not exist yet, so the strong assertion survives intact.
+     */
+    if (access(path, F_OK) == 0) {
+        printf("%s\n", path);
+        return 0;
+    }
     if (bounce_persistence_save(&probe) != 0) {
         fprintf(stderr, "could not write the save probe to %s\n", path);
         return -1;
@@ -34021,6 +34134,86 @@ static int verify_save_directory_precedence(void)
     }
 
     /*
+     * CASE 5 -- A STORE THAT ALREADY EXISTS MUST SURVIVE --save-path.
+     *
+     * This is the case that matters most to the person running the command. Cases 1-4
+     * all used a store the run had just created, so every one of them was satisfied by
+     * a probe that writes unconditionally -- which is exactly what destroyed the
+     * player's real save the first time this command existed. Nothing in cases 1-4 could
+     * have noticed, because in every one of them the file is SUPPOSED to change.
+     *
+     * SO IT IS COMPARED BY CONTENT, NOT BY EXISTENCE. Asserting the file still exists
+     * would pass while the probe rewrote it, which is the bug. The digest covers the
+     * whole file because a size comparison would miss a rewrite that happens to land on
+     * the same length, which a zeroed record very nearly does.
+     *
+     * The store is planted by --save-plant, not by --save-path, because the probe is
+     * deterministic: a probe-planted "before" file equals the probe's "after" file and
+     * the comparison passes whether or not the overwrite happened. That mistake was made
+     * once here and its negative control came back NOT CAUGHT, twice. A fixture built by
+     * the program rather than by hand also avoids drifting from the container format.
+     */
+    {
+        char parent[sizeof template];
+        char store[1200];
+        uint64_t first = 0u;
+        uint64_t second = 0u;
+
+        memcpy(parent, template, sizeof parent);
+        if (mkdtemp(parent) == NULL) {
+            fprintf(stderr, "save-dir: could not create the preserve parent\n");
+            bad++;
+        } else if (snprintf(store, sizeof store, "%s/x/bounce/records.bin", parent)
+                   >= (int)sizeof store) {
+            bad++;
+        } else if (snprintf(command, sizeof command, "'%s' --save='%s/x' --save-plant",
+                            self, parent) >= (int)sizeof command) {
+            bad++;
+        } else if (system(command) != 0) {
+            fprintf(stderr, "save-dir: could not plant the store to preserve\n");
+            bad++;
+        } else if ((first = digest_file(store)) == 0u) {
+            fprintf(stderr, "save-dir: the planted store was not readable\n");
+            bad++;
+        } else if (snprintf(command, sizeof command, "'%s' --save='%s/x' --save-path",
+                            self, parent) >= (int)sizeof command) {
+            bad++;
+        } else if (system(command) != 0) {
+            fprintf(stderr, "save-dir: the second --save-path run failed\n");
+            bad++;
+        } else if ((second = digest_file(store)) == 0u) {
+            fprintf(stderr, "save-dir: the store vanished after --save-path\n");
+            bad++;
+        } else if (first != second) {
+            fprintf(stderr,
+                    "save-dir: --save-path overwrote an existing store"
+                    " (%016llx -> %016llx at %s)\n",
+                    (unsigned long long)first, (unsigned long long)second,
+                    store);
+            bad++;
+        }
+        {
+            static const char *const tails[] = { "/x/bounce/records.bin",
+                                                 "/x/bounce", "/x", "" };
+            char victim[1200];
+            size_t index;
+
+            for (index = 0u;
+                 index < sizeof tails / sizeof tails[0];
+                 index++) {
+                if (snprintf(victim, sizeof victim, "%s%s", parent, tails[index])
+                    >= (int)sizeof victim)
+                    continue;
+                if (index == 0u)
+                    (void)remove(victim);
+                else
+                    (void)rmdir(victim);
+            }
+        }
+        (void)rmdir(parent);
+    }
+
+    /*
      * STEP SAVE-DIR -- CLEAN UP BOTH ROOTS.
      *
      * Each mkdtemp root holds exactly one file -- bounce/records.bin -- written by the
@@ -34067,7 +34260,8 @@ static int verify_save_directory_precedence(void)
 
     if (bad == 0) {
         printf("SAVE-DIR override=%s beats_xdg=yes flag_beats_env=yes"
-               " xdg_fallback=yes creates_missing=yes default=unchanged PASS\n",
+               " xdg_fallback=yes creates_missing=yes preserves_existing=yes"
+               " default=unchanged PASS\n",
                "BOUNCE_SAVE_DIR");
     }
     return bad == 0 ? 0 : -1;
@@ -34755,6 +34949,7 @@ int main(int argc, char **argv)
     const char *screenshots_dir = NULL;
     const char *save_dir = NULL;
     int save_path_mode = 0;
+    int save_plant_mode = 0;
     size_t asset_count = 0u;
     BounceApp app;
     BounceSurface *surface = NULL;
@@ -34835,6 +35030,8 @@ int main(int argc, char **argv)
                 live_status_mode = 1;
             } else if (strcmp(argv[argument_index], "--save-path") == 0) {
                 save_path_mode = 1;
+            } else if (strcmp(argv[argument_index], "--save-plant") == 0) {
+                save_plant_mode = 1;
             } else if (strcmp(argv[argument_index], "--save") == 0) {
                 /* The bare form is a mistake, not a level path. */
                 fprintf(stderr, "--save requires a directory: --save=DIR\n");
@@ -34938,8 +35135,9 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    if (save_path_mode) {
-        int probe_rc = bounce_save_path_probe();
+    if (save_path_mode || save_plant_mode) {
+        int probe_rc = save_plant_mode ? bounce_save_plant_probe()
+                                       : bounce_save_path_probe();
 
         free(bounce_check_original_xdg);
         bounce_check_original_xdg = NULL;
