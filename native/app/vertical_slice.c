@@ -29,6 +29,9 @@
 #include <unistd.h>
 
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -33904,6 +33907,20 @@ static int verify_save_directory_precedence(void)
     (void)unsetenv("BOUNCE_SAVE_DIR");
 
     /*
+     * EVERY CHILD'S STDOUT GOES TO /dev/null, AND THAT IS NOT COSMETIC.
+     *
+     * One of the five was left unredirected for a while, and what it did was splice a
+     * path into the middle of an unrelated check's line:
+     *
+     *     GODMODE DETECTOR case=WRONG [...] activated=false expected=f/tmp/bounce-savedir-.../records.bin
+     *
+     * A report whose lines are interleaved with a subprocess's is a report nobody can
+     * read, and it is worse than plain noise on a machine that then crashes: the last
+     * thing on screen before the fault is a mangled line, which points the reader at a
+     * fault in the wrong place. No check reads a child's stdout, so discarding it costs
+     * nothing.
+     */
+    /*
      * THE PROGRAM'S OWN PATH, from /proc/self/exe.
      *
      * A relative "./native/app/bounce_vertical_slice" would only be right when --check
@@ -33928,7 +33945,7 @@ static int verify_save_directory_precedence(void)
          * what makes a save directory with a space in its name work at all.
          */
         if (snprintf(command, sizeof command,
-                     "'%s' --save-path", self)
+                     "'%s' --save-path >/dev/null", self)
             >= (int)sizeof command) {
             if (saved_ok)
                 (void)setenv("XDG_DATA_HOME", saved, 1);
@@ -34025,7 +34042,7 @@ static int verify_save_directory_precedence(void)
             fprintf(stderr, "save-dir: could not create the --save= root\n");
             bad++;
         } else if (snprintf(command, sizeof command,
-                            "'%s' --save='%s' --save-path",
+                            "'%s' --save='%s' --save-path >/dev/null",
                             self, flag_root) >= (int)sizeof command) {
             bad++;
         } else if (system(command) != 0) {
@@ -34085,7 +34102,7 @@ static int verify_save_directory_precedence(void)
         } else if (snprintf(target, sizeof target, "%s/x/y", parent)
                    >= (int)sizeof target) {
             bad++;
-        } else if (snprintf(command, sizeof command, "'%s' --save='%s' --save-path",
+        } else if (snprintf(command, sizeof command, "'%s' --save='%s' --save-path >/dev/null",
                             self, target) >= (int)sizeof command) {
             bad++;
         } else if (system(command) != 0) {
@@ -34168,7 +34185,7 @@ static int verify_save_directory_precedence(void)
         } else if (snprintf(store, sizeof store, "%s/x/bounce/records.bin", parent)
                    >= (int)sizeof store) {
             bad++;
-        } else if (snprintf(command, sizeof command, "'%s' --save='%s/x' --save-plant",
+        } else if (snprintf(command, sizeof command, "'%s' --save='%s/x' --save-plant >/dev/null",
                             self, parent) >= (int)sizeof command) {
             bad++;
         } else if (system(command) != 0) {
@@ -34177,7 +34194,7 @@ static int verify_save_directory_precedence(void)
         } else if ((first = digest_file(store)) == 0u) {
             fprintf(stderr, "save-dir: the planted store was not readable\n");
             bad++;
-        } else if (snprintf(command, sizeof command, "'%s' --save='%s/x' --save-path",
+        } else if (snprintf(command, sizeof command, "'%s' --save='%s/x' --save-path >/dev/null",
                             self, parent) >= (int)sizeof command) {
             bad++;
         } else if (system(command) != 0) {
@@ -34958,7 +34975,11 @@ restore:
  * is a layout choice.
  */
 #define BOUNCE_README_REFERENCE_LIMIT 64u
+/* A README is a few kilobytes. Anything past this is reported, not truncated. */
+#define BOUNCE_README_MAX_BYTES 1048576L
 #define BOUNCE_README_PATH_MAX 1200
+/* A screenshots/ reference: a directory name plus a file name, with room to spare. */
+#define BOUNCE_README_REF_MAX 128u
 
 static int verify_readme_screenshots(void)
 {
@@ -34966,8 +34987,16 @@ static int verify_readme_screenshots(void)
     char root[1024];
     char readme[BOUNCE_README_PATH_MAX];
     char images[BOUNCE_README_PATH_MAX];
-    char referenced[BOUNCE_README_REFERENCE_LIMIT][BOUNCE_README_PATH_MAX];
-    char text[262144];
+    /*
+     * 64 x 1200 bytes is 76 KB of automatic for a table of strings like
+     * "screenshots/title-screen.png". That was most of what the run still needed on the
+     * stack once the two megabyte-scale buffers were fixed, so the entry bound is its own
+     * constant rather than the general path bound: a reference cannot plausibly be longer
+     * than the directory name plus a file name.
+     */
+    char referenced[BOUNCE_README_REFERENCE_LIMIT][BOUNCE_README_REF_MAX];
+    char *text;
+    long text_size;
     const char *cursor;
     size_t reference_count = 0u;
     size_t image_count = 0u;
@@ -35042,13 +35071,45 @@ static int verify_readme_screenshots(void)
         fprintf(stderr, "readme: could not read %s\n", readme);
         return -1;
     }
-    length = (ssize_t)fread(text, 1u, sizeof text - 1u, file);
-    (void)fclose(file);
-    if (length <= 0) {
-        fprintf(stderr, "readme: %s is empty\n", readme);
+    /*
+     * THE DOCUMENT IS SIZED FROM ITS OWN LENGTH AND PUT ON THE HEAP.
+     *
+     * It used to be a 256 KB automatic, which is roughly two thirds of what a whole
+     * --check run needs on the stack -- a README is a few kilobytes, and asking for
+     * 256 KB of stack to hold a few kilobytes is what left the suite failing at a 1 MB
+     * stack limit even after the persistence buffer was fixed. It also read at most
+     * sizeof text - 1 bytes and never said so, so a README that grew past 256 KB would
+     * have been silently truncated and judged on the first half.
+     *
+     * The cap is now explicit and a file over it is a FAILURE rather than a shorter
+     * check, because a document this check cannot read in full is a document it has no
+     * opinion about, and reporting "broken=0 unlisted=0" off a truncated prefix would be
+     * the worst of the three possible answers.
+     */
+    if (fseek(file, 0L, SEEK_END) != 0
+        || (text_size = ftell(file)) <= 0
+        || text_size > BOUNCE_README_MAX_BYTES) {
+        (void)fclose(file);
+        fprintf(stderr,
+                "readme: %s is missing, empty, or over the %lu byte cap\n",
+                readme, (unsigned long)BOUNCE_README_MAX_BYTES);
         return -1;
     }
-    text[length] = '\0';
+    rewind(file);
+    text = (char *)malloc((size_t)text_size + 1u);
+    if (text == NULL) {
+        (void)fclose(file);
+        fprintf(stderr, "readme: could not allocate %ld bytes\n", text_size);
+        return -1;
+    }
+    length = (ssize_t)fread(text, 1u, (size_t)text_size, file);
+    (void)fclose(file);
+    if (length != (ssize_t)text_size) {
+        free(text);
+        fprintf(stderr, "readme: %s changed size while being read\n", readme);
+        return -1;
+    }
+    text[text_size] = '\0';
 
     /*
      * COLLECT THE REFERENCES. Every occurrence of the directory name is taken, so a
@@ -35081,6 +35142,7 @@ static int verify_readme_screenshots(void)
     }
     if (reference_count == 0u) {
         fprintf(stderr, "readme: no screenshots/ references at all\n");
+        free(text);
         return -1;
     }
 
@@ -35134,6 +35196,7 @@ static int verify_readme_screenshots(void)
     }
     (void)closedir(dir);
 
+    free(text);
     if (image_count == 0u) {
         fprintf(stderr, "readme: screenshots/ contains no images\n");
         return -1;
@@ -35142,6 +35205,384 @@ static int verify_readme_screenshots(void)
         printf("README-SHOTS refs=%zu images=%zu broken=0 unlisted=0 PASS\n",
                reference_count, image_count);
     }
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * STEP STACK -- does a file contain this text?
+ *
+ * Used on a probe child's captured output, which is small and read whole. A missing file
+ * counts as "not present" rather than an error: the caller wants to know whether the marker
+ * appeared, and an unreadable log cannot produce one.
+ */
+static bool log_contains(const char *path, const char *needle)
+{
+    /*
+     * THE WHOLE FILE IS SCANNED, NOT A PREFIX OF IT.
+     *
+     * A first version read 8 KB once and reported "absent". The marker it looks for is
+     * printed by one of the LAST verifiers, roughly 16 KB into the child's output, so it
+     * reported absent for three children that had all run the whole suite, and the
+     * assertion built on top of it failed on a correct program. A helper that silently
+     * truncates what it inspects turns one bug into two and hides the first.
+     *
+     * The window slides by one byte per step rather than by a whole chunk, because a
+     * needle straddling a chunk boundary has to be found.
+     */
+    char window[4096];
+    FILE *file = fopen(path, "rb");
+    size_t length = strlen(needle);
+    size_t filled = 0u;
+    bool found = false;
+
+    if (file == NULL || length == 0u || length >= sizeof window)
+        return false;
+    for (;;) {
+        size_t got = fread(window + filled, 1u, sizeof window - filled, file);
+        size_t total = filled + got;
+        size_t start;
+
+        if (total >= length) {
+            for (start = 0u; start + length <= total; start++) {
+                if (memcmp(window + start, needle, length) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (found)
+            break;
+        if (got == 0u)
+            break;
+        /* Keep the last length - 1 bytes so a needle across the seam is still visible. */
+        if (total >= length - 1u) {
+            memmove(window, window + total - (length - 1u), length - 1u);
+            filled = length - 1u;
+        } else {
+            filled = total;
+        }
+    }
+    (void)fclose(file);
+    return found;
+}
+
+/*
+ * STEP STACK -- copy the value that follows a prefix in a file, into `out`.
+ *
+ * Returns 0 when the prefix is absent. Reads the whole file in the same sliding window as
+ * log_contains() -- the prefix this looks for is printed by the FIRST thing a probe child
+ * does, so it is near the beginning, but a helper that only ever looked at a fixed prefix
+ * of the file is the exact mistake this file already made once.
+ */
+static int log_field(const char *path, const char *prefix,
+                     char *out, size_t out_size)
+{
+    char window[4096];
+    FILE *file = fopen(path, "rb");
+    size_t prefix_length = strlen(prefix);
+    size_t filled = 0u;
+    int result = -1;
+
+    if (file == NULL || out_size == 0u)
+        return -1;
+    out[0] = '\0';
+    for (;;) {
+        size_t got = fread(window + filled, 1u, sizeof window - filled, file);
+        size_t total = filled + got;
+        size_t start;
+
+        if (total >= prefix_length) {
+            for (start = 0u; start + prefix_length <= total; start++) {
+                if (memcmp(window + start, prefix, prefix_length) != 0)
+                    continue;
+                {
+                    size_t taken = 0u;
+                    size_t at;
+
+                    for (at = start + prefix_length;
+                         at < total && taken + 1u < out_size; at++) {
+                        if (window[at] == '\n' || window[at] == '\r')
+                            break;
+                        out[taken++] = window[at];
+                    }
+                    out[taken] = '\0';
+                    result = 0;
+                }
+                break;
+            }
+        }
+        if (result == 0 || got == 0u)
+            break;
+        if (total >= prefix_length - 1u && prefix_length >= 1u) {
+            memmove(window, window + total - (prefix_length - 1u), prefix_length - 1u);
+            filled = prefix_length - 1u;
+        } else {
+            filled = total;
+        }
+    }
+    (void)fclose(file);
+    return result;
+}
+
+/*
+ * =============================================================================
+ * STEP STACK -- verify_stack_budget()
+ *
+ * THE CLAIM. A --check run completes on a stack of 512 KB.
+ *
+ * WHY THE CLAIM EXISTS AT ALL. A shipped AppImage segfaulted on the reporter's machine
+ * after a long stretch of self-test output. The one cause found here that reproduces is
+ * plain stack exhaustion: bounce_persistence_load() held its 1 MB read buffer in an
+ * automatic, so the suite needed 1088 KB of stack and died at 1024 KB. Nothing asserted a
+ * stack budget, so the frame was invisible; the three sibling buffers in the same file
+ * were already static and the odd one out did not look like a decision.
+ *
+ * MEASURED BEFORE AND AFTER, not asserted from a reading of the code:
+ *
+ *     before   worked at 1088 KB, segfaulted at 1024 KB
+ *     after    works at 96 KB, segfaults at 80 KB
+ *
+ * 512 KB is the gate and it is deliberately not tight. The point is to catch a frame the
+ * size of the one that broke it -- a megabyte on the stack -- not to make every ordinary
+ * local variable illegal. 96 KB today leaves five times the room, so nothing that a
+ * normal edit does will trip this.
+ *
+ * WHY A CHILD PROCESS WITH ITS OWN LIMIT. RLIMIT_STACK is consumed when the kernel lays
+ * out the initial thread's stack, at exec time. Lowering it inside an already-running
+ * process changes nothing about where the existing stack lives, so the only way to test
+ * the real thing is to exec a fresh process under a lower limit.
+ *
+ * THE RECURSION GUARD IS AN ENVIRONMENT VARIABLE, and it has to be. The child runs the
+ * whole suite, which includes this verifier; without a way to switch this one check off in
+ * the child, the suite forks a child that forks a child that forks a child. An earlier
+ * mistake of exactly this shape -- a verifier shelling out to `--check`, which runs the
+ * suite, which shells out again -- presented as a test that simply stopped at rc=124.
+ */
+#define BOUNCE_STACK_PROBE_CHILD "BOUNCE_STACK_PROBE_CHILD"
+/* Where a probe child's output goes. Overridable so a run can be inspected. */
+#define BOUNCE_STACK_PROBE_LOG "BOUNCE_STACK_PROBE_LOG"
+#define BOUNCE_STACK_GATE_KB 512u
+
+static int verify_stack_budget(void)
+{
+    static const unsigned int probes[] = { 512u, 256u, 128u };
+    char executable[1024];
+    unsigned int smallest_ok = 0u;
+    int marker_seen = false;
+    size_t index;
+    ssize_t length;
+    char fallback_log[64];
+    char *log_path;
+    int log_fd;
+    bool fallback_created = false;
+    int bad = 0;
+
+    if (getenv(BOUNCE_STACK_PROBE_CHILD) != NULL) {
+        struct rlimit actual;
+
+        /*
+         * WE ARE THE CHILD, AND WE SAY WHAT LIMIT WE ACTUALLY GOT.
+         *
+         * Skipping this verifier in the child is necessary -- it would otherwise fork its
+         * own children -- but simply skipping it is not enough. An earlier version had the
+         * parent trust that its setrlimit() had taken effect, and a negative control that
+         * deleted the setrlimit() call came back NOT CAUGHT: the child then ran the whole
+         * suite on the inherited 8 MB stack, reached the end, exited 0, and the gate
+         * reported a 512 KB budget verified while verifying nothing.
+         *
+         * So the limit is reported from inside the child and the parent checks the number
+         * rather than the outcome. The child is the only party that can know.
+         */
+        if (getrlimit(RLIMIT_STACK, &actual) == 0) {
+            printf("STACK-LIMIT soft=%s hard=%s\n",
+                   actual.rlim_cur == RLIM_INFINITY
+                       ? "unlimited" : "finite",
+                   actual.rlim_max == RLIM_INFINITY
+                       ? "unlimited" : "finite");
+            printf("STACK-LIMIT-BYTES soft=%llu\n",
+                   (unsigned long long)actual.rlim_cur);
+        } else {
+            printf("STACK-LIMIT-BYTES soft=unknown\n");
+        }
+        return 0;
+    }
+    length = readlink("/proc/self/exe", executable, sizeof executable - 1u);
+    if (length <= 0 || (size_t)length >= sizeof executable - 1u) {
+        fprintf(stderr, "stack: could not resolve this program's path\n");
+        return -1;
+    }
+    executable[length] = '\0';
+    /*
+     * Opened BEFORE the fork so every child already holds the descriptor. Opening it
+     * after the fork would mean a second open per child and a second failure path, and it
+     * survives exec because it is not close-on-exec.
+     */
+    /*
+     * THE CHILD'S OUTPUT GOES TO A FILE, NOT TO THE TERMINAL AND NOT TO /dev/null.
+     *
+     * Not the terminal: every probe runs the whole suite again, so three more copies of
+     * every PASS line would land in the parent's stdout and the run's own line count would
+     * triple.
+     *
+     * Not /dev/null: checking only the child's exit status leaves the gate vacuous. A child
+     * pointed at some quick mode would exit 0, the gate would pass, and the deep frames
+     * would never have run -- the check would report a 512 KB stack fine while testing
+     * nothing. So the output is kept and required to contain a marker printed by the LAST
+     * verifier, which can only be there if the whole suite ran. BOUNCE_STACK_PROBE_LOG
+     * overrides the file so a run can be inspected from the shell.
+     */
+    log_path = getenv(BOUNCE_STACK_PROBE_LOG);
+    if (log_path == NULL || log_path[0] == '\0') {
+        (void)snprintf(fallback_log, sizeof fallback_log,
+                       "/tmp/bounce-stackprobe-XXXXXX");
+        log_fd = mkstemp(fallback_log);
+        if (log_fd < 0) {
+            fprintf(stderr, "stack: could not create the probe log\n");
+            return -1;
+        }
+        log_path = fallback_log;
+        fallback_created = true;
+    } else {
+        log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (log_fd < 0) {
+            fprintf(stderr, "stack: could not open %s\n", log_path);
+            return -1;
+        }
+    }
+    for (index = 0u; index < sizeof probes / sizeof probes[0]; index++) {
+        pid_t child;
+        int status = 0;
+
+        /*
+         * EACH PROBE GETS AN EMPTY LOG. The descriptor was opened once, so without this
+         * the three children append to the same file and the marker assertion for a later
+         * probe could be satisfied by an earlier probe's output -- the same "absent means
+         * nothing" error as reading only a prefix.
+         */
+        if (ftruncate(log_fd, 0) != 0 || lseek(log_fd, 0L, SEEK_SET) < 0) {
+            fprintf(stderr, "stack: could not rewind the probe log\n");
+            (void)close(log_fd);
+            return -1;
+        }
+        child = fork();
+        if (child < 0) {
+            fprintf(stderr, "stack: could not fork\n");
+            return -1;
+        }
+        if (child == 0) {
+            struct rlimit low;
+
+            /*
+             * SOFT AND HARD ARE SET TOGETHER. The kernel ignores a soft limit above the
+             * hard limit, so setting only the soft one would silently do nothing and this
+             * check would pass on a program with a megabyte frame.
+             */
+            /*
+             * THE CHILD'S OUTPUT IS DISCARDED, or the suite's own line count triples:
+             * every probe runs the whole thing again, and all three copies' PASS lines
+             * land in the parent's stdout. The parent has to report one run's results.
+             */
+            if (dup2(log_fd, STDOUT_FILENO) < 0)
+                _exit(122);
+            low.rlim_cur = (rlim_t)probes[index] * 1024u;
+            low.rlim_max = low.rlim_cur;
+            if (setrlimit(RLIMIT_STACK, &low) != 0)
+                _exit(120);
+            (void)setenv(BOUNCE_STACK_PROBE_CHILD, "1", 1);
+            (void)execl(executable, executable, "--check", (char *)NULL);
+            _exit(121);
+        }
+        if (waitpid(child, &status, 0) != child) {
+            fprintf(stderr, "stack: waitpid failed\n");
+            return -1;
+        }
+        /*
+         * DID THE CHILD ACTUALLY RUN THE SUITE? A marker printed by the LAST verifier is
+         * required, so a child that exited 0 without ever reaching the deep frames cannot
+         * satisfy this check. README-SHOTS is the marker because it prints on both scopes
+         * -- in a checkout and in a packaged build -- so the assertion cannot be satisfied
+         * by a scope accident.
+         */
+        /*
+         * ORDER MATTERS: THE CHILD'S FATE IS REPORTED BEFORE ITS LIMIT.
+         *
+         * The limit check first, as it was, produced a message that pointed at the wrong
+         * thing twice over. A child that died of signal 11 printed no limit at all, so the
+         * check complained about a limit mismatch -- blaming the wrong mechanism -- and then
+         * printed the value that HAD BEEN ASKED FOR rather than the value the child
+         * reported, which made 524288 appear next to the words "did not report running
+         * under it". A reader would have concluded the numbers matched.
+         *
+         * So: if the child never reached the end of the suite, that is the whole story and
+         * it is reported with the signal or exit status. Only a child that survived is
+         * asked whether it was really under the limit, and both numbers are printed.
+         */
+        if (!log_contains(log_path, "README-SHOTS")) {
+            fprintf(stderr,
+                    "stack: the probe at %u KB never reached the end of the suite"
+                    " (signal=%d exit=%d); it printed no README-SHOTS\n",
+                    probes[index],
+                    WIFSIGNALED(status) ? WTERMSIG(status) : 0,
+                    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            bad++;
+        } else {
+            char expected[64];
+            char actual[64];
+
+            /*
+             * THE LIMIT THE CHILD REPORTS MUST BE THE LIMIT THAT WAS ASKED FOR. This is
+             * what makes the gate non-vacuous: it does not ask whether the child succeeded,
+             * it asks whether the child was under the constraint at all.
+             */
+            (void)snprintf(expected, sizeof expected, "%llu",
+                           (unsigned long long)((rlim_t)probes[index] * 1024u));
+            if (log_field(log_path, "STACK-LIMIT-BYTES soft=",
+                          actual, sizeof actual) != 0
+                || strcmp(actual, expected) != 0) {
+                fprintf(stderr,
+                        "stack: the probe asked for %s bytes of stack but the child"
+                        " reported %s; the gate measured nothing\n",
+                        expected,
+                        actual[0] == '\0' ? "nothing at all" : actual);
+                bad++;
+            } else {
+                marker_seen = true;
+            }
+        }
+        if (WIFSIGNALED(status)) {
+            if (index == 0u) {
+                fprintf(stderr,
+                        "stack: a --check run died from signal %d on a %u KB stack;"
+                        " something is back on the stack as an automatic\n",
+                        WTERMSIG(status), probes[index]);
+                bad++;
+            }
+        } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            if (smallest_ok == 0u)
+                smallest_ok = probes[index];
+        }
+    }
+
+    if (bad == 0) {
+        /*
+         * THE PROBES BELOW THE GATE ARE INFORMATIONAL AND MAY NOT BE ABOUT THIS PROGRAM.
+         * A --check run spawns children through system(), so a 128 KB probe also has to
+         * fit /bin/sh on that stack, and a failure there says more about the shell than
+         * about the game. Only the gate decides the result. smallest_ok is printed so a
+         * change in headroom is visible, not so it can be asserted against.
+         */
+        if (!marker_seen) {
+            fprintf(stderr,
+                    "stack: no probe child reported reaching the end of the suite\n");
+            bad++;
+        }
+        printf("STACK-BUDGET gate=%uKB smallest_ok=%uKB gate_pass=yes"
+               " suite_ran=yes sub_gate=informational PASS\n",
+               BOUNCE_STACK_GATE_KB, smallest_ok);
+    }
+    (void)close(log_fd);
+    if (fallback_created)
+        (void)remove(log_path);
     return bad == 0 ? 0 : -1;
 }
 
@@ -35750,6 +36191,10 @@ int main(int argc, char **argv)
     }
     if (bounce_persistence_verify() != 0) {
         fprintf(stderr, "persistence store verification failed\n");
+        goto cleanup;
+    }
+    if (verify_stack_budget() != 0) {
+        fprintf(stderr, "stack budget verification failed\n");
         goto cleanup;
     }
     if (verify_readme_screenshots() != 0) {

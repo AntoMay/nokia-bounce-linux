@@ -468,9 +468,34 @@ int bounce_persistence_is_well_formed(const unsigned char *bytes, uint32_t size)
     return 1;
 }
 
+/*
+ * STEP STACK -- THE READ BUFFER IS STATIC, LIKE ITS THREE SIBLINGS.
+ *
+ * This one buffer was the whole stack budget of a --check run. It is 1 MB on purpose --
+ * it has to read a file that is either exactly BOUNCE_PERSISTENCE_SIZE (20) bytes or a
+ * version-2 container of a few hundred, and reading only that much could not tell a file
+ * of exactly that length from a longer one, which the version-1 branch needs to
+ * distinguish. Fine in a static; ruinous as an automatic.
+ *
+ * MEASURED, NOT ASSUMED. With this buffer automatic the suite needed 1088 KB of stack and
+ * segfaulted at 1024 KB, which is a real limit on plenty of systems -- systemd units and
+ * containers routinely set DefaultLimitStack to 1 MB. Static moves 1 MB from stack to
+ * BSS, where bounce_persistence_load_record3(), bounce_persistence_load_theme_index() and
+ * write_container() already keep three more buffers of exactly this size. BSS costs
+ * nothing until it is touched, and fread touches only the few hundred bytes it reads.
+ *
+ * WHY SHARING IS SAFE HERE. The three sibling buffers are separate objects, so a writer
+ * calling load() and then rewriting does not read through a buffer load() would change
+ * underneath it, and every caller copies values out into its own locals -- records12,
+ * record3, theme -- rather than holding a pointer into the buffer. The module was
+ * already non-reentrant before this change, because bounce_persistence_path() caches its
+ * result in a function-static, and the program is single-threaded: the timer is driven
+ * from the main loop, not from a signal handler.
+ */
+static unsigned char bytes[BOUNCE_PERSISTENCE_MAX_FILE_SIZE];
+
 int bounce_persistence_load(BouncePersistenceRecords *out)
 {
-    unsigned char bytes[BOUNCE_PERSISTENCE_MAX_FILE_SIZE];
     char path[BOUNCE_PERSISTENCE_PATH_MAX];
     FILE *file;
     size_t read_count;
