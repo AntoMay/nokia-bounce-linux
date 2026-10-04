@@ -8,23 +8,44 @@
 
 ## Screenshots
 
+### Game
+
 ![Title Screen](screenshots/title-screen.png)
 
 ![Main Menu](screenshots/main-menu.png)
 
 ![Level Select](screenshots/level-select.png)
 
-![Gameplay on Level 1](screenshots/gameplay-level-1.png)
+![Level Select with progress](screenshots/level-select-progress.png)
 
 ![Instructions](screenshots/instructions.png)
 
+![Gameplay on Level 1](screenshots/gameplay-level-1.png)
+
 ![High Score](screenshots/high-score.png)
+
+### Settings
 
 ![Settings Menu](screenshots/settings-menu.png)
 
-![Language Selection](screenshots/language-selection.png)
+![Settings: Language](screenshots/settings-language.png)
+
+![Settings: Theme](screenshots/settings-theme.png)
+
+![Settings: Audio](screenshots/settings-audio.png)
+
+![Settings: Input and Keypad](screenshots/settings-input-keypad.png)
+
+![Reset to Default, awaiting confirmation](screenshots/settings-reset-confirm.png)
+
+### About
 
 ![About](screenshots/about.png)
+
+Every image above is a render of the current native build, produced by
+`./native/app/bounce_vertical_slice --screenshots=DIR`. There is no separate
+standalone language screen in this build: language is chosen from
+Settings -> Language, which is the second Settings image above.
 
 # Nokia Bounce Decomp
 

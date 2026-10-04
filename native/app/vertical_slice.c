@@ -28,6 +28,8 @@
 
 #include <unistd.h>
 
+#include <dirent.h>
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34925,6 +34927,224 @@ restore:
     return bad == 0 ? 0 : -1;
 }
 
+/*
+ * =============================================================================
+ * STEP README -- verify_readme_screenshots()
+ *
+ * THE CLAIM. Every screenshots/ image the README shows exists, and every image in
+ * screenshots/ is shown by the README.
+ *
+ * WHY IT NEEDS A CLAIM AND NOT JUST A LOOK. Commit 8bdc651 replaced the screenshot set
+ * with renders of the native build and correctly dropped language-selection.png -- this
+ * build has no standalone language screen, language is chosen from Settings -> Language.
+ * The README kept pointing at the deleted file, so the repository has had a broken image
+ * on its front page ever since, and no test noticed because nothing compared the
+ * document against the directory.
+ *
+ * The second half is the one that finds problems earlier. A render added to
+ * screenshots/ and not added to the gallery is not a defect -- but it is how the missing
+ * Settings pages went unlisted through five commits, and how the rot above became
+ * possible in the first place: the gallery and the directory had drifted apart with
+ * nothing asserting they still matched.
+ *
+ * THE ROOT IS TAKEN FROM /proc/self/exe, NOT FROM THE WORKING DIRECTORY. The rest of the
+ * suite already depends on being run from the repository root because level and asset
+ * paths are relative to it, but this check reads a file that has nothing to do with
+ * gameplay, and pinning it to the binary's own location means it also works if that
+ * dependency is ever removed.
+ *
+ * DUPLICATE REFERENCES ARE NOT AN ERROR and do not fail the check; only a reference that
+ * does not resolve, and a file that is not referenced, are failures. Repeating an image
+ * is a layout choice.
+ */
+#define BOUNCE_README_REFERENCE_LIMIT 64u
+#define BOUNCE_README_PATH_MAX 1200
+
+static int verify_readme_screenshots(void)
+{
+    char executable[1024];
+    char root[1024];
+    char readme[BOUNCE_README_PATH_MAX];
+    char images[BOUNCE_README_PATH_MAX];
+    char referenced[BOUNCE_README_REFERENCE_LIMIT][BOUNCE_README_PATH_MAX];
+    char text[262144];
+    const char *cursor;
+    size_t reference_count = 0u;
+    size_t image_count = 0u;
+    ssize_t length;
+    DIR *dir;
+    struct dirent *entry;
+    FILE *file;
+    int bad = 0;
+    size_t index;
+
+    length = readlink("/proc/self/exe", executable, sizeof executable - 1u);
+    if (length <= 0 || (size_t)length >= sizeof executable - 1u) {
+        fprintf(stderr, "readme: could not resolve this program's path\n");
+        return -1;
+    }
+    executable[length] = '\0';
+    /*
+     * IS THIS BINARY INSIDE A SOURCE CHECKOUT, AND WHERE IS THE CHECKOUT ROOT.
+     *
+     * Two components are stripped first, leaving ".../native", and the leaf of THAT is
+     * what decides the scope. A checkout gives ".../nokia-bounce-linux/native"; the
+     * AppImage gives ".../usr" because the package installs the binary at usr/bin. The
+     * third strip then reaches the checkout root.
+     *
+     * THE SCOPE IS NOT COSMETIC. Without it this check made the AppImage's own --check
+     * fail: /proc/self/exe inside a mounted AppImage is
+     * /tmp/.mount_XXX/usr/bin/bounce_vertical_slice, so the derived root was the mount
+     * point, there was no README.md there, and the run died with 96 bytes on stderr
+     * having reported only 97 of its checks. A packaged artifact ships no README, so
+     * there is no document for this check to have an opinion about; skipping is the
+     * correct answer and failing is the wrong one.
+     *
+     * IT IS REPORTED DIFFERENTLY RATHER THAN SILENTLY, because "no claim was checked"
+     * must not look identical to "the claim was checked and held". A run from a checkout
+     * prints the reference and image counts; a packaged build prints scope=packaged-build
+     * on its own line.
+     */
+    for (index = 0u; index < 2u; index++) {
+        char *slash = strrchr(executable, '/');
+
+        if (slash == NULL || slash == executable) {
+            fprintf(stderr,
+                    "readme: the executable is not inside a directory tree\n");
+            return -1;
+        }
+        *slash = '\0';
+    }
+    {
+        const char *leaf = strrchr(executable, '/');
+        char *slash;
+
+        leaf = (leaf != NULL) ? leaf + 1 : executable;
+        if (strcmp(leaf, "native") != 0) {
+            printf("README-SHOTS scope=packaged-build refs=0 images=0"
+                   " skipped=yes PASS\n");
+            return 0;
+        }
+        slash = strrchr(executable, '/');
+        if (slash == NULL || slash == executable) {
+            fprintf(stderr,
+                    "readme: the checkout root could not be derived\n");
+            return -1;
+        }
+        *slash = '\0';
+    }
+    (void)snprintf(root, sizeof root, "%s", executable);
+    (void)snprintf(readme, sizeof readme, "%s/README.md", root);
+    (void)snprintf(images, sizeof images, "%s/screenshots", root);
+
+    file = fopen(readme, "rb");
+    if (file == NULL) {
+        fprintf(stderr, "readme: could not read %s\n", readme);
+        return -1;
+    }
+    length = (ssize_t)fread(text, 1u, sizeof text - 1u, file);
+    (void)fclose(file);
+    if (length <= 0) {
+        fprintf(stderr, "readme: %s is empty\n", readme);
+        return -1;
+    }
+    text[length] = '\0';
+
+    /*
+     * COLLECT THE REFERENCES. Every occurrence of the directory name is taken, so a
+     * reference in prose counts as well as one in an image link; both would rot the same
+     * way. Occurrences beyond the limit are counted rather than stored, and reported, so
+     * the limit cannot quietly turn into "stop checking".
+     */
+    cursor = text;
+    for (;;) {
+        const char *hit = strstr(cursor, "screenshots/");
+        const char *end;
+        size_t span;
+
+        if (hit == NULL)
+            break;
+        end = strstr(hit, ".png");
+        if (end == NULL) {
+            cursor = hit + strlen("screenshots/");
+            continue;
+        }
+        span = (size_t)(end - hit) + 4u;
+        if (span >= BOUNCE_README_PATH_MAX)
+            span = BOUNCE_README_PATH_MAX - 1u;
+        if (reference_count < BOUNCE_README_REFERENCE_LIMIT) {
+            memcpy(referenced[reference_count], hit, span);
+            referenced[reference_count][span] = '\0';
+            reference_count++;
+        }
+        cursor = hit + span;
+    }
+    if (reference_count == 0u) {
+        fprintf(stderr, "readme: no screenshots/ references at all\n");
+        return -1;
+    }
+
+    /* EVERY REFERENCE MUST RESOLVE. This is the half that would have caught 8bdc651. */
+    for (index = 0u; index < reference_count; index++) {
+        char full[BOUNCE_README_PATH_MAX + 1024];
+
+        if (snprintf(full, sizeof full, "%s/%s", root, referenced[index])
+            >= (int)sizeof full)
+            continue;
+        if (access(full, F_OK) != 0) {
+            fprintf(stderr,
+                    "readme: the README shows %s, which does not exist\n",
+                    referenced[index]);
+            bad++;
+        }
+    }
+
+    /* AND EVERY IMAGE MUST BE SHOWN. */
+    dir = opendir(images);
+    if (dir == NULL) {
+        fprintf(stderr, "readme: could not open %s\n", images);
+        return -1;
+    }
+    while ((entry = readdir(dir)) != NULL) {
+        size_t name_length = strlen(entry->d_name);
+        int listed = 0;
+
+        if (name_length < 4u
+            || strcmp(entry->d_name + name_length - 4u, ".png") != 0)
+            continue;
+        image_count++;
+        for (index = 0u; index < reference_count; index++) {
+            char leaf[BOUNCE_README_PATH_MAX];
+            const char *tail = strrchr(referenced[index], '/');
+
+            if (snprintf(leaf, sizeof leaf, "%s",
+                         tail != NULL ? tail + 1 : referenced[index]) >= (int)sizeof leaf)
+                continue;
+            if (strcmp(leaf, entry->d_name) == 0) {
+                listed = 1;
+                break;
+            }
+        }
+        if (!listed) {
+            fprintf(stderr,
+                    "readme: screenshots/%s exists but the README never shows it\n",
+                    entry->d_name);
+            bad++;
+        }
+    }
+    (void)closedir(dir);
+
+    if (image_count == 0u) {
+        fprintf(stderr, "readme: screenshots/ contains no images\n");
+        return -1;
+    }
+    if (bad == 0) {
+        printf("README-SHOTS refs=%zu images=%zu broken=0 unlisted=0 PASS\n",
+               reference_count, image_count);
+    }
+    return bad == 0 ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     const char *level_path = BOUNCE_LEVEL001_PATH;
@@ -35530,6 +35750,10 @@ int main(int argc, char **argv)
     }
     if (bounce_persistence_verify() != 0) {
         fprintf(stderr, "persistence store verification failed\n");
+        goto cleanup;
+    }
+    if (verify_readme_screenshots() != 0) {
+        fprintf(stderr, "README screenshot verification failed\n");
         goto cleanup;
     }
     if (verify_save_directory_precedence() != 0) {
