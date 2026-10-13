@@ -102,35 +102,6 @@ int bounce_ui_shell_can_draw_ascii(int codepoint);
  */
 unsigned int bounce_ui_shell_volume_from_track_x(int x);
 
-/*
- * BL-005 -- where the FPS control sits on the Display page.
- *
- * THE SIZE FACTS ABOVE IT END AT y = 92 (the last one's digits start at 86 and are
- * 7 px tall) and STEP 38-RESET-UI removed the ESC BACK footer, so y = 94 is the
- * first free row.
- *
- * THE BAND STOPS AT 121 ON PURPOSE, and the first draft of this block did not. The
- * Settings page draws a panel at fill_rect(4, 4, 120, 120) with a border row at
- * y = 123, so a band of the natural "32 px tall" size would have painted over the
- * card's bottom edge and into the background below it on every frame. The whole
- * control -- band, both label lines and the value -- has to fit inside the card, and
- * 121 is the last row before the border at 123.
- *
- * THE GAP BETWEEN THE LABEL AND THE VALUE IS THE 10 PX SECOND-LINE PITCH, not an
- * arbitrary number: the wrapped-label helper puts the second line of an over-wide
- * label at y + 10, so a label that wraps at 96 occupies 96 and 106, and a value at
- * 114 clears both and still ends at 121. A label that does not wrap leaves 106 empty,
- * which reads as spacing rather than as a mistake.
- *
- * THESE ARE IN THE HEADER because a verifier has to measure the same rectangles the
- * renderer draws into, in order to prove the FPS value is on the screen. Duplicating
- * the numbers in a test would let the two disagree silently.
- */
-#define BOUNCE_UI_DISPLAY_FPS_BAND_Y 94
-#define BOUNCE_UI_DISPLAY_FPS_BAND_WIDTH 104
-#define BOUNCE_UI_DISPLAY_FPS_BAND_HEIGHT 28
-#define BOUNCE_UI_DISPLAY_FPS_LABEL_Y 96
-#define BOUNCE_UI_DISPLAY_FPS_VALUE_Y 114
 
 /*
  * There is deliberately no string-level companion to this one. See the note above
@@ -193,30 +164,7 @@ typedef enum BounceUiInput {
      * the volume by 10. These inputs are ignored on all other pages.
      */
     BOUNCE_UI_INPUT_LEFT = 6,
-    BOUNCE_UI_INPUT_RIGHT = 7,
-    /*
-     * BL-005 -- TEXT ENTRY, WHICH LEFT AND RIGHT CANNOT EXPRESS.
-     *
-     * The FPS setting is a two-digit numeric field in the reference
-     * (BounceUI.java:552), so it needs characters, not a step. These ten plus
-     * BACKSPACE are the only new inputs the UI gained; nothing else in the shell
-     * consumes them, and bounce_ui_shell_handle_press() only acts on them while an
-     * edit is actually live -- which is what stops a digit key from being swallowed
-     * by navigation, or reaching the game, on every other screen.
-     *
-     * Appended after LEFT/RIGHT so no existing enumerator value moves.
-     */
-    BOUNCE_UI_INPUT_DIGIT0 = 8,
-    BOUNCE_UI_INPUT_DIGIT1 = 9,
-    BOUNCE_UI_INPUT_DIGIT2 = 10,
-    BOUNCE_UI_INPUT_DIGIT3 = 11,
-    BOUNCE_UI_INPUT_DIGIT4 = 12,
-    BOUNCE_UI_INPUT_DIGIT5 = 13,
-    BOUNCE_UI_INPUT_DIGIT6 = 14,
-    BOUNCE_UI_INPUT_DIGIT7 = 15,
-    BOUNCE_UI_INPUT_DIGIT8 = 16,
-    BOUNCE_UI_INPUT_DIGIT9 = 17,
-    BOUNCE_UI_INPUT_BACKSPACE = 18
+    BOUNCE_UI_INPUT_RIGHT = 7
 } BounceUiInput;
 
 /*

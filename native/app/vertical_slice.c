@@ -2487,12 +2487,6 @@ static void app_restore_persisted_settings(BounceApp *app)
      * already initialised to, and a stored 0 now restores 0. This matches the
      * reference, which reads the byte raw with no truthiness test at all
      * (BounceUI.java:580).
-     *
-     * It also brings the FPS restore below it onto the same contract. A stored FPS
-     * of 0 is not reachable through the UI or the writer, so its guard was not a
-     * live mute-style bug -- but removing it is what makes a record that IS out of
-     * range, or hand-edited, land on the loader's clamp (BOUNCE_FPS_MIN..MAX) rather
-     * than on whichever value happened to survive the guard.
      */
     int32_t stored_volume = 0;
     if (bounce_persistence_load_volume(&stored_volume) == 0) {
@@ -2500,16 +2494,6 @@ static void app_restore_persisted_settings(BounceApp *app)
             (unsigned int)stored_volume);
     }
 
-    /* BL-005 -- restore the FPS setting at startup. Same contract as the
-     * volume above, and for the same reason: the loader defaults the value
-     * before it can fail and clamps a stored one into BOUNCE_FPS_MIN..MAX, so an
-     * absent record, an unreadable container and an out-of-range record all arrive
-     * here as a legal value already. */
-    int32_t stored_fps = 0;
-    if (bounce_persistence_load_fps(&stored_fps) == 0) {
-        (void)bounce_app_flow_restore_persisted_fps(&app->flow,
-            (unsigned int)stored_fps);
-    }
 }
 
 /*
@@ -2711,28 +2695,6 @@ static void app_commit_volume_change(BounceApp *app, unsigned int volume_before)
     app->last_persisted_volume = bounce_app_flow_settings_volume(&app->flow);
 }
 
-/*
- * BL-005 -- commit the FPS if, and only if, this input changed it.
- *
- * The same rationale as app_commit_theme_change() applies: write on the edge
- * that produces the change, not at shutdown.
- */
-static void app_persist_fps(BounceApp *app)
-{
-    if (app == NULL)
-        return;
-    (void)bounce_persistence_save_fps(
-        (int32_t)bounce_app_flow_settings_fps(&app->flow));
-}
-
-static void app_commit_fps_change(BounceApp *app, unsigned int fps_before)
-{
-    if (app == NULL)
-        return;
-    if ((int)bounce_app_flow_settings_fps(&app->flow) == (int)fps_before)
-        return;
-    app_persist_fps(app);
-}
 
 /*
  * BL-004 PARITY FIX -- push the current volume into the audio player, but only when
@@ -15195,22 +15157,6 @@ static bool x11_keysym_to_source(
         case XK_Escape:
             *source_out = BOUNCE_INPUT_SOURCE_ESCAPE;
             return true;
-        /*
-         * BL-005 -- BACKSPACE, FOR THE FPS FIELD.
-         *
-         * XK_BackSpace is the standard X11 keysym for the key. It was mapped to
-         * nothing before, so the FPS field had no way to delete a mistyped digit --
-         * the only edits available were appending more digits and committing, which
-         * is not an editable field in any useful sense.
-         *
-         * It is deliberately NOT XK_Delete and not an alias of Escape. Back is
-         * BOUNCE_UI_INPUT_BACK and already means "leave this page" everywhere in
-         * the shell; folding Backspace into it would mean a player who reached for
-         * the usual delete key cancelled their whole edit instead.
-         */
-        case XK_BackSpace:
-            *source_out = BOUNCE_INPUT_SOURCE_BACKSPACE;
-            return true;
         case XK_q:
         case XK_Q:
             *source_out = BOUNCE_INPUT_SOURCE_QUIT;
@@ -15356,14 +15302,14 @@ static BounceUiInput app_ui_input_from_source(BounceInputSource source)
 {
     switch (source) {
         /*
-         * BL-004/BL-005 -- LEFT AND RIGHT WERE FALLING THROUGH TO `default`.
+         * BL-004 -- LEFT AND RIGHT WERE FALLING THROUGH TO `default`.
          *
-         * THIS IS THE WHOLE REASON THE VOLUME AND FPS CONTROLS WERE DEAD. The four
+         * THIS IS THE WHOLE REASON THE VOLUME CONTROL WAS DEAD. The four
          * sources below were already produced -- x11_keysym_to_source() has mapped
          * XK_Left, XK_a, XK_Right and XK_d to them since STEP 34-F-K -- and
          * bounce_ui_shell_handle_press() has handled BOUNCE_UI_INPUT_LEFT and
-         * BOUNCE_UI_INPUT_RIGHT on the Audio and Display pages since the controls
-         * were added. Nothing joined the two ends: every press fell to `default`
+         * BOUNCE_UI_INPUT_RIGHT on the Audio page since the control was added.
+         * Nothing joined the two ends: every press fell to `default`
          * and became BOUNCE_UI_INPUT_OTHER, so the handlers ran for nobody and the
          * setting could only be changed by a pointer path that did not exist yet
          * either.
@@ -15394,43 +15340,6 @@ static BounceUiInput app_ui_input_from_source(BounceInputSource source)
         /* X11-only test alias; physical Nokia Back mapping remains UNKNOWN. */
         case BOUNCE_INPUT_SOURCE_ESCAPE:
             return BOUNCE_UI_INPUT_BACK;
-        /*
-         * BL-005 -- DIGITS AND BACKSPACE REACH THE SHELL ONLY AS TEXT ENTRY.
-         *
-         * They are mapped here, unconditionally, and bounce_ui_shell_handle_press()
-         * acts on them only while an FPS edit is live. That is the whole reason a
-         * digit key cannot be swallowed by navigation while the field is open: the
-         * digit never has to travel through the navigation branches at all.
-         *
-         * Outside an edit these are still consumed here rather than reported as
-         * BOUNCE_UI_INPUT_OTHER, which changes nothing observable -- every handler
-         * ignores an input it has no case for, and the keypad game controls read
-         * BounceInputState, not this mapping. What it buys is that the field's input
-         * contract is a property of this one function, so a test can assert the
-         * whole digit range without driving the X11 loop.
-         */
-        case BOUNCE_INPUT_SOURCE_NUM0:
-            return BOUNCE_UI_INPUT_DIGIT0;
-        case BOUNCE_INPUT_SOURCE_NUM1:
-            return BOUNCE_UI_INPUT_DIGIT1;
-        case BOUNCE_INPUT_SOURCE_NUM2:
-            return BOUNCE_UI_INPUT_DIGIT2;
-        case BOUNCE_INPUT_SOURCE_NUM3:
-            return BOUNCE_UI_INPUT_DIGIT3;
-        case BOUNCE_INPUT_SOURCE_NUM4:
-            return BOUNCE_UI_INPUT_DIGIT4;
-        case BOUNCE_INPUT_SOURCE_NUM5:
-            return BOUNCE_UI_INPUT_DIGIT5;
-        case BOUNCE_INPUT_SOURCE_NUM6:
-            return BOUNCE_UI_INPUT_DIGIT6;
-        case BOUNCE_INPUT_SOURCE_NUM7:
-            return BOUNCE_UI_INPUT_DIGIT7;
-        case BOUNCE_INPUT_SOURCE_NUM8:
-            return BOUNCE_UI_INPUT_DIGIT8;
-        case BOUNCE_INPUT_SOURCE_NUM9:
-            return BOUNCE_UI_INPUT_DIGIT9;
-        case BOUNCE_INPUT_SOURCE_BACKSPACE:
-            return BOUNCE_UI_INPUT_BACKSPACE;
         default:
             return BOUNCE_UI_INPUT_OTHER;
     }
@@ -20942,7 +20851,6 @@ static int verify_native_extension_ui(void)
     BounceRenderer *renderer;
     unsigned int index;
     unsigned int walk;
-    unsigned int fps_before;
     int nonblank;
 
     memset(&flow, 0, sizeof flow);
@@ -21090,57 +20998,30 @@ static int verify_native_extension_ui(void)
     }
 
     /*
-     * STEP 34-F-K: Input used to be a read-only fact page with no navigable list,
-     * and so was Display. Neither is any more. Input has the numeric keypad setting
-     * and Display has the BL-005 FPS control, so each gets its own block below, in
-     * the same shape as the Audio one.
+     * STEP 34-F-K: Display and Input remained read-only fact pages with no
+     * navigable list. Audio did not, and now neither does Input: the numeric
+     * keypad setting added to Input gives it a two-row list.
      *
-     * THE INVARIANT IS NOT WEAKENED, IT IS RE-SCOPED. This block used to assert that
-     * the Display page reported zero rows and that UP, DOWN and SELECT all failed.
-     * That was true while Display was a fact table, and BL-005 ended it: app_flow.h
-     * now defines BOUNCE_SETTINGS_DISPLAY_VALUE_COUNT and BOUNCE_SETTINGS_DISPLAY_ROW_FPS,
-     * and bounce_app_flow_settings_list_count() returns the former for this page. The
-     * block below asserts the page's real shape instead of the shape it no longer has.
+     * THE INVARIANT IS NOT WEAKENED, IT IS SCOPED. This loop used to cover
+     * DISPLAY..INPUT together and assert, for both, that the page reports zero
+     * rows and that UP, DOWN and SELECT all fail. Display still satisfies that in
+     * full and is still asserted here. Input no longer does, and cannot: a
+     * setting the player cannot reach is not a setting, so asserting it would be
+     * asserting the absence of the feature this change exists to add.
      *
-     * It stayed green until now only because verify_script_glyph_coverage() runs
-     * earlier and aborted the suite on its own failure. Nothing about the Display
-     * page changed when that was fixed; the stale assertion was simply reachable.
+     * Input is verified in its own block below, in the same shape as the Audio
+     * one -- two rows, moving does not apply, SELECT applies -- so what replaced
+     * the invariant is a real assertion rather than a removal.
      */
     flow.settings.page = BOUNCE_SETTINGS_PAGE_DISPLAY;
-    /*
-     * The FPS is read BEFORE the walk rather than compared against a constant. What
-     * this block is about is that SELECT does not change it, and pinning the literal
-     * default here would restate a shipped-default claim that verify_default_state()
-     * already owns.
-     */
-    fps_before = bounce_app_flow_settings_fps(&flow);
-    if (bounce_app_flow_settings_list_count(&flow)
-            != BOUNCE_SETTINGS_DISPLAY_VALUE_COUNT
-        || BOUNCE_SETTINGS_DISPLAY_ROW_FPS != 0u
-        || bounce_app_flow_settings_selected_index(&flow)
-            != BOUNCE_SETTINGS_DISPLAY_ROW_FPS)
-        return -1;
-    /*
-     * ONE ROW, SO BOTH DIRECTIONS CLAMP AND NEITHER IS AN ERROR. The generic
-     * settings move is bounded and non-wrapping, the same rule the main menu and the
-     * level list use, so a DOWN past the last row returns 0 with the highlight still
-     * on the FPS row rather than wrapping or failing.
-     */
-    if (bounce_app_flow_settings_move(&flow, BOUNCE_MENU_DIRECTION_DOWN) != 0
-        || bounce_app_flow_settings_selected_index(&flow)
-            != BOUNCE_SETTINGS_DISPLAY_ROW_FPS
-        || bounce_app_flow_settings_move(&flow, BOUNCE_MENU_DIRECTION_UP) != 0
-        || bounce_app_flow_settings_selected_index(&flow)
-            != BOUNCE_SETTINGS_DISPLAY_ROW_FPS)
-        return -1;
-    /*
-     * SELECT IS A NO-OP HERE, and that is the point of the page rather than an
-     * omission: the FPS is adjusted with LEFT/RIGHT in the shell's input seam, so
-     * the flow's select path recognises the FPS row and changes nothing. Asserted
-     * as "unchanged", which holds whatever the current value is.
-     */
-    if (bounce_app_flow_settings_select(&flow) != 0
-        || bounce_app_flow_settings_fps(&flow) != fps_before)
+    if (bounce_app_flow_settings_list_count(&flow) != 0u
+        || bounce_app_flow_settings_move(
+               &flow,
+               BOUNCE_MENU_DIRECTION_DOWN) != -1
+        || bounce_app_flow_settings_move(
+               &flow,
+               BOUNCE_MENU_DIRECTION_UP) != -1
+        || bounce_app_flow_settings_select(&flow) != -1)
         return -1;
 
     /*
@@ -21603,42 +21484,6 @@ static int verify_native_extension_ui(void)
     return nonblank > 0 ? 0 : -1;
 }
 
-/*
- * BL-004 PARITY FIX -- an FNV digest over a rectangle of the surface.
- *
- * The same construction the file already uses for the level and thorn payload
- * digests, applied to pixels instead of bytes. It exists so a render can be
- * compared to another render of the same screen and answered with "these differ",
- * which is what proves a control was actually drawn rather than merely declared.
- */
-static unsigned long region_digest(
-    BounceSurface *surface,
-    int x,
-    int y,
-    int width,
-    int height
-)
-{
-    unsigned long digest = 1469598103934665603UL;
-    int px;
-    int py;
-
-    if (surface == NULL)
-        return 0UL;
-    for (py = y; py < y + height; ++py) {
-        for (px = x; px < x + width; ++px) {
-            uint32_t pixel = 0u;
-
-            if (bounce_surface_get_pixel(surface, px, py, &pixel) != 0)
-                return 0UL;
-            digest ^= (unsigned long)(pixel & 0xffu);
-            digest *= 1099511628211UL;
-            digest ^= (unsigned long)((pixel >> 8) & 0xffu);
-            digest *= 1099511628211UL;
-        }
-    }
-    return digest;
-}
 
 /*
  * BL-004 PARITY FIX -- VOLUME 0 IS A VALUE, NOT A FAILURE, AND IT MUST SURVIVE A
@@ -21755,271 +21600,7 @@ static int verify_volume_zero_survives_restart(void)
     return bad == 0 ? 0 : -1;
 }
 
-/*
- * BL-005 PARITY FIX -- the FPS range is the reference's 10..60, default 25, and
- * every layer that can meet an out-of-range value has to land on the same answer.
- *
- * THE RANGE MOVED and three places could have been left behind: the flow's restore
- * guard, the persistence loader's clamp, and the UI's LEFT/RIGHT arithmetic. A
- * mismatch between them is the defect this catches -- for example the UI clamps used
- * to be written against 10..180 and would have walked past a 60 maximum.
- */
-static int verify_fps_range_normalization(void)
-{
-    BounceAppFlow flow;
-    BounceApp app;
-    int32_t stored = -1;
-    int bad = 0;
 
-    (void)printf("FPS-RANGE bounds, default and out-of-range normalisation\n");
-
-    /* The bounds ARE the reference's. */
-    if (BOUNCE_FPS_MIN != 10u || BOUNCE_FPS_MAX != 60u
-        || BOUNCE_FPS_DEFAULT != 25u) {
-        fprintf(stderr,
-                "fps-range: bounds are %u..%u default %u, expected 10..60 default 25\n",
-                (unsigned int)BOUNCE_FPS_MIN, (unsigned int)BOUNCE_FPS_MAX,
-                (unsigned int)BOUNCE_FPS_DEFAULT);
-        ++bad;
-    }
-    /* The step must land on the maximum, or UP and RIGHT disagree about the end. */
-    if ((BOUNCE_FPS_MAX - BOUNCE_FPS_MIN) % BOUNCE_SETTINGS_FPS_STEP != 0u) {
-        fprintf(stderr, "fps-range: the step does not divide the range\n");
-        ++bad;
-    }
-
-    /* A fresh flow starts at the reference default, not at 60. */
-    bounce_app_flow_init(&flow);
-    if (bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_DEFAULT) {
-        fprintf(stderr, "fps-range: a fresh flow is not at the default\n");
-        ++bad;
-    }
-
-    /*
-     * BOTH ENDS OF THE RANGE ARE ACCEPTED BY THE FLOW. This is what the UI's
-     * arithmetic depends on: if either end were refused, LEFT or RIGHT at a bound
-     * would silently do nothing.
-     */
-    if (bounce_app_flow_restore_persisted_fps(
-                &flow, BOUNCE_FPS_MIN) != 0
-        || bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_MIN) {
-        fprintf(stderr, "fps-range: the minimum was refused\n");
-        ++bad;
-    }
-    if (bounce_app_flow_restore_persisted_fps(
-                &flow, BOUNCE_FPS_MAX) != 0
-        || bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_MAX) {
-        fprintf(stderr, "fps-range: the maximum was refused\n");
-        ++bad;
-    }
-
-    /*
-     * AND JUST OUTSIDE IT IS NOT. The flow refuses rather than clamping, so a
-     * corrupt or hand-edited store cannot install a value the UI cannot reach.
-     */
-    if (bounce_app_flow_restore_persisted_fps(
-                &flow, BOUNCE_FPS_MAX + 1u) != -1) {
-        fprintf(stderr, "fps-range: a value above the maximum was accepted\n");
-        ++bad;
-    }
-    if (bounce_app_flow_restore_persisted_fps(
-                &flow, BOUNCE_FPS_MIN - 1u) != -1) {
-        fprintf(stderr, "fps-range: a value below the minimum was accepted\n");
-        ++bad;
-    }
-
-    /*
-     * THE LOADER CLAMP INSTEAD, because a store that already holds 180 -- which any
-     * player who ran the 10..180 build has -- must not keep it, and must not leave
-     * the flow refusing forever either.
-     */
-    if (bounce_persistence_save_fps((int32_t)BOUNCE_FPS_MAX + 120) != 0) {
-        fprintf(stderr, "fps-range: save_fps of an out-of-range value failed\n");
-        return -1;
-    }
-    stored = -1;
-    if (bounce_persistence_load_fps(&stored) != 0
-        || (unsigned int)stored != BOUNCE_FPS_MAX) {
-        fprintf(stderr,
-                "fps-range: a stored %ld was not clamped to the maximum %u\n",
-                (long)((int32_t)BOUNCE_FPS_MAX + 120), BOUNCE_FPS_MAX);
-        ++bad;
-    }
-    /* And the clamped value is one the flow then accepts. */
-    memset(&app, 0, sizeof app);
-    bounce_app_flow_init(&app.flow);
-    app_restore_persisted_settings(&app);
-    if (bounce_app_flow_settings_fps(&app.flow) != BOUNCE_FPS_MAX) {
-        fprintf(stderr,
-                "fps-range: launch restore of the clamped value got %u\n",
-                bounce_app_flow_settings_fps(&app.flow));
-        ++bad;
-    }
-
-    /* A stored 0 is clamped up to the minimum, not treated as "absent". */
-    if (bounce_persistence_save_fps(0) != 0) {
-        fprintf(stderr, "fps-range: save_fps(0) failed\n");
-        return -1;
-    }
-    stored = -1;
-    if (bounce_persistence_load_fps(&stored) != 0
-        || (unsigned int)stored != BOUNCE_FPS_MIN) {
-        fprintf(stderr,
-                "fps-range: a stored 0 was not clamped up to %u, got %ld\n",
-                BOUNCE_FPS_MIN, (long)stored);
-        ++bad;
-    }
-
-    (void)bounce_persistence_save_fps((int32_t)BOUNCE_FPS_DEFAULT);
-
-    (void)printf("  bounds=10..60 default=25 ends_accepted=yes"
-                 " out_of_range_refused=yes loader_clamps=yes %s\n",
-                 bad == 0 ? "PASS" : "FAIL");
-    return bad == 0 ? 0 : -1;
-}
-
-/*
- * BL-005 PARITY FIX -- THE FPS ROW IS ACTUALLY PAINTED.
- *
- * THE DEFECT THIS EXISTS FOR. The Display page rendered three size facts and
- * nothing else: no FPS label, no value, no selection band. The setting was live --
- * selectable, adjustable, persisted, restored and spent by sleep_frame_fps() -- and
- * invisible, so a player could move a number and never see it, and no test in the
- * tree could notice. The earlier BL-005 report asserted "FPS displayed as 'XX FPS'
- * on Display page"; it was not.
- *
- * WHY IT IS PROVEN BY DIFFERENCE RATHER THAN BY INK. A band that is painted is
- * necessary but weak on its own -- the highlight alone would satisfy it. So the band
- * is rendered twice with the FPS value set to the minimum and then to the maximum,
- * and the VALUE REGION is required to differ. That can only happen if the number
- * itself is on the screen, and it is the property a player actually reads.
- *
- * EVERY LANGUAGE IS CHECKED, and not only for boxes: SCRIPT-COVERAGE already proves
- * no language paints a glyph box here, and this proves each of them paints
- * SOMETHING, so a string that silently failed to render would be caught as well as
- * one that rendered as a box.
- */
-static int verify_display_fps_row_is_painted(void)
-{
-    static const BounceLanguage order[5] = {
-        BOUNCE_LANGUAGE_EN, BOUNCE_LANGUAGE_ZH_CN, BOUNCE_LANGUAGE_ZH_TW,
-        BOUNCE_LANGUAGE_TH_TH, BOUNCE_LANGUAGE_ID
-    };
-    BounceSurface *surface;
-    BounceRenderer *renderer;
-    BounceAppFlow flow;
-    unsigned int step;
-    int bad = 0;
-
-    (void)printf("DISPLAY-FPS-ROW label, value and selection band are painted\n");
-
-    surface = bounce_surface_create();
-    if (surface == NULL)
-        return -1;
-    renderer = bounce_renderer_create(surface);
-    if (renderer == NULL) {
-        bounce_surface_destroy(surface);
-        return -1;
-    }
-
-    for (step = 0u; step < 5u; ++step) {
-        unsigned long digest_min = 0ul;
-        unsigned long digest_max = 0ul;
-        unsigned long digest_off = 0ul;
-
-        memset(&flow, 0, sizeof flow);
-        bounce_app_flow_init(&flow);
-        flow.state = BOUNCE_APP_STATE_SETTINGS;
-        flow.level_selection.available_level_count =
-            (unsigned int)BOUNCE_APP_LAST_LEVEL_ID;
-        flow.level_selection.selected_index = 0u;
-        flow.gameplay_entry.phase =
-            BOUNCE_GAMEPLAY_ENTRY_PHASE_INIT_METADATA_RECORDED;
-        flow.gameplay_entry.level_id = BOUNCE_APP_FIRST_LEVEL_ID;
-        flow.settings.page = BOUNCE_SETTINGS_PAGE_DISPLAY;
-        bounce_locale_set_active_language(order[step]);
-        bounce_script_font_set_active_language(order[step]);
-
-        /*
-         * ONE RENDERER, REUSED. bounce_ui_shell_render_settings() begins with
-         * bounce_surface_fill(surface, background) over the whole 128x128, so every
-         * render fully replaces the previous one and a second renderer would buy
-         * nothing -- while a shared surface without that fill would have made the
-         * band comparison meaningless by accumulating both renders.
-         */
-        if (bounce_app_flow_restore_persisted_fps(
-                    &flow, BOUNCE_FPS_MIN) != 0
-            || bounce_ui_shell_render_settings(surface, renderer, &flow) != 0) {
-            fprintf(stderr,
-                    "display-fps-row: language %u failed to render at the minimum\n",
-                    (unsigned int)order[step]);
-            ++bad;
-            continue;
-        }
-        digest_min = region_digest(surface,
-                                   12,
-                                   BOUNCE_UI_DISPLAY_FPS_VALUE_Y - 2,
-                                   BOUNCE_UI_DISPLAY_FPS_BAND_WIDTH,
-                                   12);
-
-        if (bounce_app_flow_restore_persisted_fps(
-                    &flow, BOUNCE_FPS_MAX) != 0
-            || bounce_ui_shell_render_settings(surface, renderer, &flow) != 0) {
-            fprintf(stderr,
-                    "display-fps-row: language %u failed to render at the maximum\n",
-                    (unsigned int)order[step]);
-            ++bad;
-            continue;
-        }
-        digest_max = region_digest(surface,
-                                   12,
-                                   BOUNCE_UI_DISPLAY_FPS_VALUE_Y - 2,
-                                   BOUNCE_UI_DISPLAY_FPS_BAND_WIDTH,
-                                   12);
-
-        if (digest_min == digest_max) {
-            fprintf(stderr,
-                    "display-fps-row: language %u painted the same value region"
-                    " at %u and %u, so the FPS number is not on screen\n",
-                    (unsigned int)order[step],
-                    BOUNCE_FPS_MIN, BOUNCE_FPS_MAX);
-            ++bad;
-        }
-
-        /*
-         * THE SELECTION BAND. Rendered with the row NOT selected -- by hand, because
-         * a one-row page cannot navigate away from row 0 through the flow -- and
-         * compared against the selected render above. If the band were not drawn,
-         * these two would be identical.
-         */
-        flow.settings.selected_index = BOUNCE_SETTINGS_DISPLAY_ROW_FPS + 1u;
-        if (bounce_ui_shell_render_settings(surface, renderer, &flow) != 0) {
-            ++bad;
-        } else {
-            digest_off = region_digest(surface,
-                                       12,
-                                       BOUNCE_UI_DISPLAY_FPS_BAND_Y,
-                                       BOUNCE_UI_DISPLAY_FPS_BAND_WIDTH,
-                                       BOUNCE_UI_DISPLAY_FPS_BAND_HEIGHT);
-            if (digest_off == digest_max) {
-                fprintf(stderr,
-                        "display-fps-row: language %u paints no selection band\n",
-                        (unsigned int)order[step]);
-                ++bad;
-            }
-        }
-        flow.settings.selected_index = BOUNCE_SETTINGS_DISPLAY_ROW_FPS;
-    }
-
-    bounce_locale_set_active_language(BOUNCE_LANGUAGE_EN);
-    bounce_script_font_set_active_language(BOUNCE_LANGUAGE_EN);
-    bounce_renderer_destroy(renderer);
-    bounce_surface_destroy(surface);
-
-    (void)printf("  languages=5 value_tracks_fps=yes selection_band=yes %s\n",
-                 bad == 0 ? "PASS" : "FAIL");
-    return bad == 0 ? 0 : -1;
-}
 
 /*
  * BL-004 PARITY FIX -- the volume really reaches the player, including mid-game.
@@ -22431,324 +22012,7 @@ static int verify_volume_slider_pointer(void)
     return bad == 0 ? 0 : -1;
 }
 
-/*
- * BL-005 -- THE FPS FIELD, TYPED INTO THE WAY A PLAYER TYPES.
- *
- * The stepper could only ever reach 10, 20, 30, 40, 50 and 60. This drives the
- * replacement end to end: SELECT to open, digits, Backspace, SELECT to commit, and
- * the rejection of everything that is not a legal FPS.
- *
- * AS WITH THE VOLUME, THE KEYBOARD IS ENTERED THROUGH app_ui_input_from_source().
- * Asserting handle_press() with a hand-built BounceUiInput would pass against a
- * keyboard that delivered nothing, which is the mistake that let the original control
- * stay dead.
- */
-static int verify_fps_field_editing(void)
-{
-    BounceAppFlow flow;
-    unsigned int digit;
-    int bad = 0;
 
-    (void)printf("FPS-FIELD open, type, backspace, commit, cancel, reject\n");
-
-    /* EVERY DIGIT REACHES THE FIELD AS A DISTINCT INPUT. */
-    for (digit = 0u; digit <= 9u; digit++) {
-        const BounceUiInput mapped
-            = app_ui_input_from_source(
-                (BounceInputSource)(BOUNCE_INPUT_SOURCE_NUM0 + (int)digit));
-
-        if (mapped != (BounceUiInput)(BOUNCE_UI_INPUT_DIGIT0 + (int)digit)) {
-            fprintf(stderr,
-                    "fps-field: digit %u maps to %d, expected %d\n",
-                    digit, (int)mapped,
-                    (int)(BOUNCE_UI_INPUT_DIGIT0 + (int)digit));
-            ++bad;
-        }
-    }
-    if (app_ui_input_from_source(BOUNCE_INPUT_SOURCE_BACKSPACE)
-            != BOUNCE_UI_INPUT_BACKSPACE) {
-        fprintf(stderr, "fps-field: Backspace does not map to a text input\n");
-        ++bad;
-    }
-
-    /* SELECT OPENS THE FIELD, SEEDED WITH THE CURRENT VALUE. */
-    bounce_app_flow_init(&flow);
-    flow.state = BOUNCE_APP_STATE_SETTINGS;
-    flow.settings.page = BOUNCE_SETTINGS_PAGE_DISPLAY;
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || !bounce_app_flow_settings_fps_edit_active(&flow)) {
-        fprintf(stderr, "fps-field: SELECT did not open the editor\n");
-        ++bad;
-    } else if (strcmp(bounce_app_flow_settings_fps_edit_text(&flow),
-                      "25") != 0) {
-        fprintf(stderr,
-                "fps-field: the field opened as \"%s\", expected the current 25\n",
-                bounce_app_flow_settings_fps_edit_text(&flow));
-        ++bad;
-    }
-
-    /* BACKSPACE TWICE AND TYPE 37: THE HEADLINE CASE FROM THE BRIEF. */
-    if (bounce_ui_shell_handle_press(
-            &flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(
-            &flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || strcmp(bounce_app_flow_settings_fps_edit_text(&flow), "") != 0) {
-        fprintf(stderr, "fps-field: two backspaces did not empty the field\n");
-        ++bad;
-    }
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT3) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT7) != 0
-        || strcmp(bounce_app_flow_settings_fps_edit_text(&flow), "37") != 0) {
-        fprintf(stderr,
-                "fps-field: typing 37 produced \"%s\"\n",
-                bounce_app_flow_settings_fps_edit_text(&flow));
-        ++bad;
-    }
-    /* THE APPLIED VALUE IS UNTOUCHED WHILE THE EDIT IS LIVE. */
-    if (bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_DEFAULT) {
-        fprintf(stderr,
-                "fps-field: the applied value changed mid-edit to %u\n",
-                bounce_app_flow_settings_fps(&flow));
-        ++bad;
-    }
-    /* COMMIT. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_app_flow_settings_fps_edit_active(&flow)
-        || bounce_app_flow_settings_fps(&flow) != 37u) {
-        fprintf(stderr,
-                "fps-field: committing 37 left the flow at %u\n",
-                bounce_app_flow_settings_fps(&flow));
-        ++bad;
-    }
-
-    /* CANCEL LEAVES THE VALUE ALONE.
-     *
-     * The pending edit below is a value that WOULD have committed -- "45" -- because
-     * an earlier version of this block typed a single 9, making "259", and then
-     * asserted that SELECT closed the field. SELECT correctly REFUSED it as out of
-     * range and left the field open, so the assertion was describing a rejection as
-     * a commit. Cancel is now tested on a pending edit that is actually valid, which
-     * is the case that distinguishes "cancel discards" from "cancel did nothing". */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || !bounce_app_flow_settings_fps_edit_active(&flow)
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT4) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT5) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK) != 0
-        || bounce_app_flow_settings_fps_edit_active(&flow)
-        || bounce_app_flow_settings_fps(&flow) != 37u) {
-        fprintf(stderr, "fps-field: cancel did not discard the edit\n");
-        ++bad;
-    }
-
-    /* BACK CANCELS TOO, WITHOUT LEAVING THE PAGE. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT1) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT2) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK) != 0
-        || bounce_app_flow_settings_fps_edit_active(&flow)
-        || bounce_app_flow_settings_fps(&flow) != 37u
-        || bounce_app_flow_settings_page(&flow)
-            != BOUNCE_SETTINGS_PAGE_DISPLAY) {
-        fprintf(stderr,
-                "fps-field: Back did not cancel the edit in place\n");
-        ++bad;
-    }
-
-    /* BOTH ENDS OF THE RANGE ARE ACCEPTED. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT1) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT0) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_MIN) {
-        fprintf(stderr,
-                "fps-field: 10 did not commit, flow holds %u\n",
-                bounce_app_flow_settings_fps(&flow));
-        ++bad;
-    }
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT6) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT0) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_MAX) {
-        fprintf(stderr,
-                "fps-field: 60 did not commit, flow holds %u\n",
-                bounce_app_flow_settings_fps(&flow));
-        ++bad;
-    }
-
-    /* OUT OF RANGE IS REFUSED, AND THE PREVIOUS VALUE SURVIVES. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT9) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT9) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT9) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0) {
-        fprintf(stderr, "fps-field: could not build the 999 case\n");
-        ++bad;
-    }
-    /* A refused entry KEEPS THE FIELD OPEN, with the text still in it. */
-    if (!bounce_app_flow_settings_fps_edit_active(&flow)) {
-        fprintf(stderr,
-                "fps-field: a refused value closed the field instead of"
-                " keeping it open\n");
-        ++bad;
-    }
-    if (bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_MAX) {
-        fprintf(stderr,
-                "fps-field: 999 was accepted, flow holds %u\n",
-                bounce_app_flow_settings_fps(&flow));
-        ++bad;
-    }
-    /* Backspacing out of it and committing 45 recovers. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT4) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT5) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_app_flow_settings_fps(&flow) != 45u) {
-        fprintf(stderr,
-                "fps-field: could not recover from the rejected entry\n");
-        ++bad;
-    }
-
-    /* A SINGLE DIGIT IS NOT A LEGAL FPS AND IS REFUSED THE SAME WAY. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT5) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_app_flow_settings_fps(&flow) != 45u) {
-        fprintf(stderr,
-                "fps-field: a single digit was committed as %u\n",
-                bounce_app_flow_settings_fps(&flow));
-        ++bad;
-    }
-    (void)bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK);
-
-    /* A FOURTH DIGIT IS REFUSED RATHER THAN SILENTLY DROPPED. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT1) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT2) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT3) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT4) != 0
-        || strcmp(bounce_app_flow_settings_fps_edit_text(&flow), "123") != 0) {
-        fprintf(stderr,
-                "fps-field: a fourth digit was accepted, buffer is \"%s\"\n",
-                bounce_app_flow_settings_fps_edit_text(&flow));
-        ++bad;
-    }
-    (void)bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK);
-
-    /* AN EMPTY FIELD IS NEITHER AN ERROR NOR A VALUE: it stays open. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || !bounce_app_flow_settings_fps_edit_active(&flow)) {
-        fprintf(stderr,
-                "fps-field: committing an empty field closed the editor\n");
-        ++bad;
-    }
-    (void)bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK);
-
-    /* DIGITS ARE INERT WITH NO EDIT LIVE, SO NAVIGATION IS UNCHANGED ELSEWHERE. */
-    flow.settings.page = BOUNCE_SETTINGS_PAGE_AUDIO;
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT5) != 0
-        || bounce_app_flow_settings_fps_edit_active(&flow)
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_app_flow_settings_fps_edit_active(&flow)) {
-        fprintf(stderr,
-                "fps-field: a digit or SELECT opened the editor on the Audio"
-                " page\n");
-        ++bad;
-    }
-    /* LEFT/RIGHT no longer step the FPS at all. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_LEFT) != 0) {
-        ++bad;
-    }
-
-    (void)printf("  all_digits_mapped=yes opens_seeded=yes backspace=yes"
-                 " commit=yes cancel=yes both_bounds=yes out_of_range_refused=yes"
-                 " empty_stays_open=yes inert_without_edit=yes no_stepping=%s %s\n",
-                 bad == 0 ? "yes" : "NO", bad == 0 ? "PASS" : "FAIL");
-    return bad == 0 ? 0 : -1;
-}
-
-/*
- * BL-005 -- A COMMITTED FPS REACHES THE STORE AND COMES BACK AFTER A RESTART.
- *
- * Split out from verify_fps_range_normalization() because that block is about the
- * RANGE, and this is about the new editable field: nothing until now could produce a
- * value that was not a multiple of ten, so "restore an arbitrary valid FPS" was not
- * reachable from the UI and could not be claimed.
- */
-static int verify_fps_field_persistence(void)
-{
-    BounceAppFlow flow;
-    BounceApp app;
-    int bad = 0;
-
-    (void)printf("FPS-FIELD-PERSISTENCE a typed value survives a restart\n");
-
-    bounce_app_flow_init(&flow);
-    flow.state = BOUNCE_APP_STATE_SETTINGS;
-    flow.settings.page = BOUNCE_SETTINGS_PAGE_DISPLAY;
-
-    /* TYPE 37 AND COMMIT, EXACTLY AS A PLAYER WOULD. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT3) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT7) != 0
-        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || bounce_app_flow_settings_fps(&flow) != 37u) {
-        fprintf(stderr, "fps-field-persistence: could not commit 37\n");
-        return -1;
-    }
-
-    if (bounce_persistence_save_fps(37) != 0) {
-        fprintf(stderr, "fps-field-persistence: save_fps(37) failed\n");
-        return -1;
-    }
-
-    /* A RESTART: a fresh app, restored the way launch does it. */
-    memset(&app, 0, sizeof app);
-    bounce_app_flow_init(&app.flow);
-    app_restore_persisted_settings(&app);
-    if (bounce_app_flow_settings_fps(&app.flow) != 37u) {
-        fprintf(stderr,
-                "fps-field-persistence: restart restored %u, expected 37\n",
-                bounce_app_flow_settings_fps(&app.flow));
-        ++bad;
-    }
-
-    /* AND THE RESTORED VALUE IS EDITABLE AGAIN, SEEDED FROM ITSELF. */
-    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
-        || !bounce_app_flow_settings_fps_edit_active(&flow)
-        || strcmp(bounce_app_flow_settings_fps_edit_text(&flow), "37") != 0) {
-        fprintf(stderr,
-                "fps-field-persistence: the field did not reopen seeded from"
-                " the restored value\n");
-        ++bad;
-    }
-    (void)bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK);
-
-    (void)bounce_persistence_save_fps((int32_t)BOUNCE_FPS_DEFAULT);
-
-    (void)printf("  typed_37=yes saved=yes restored=yes reopen_seeded=%s %s\n",
-                 bad == 0 ? "yes" : "NO", bad == 0 ? "PASS" : "FAIL");
-    return bad == 0 ? 0 : -1;
-}
 
 /*
  * BL-004 -- THE PEAK COUNTERS RESET CLEANLY, SO A MEASUREMENT IS ABOUT ONE CASE.
@@ -22870,118 +22134,6 @@ static int verify_audio_peak_reset_determinism(void)
     return bad == 0 ? 0 : -1;
 }
 
-/* Defined near the frame loop, far below; declared here so the pacing check can
- * measure the real function rather than restating its arithmetic. */
-static void sleep_frame_fps(unsigned int target_fps);
-
-/*
- * BL-005 PARITY FIX -- THE FRAME PACING DURATION, MEASURED.
- *
- * WHAT THIS DOES AND DOES NOT CLAIM, because the distinction is the whole point:
- *
- *  - it MEASURES sleep_frame_fps(): that the delay it requests tracks 1000/fps, and
- *    that a lower target asks for a longer wait;
- *  - it does NOT measure the achieved frame rate of the game, which would need the
- *    real frame loop, an X11 display and a compositor.
- *
- * It calls the pacing function directly instead of standing in for the loop, so the
- * production loop is not driven, re-timed or otherwise disturbed by a test. The 25 Hz
- * simulation tick is a separate mechanism entirely -- TICK-CADENCE measures it, by
- * counting simulation ticks per elapsed millisecond -- and nothing here touches it.
- * Keeping the two apart is deliberate: the earlier state of this feature had a test
- * named for cadence that said nothing about the frame rate, which is the confusion
- * this block is written to avoid.
- *
- * THE UPPER BOUND IS GENEROUS ON PURPOSE. nanosleep is a REQUEST: it sleeps at least
- * the requested duration and is free to overshoot, and how much depends on kernel
- * timer slack and machine load. Asserting a tight upper bound would make the suite
- * fail on a loaded CI box for a reason that has nothing to do with the code. The
- * lower bound is the part that is exact, and it is the direction that matters: the
- * pacing must never deliver frames FASTER than the target the player chose, because
- * that would mean the setting is not being honoured.
- */
-static int verify_frame_pacing_duration(void)
-{
-    static const unsigned int targets[3] = { 10u, 25u, 60u };
-    int64_t measured_ms[3];
-    unsigned int i;
-    int bad = 0;
-
-    (void)printf("FRAME-PACING requested delay tracks 1000/fps\n");
-
-    for (i = 0u; i < 3u; ++i) {
-        const unsigned int iterations = 3u;
-        const int64_t expected_ms = 1000 / (int64_t)targets[i];
-        int64_t started;
-        int64_t elapsed;
-        unsigned int n;
-
-        started = monotonic_milliseconds();
-        for (n = 0u; n < iterations; ++n)
-            sleep_frame_fps(targets[i]);
-        elapsed = monotonic_milliseconds() - started;
-        measured_ms[i] = elapsed / (int64_t)iterations;
-
-        if (measured_ms[i] < expected_ms) {
-            fprintf(stderr,
-                    "frame-pacing: %u fps slept %lld ms per frame, FASTER than"
-                    " the %lld ms the target asks for\n",
-                    targets[i], (long long)measured_ms[i],
-                    (long long)expected_ms);
-            ++bad;
-        }
-        if (measured_ms[i] > expected_ms * 2) {
-            fprintf(stderr,
-                    "frame-pacing: %u fps slept %lld ms per frame, more than"
-                    " double the %lld ms requested\n",
-                    targets[i], (long long)measured_ms[i],
-                    (long long)expected_ms);
-            ++bad;
-        }
-    }
-
-    /*
-     * AND THE ORDERING IS RIGHT: a smaller target must ask for a longer wait. This
-     * catches a regression that made every target sleep the same fixed amount, which
-     * the per-target bounds above would each accept on their own.
-     */
-    if (!(measured_ms[0] > measured_ms[1] && measured_ms[1] > measured_ms[2])) {
-        fprintf(stderr,
-                "frame-pacing: measured %lld/%lld/%lld ms for 10/25/60 fps,"
-                " which is not decreasing\n",
-                (long long)measured_ms[0], (long long)measured_ms[1],
-                (long long)measured_ms[2]);
-        ++bad;
-    }
-
-    /*
-     * ZERO FALLS BACK TO THE DEFAULT RATHER THAN DIVIDING BY IT, which is the same
-     * guard sleep_frame_fps() documents and the only way a zero can reach it.
-     */
-    {
-        const int64_t expected_ms = 1000 / (int64_t)BOUNCE_FPS_DEFAULT;
-        int64_t started;
-        int64_t elapsed;
-
-        started = monotonic_milliseconds();
-        sleep_frame_fps(0u);
-        elapsed = monotonic_milliseconds() - started;
-        if (elapsed < expected_ms || elapsed > expected_ms * 2) {
-            fprintf(stderr,
-                    "frame-pacing: 0 slept %lld ms, expected the %u fps default"
-                    " of about %lld ms\n",
-                    (long long)elapsed, BOUNCE_FPS_DEFAULT,
-                    (long long)expected_ms);
-            ++bad;
-        }
-    }
-
-    (void)printf("  10fps=%lldms 25fps=%lldms 60fps=%lldms"
-                 " never_faster_than_target=yes zero_uses_default=yes %s\n",
-                 (long long)measured_ms[0], (long long)measured_ms[1],
-                 (long long)measured_ms[2], bad == 0 ? "PASS" : "FAIL");
-    return bad == 0 ? 0 : -1;
-}
 
 /*
  * NATIVE EXTENSION verification for the temporary UI color profiles.
@@ -28136,8 +27288,6 @@ static int x11_dispatch_event(
         bool t9_before;
         /* BL-004: sampled before the UI press, to detect a volume change. */
         unsigned int volume_before;
-        /* BL-005: sampled before the UI press, to detect an FPS change. */
-        unsigned int fps_before;
         /*
          * STEP CONTINUE-RETURN: sampled before the UI press, so the arrival at the main
          * menu can be told apart from a press made while already there. See the refresh
@@ -28670,12 +27820,6 @@ static int x11_dispatch_event(
                  */
                 volume_before = bounce_app_flow_settings_volume(&app->flow);
                 /*
-                 * BL-005 -- and the FPS setting, sampled at the same point
-                 * for the same reason: only a real change (LEFT/RIGHT on the
-                 * FPS row) commits, and navigation writes nothing.
-                 */
-                fps_before = bounce_app_flow_settings_fps(&app->flow);
-                /*
                  * STEP CONTINUE-RETURN -- AND THE MAIN MENU ARRIVAL IS SAMPLED TOO.
                  * bounce_app_flow_enter_menu() resets the menu, so this flag has to be
                  * re-derived on every arrival rather than only the two that already were.
@@ -28708,11 +27852,6 @@ static int x11_dispatch_event(
                  * for the same reason.
                  */
                 app_commit_volume_change(app, volume_before);
-                /*
-                 * BL-005 -- and the FPS setting, committed on the same edge
-                 * for the same reason.
-                 */
-                app_commit_fps_change(app, fps_before);
                 /*
                  * STEP CONTINUE-RETURN -- RE-DERIVE CONTINUE ON EVERY ARRIVAL AT THE
                  * MAIN MENU. THIS IS THE FIX.
@@ -33067,22 +32206,12 @@ static void present_to_x11(
         render_trace_presentation(context->render_trace);
 }
 
-static void sleep_frame_fps(unsigned int target_fps)
+static void sleep_frame(void)
 {
     struct timespec duration;
     duration.tv_sec = 0;
-    if (target_fps == 0)
-        target_fps = BOUNCE_FPS_DEFAULT;
-    duration.tv_nsec = (1000L * 1000L * 1000L) / target_fps;
-    duration.tv_sec = 0;
+    duration.tv_nsec = 16L * 1000L * 1000L;
     (void)nanosleep(&duration, NULL);
-}
-
-/* sleep_frame is now a wrapper; kept for compatibility but unused in production. */
-static void sleep_frame(void) __attribute__((unused));
-static void sleep_frame(void)
-{
-    sleep_frame_fps(BOUNCE_FPS_DEFAULT);
 }
 
 static void print_usage(const char *program)
@@ -37944,24 +37073,6 @@ int main(int argc, char **argv)
             "volume zero persistence verification failed\n");
         goto cleanup;
     }
-    if (verify_fps_range_normalization() != 0) {
-        fprintf(
-            stderr,
-            "fps range normalization verification failed\n");
-        goto cleanup;
-    }
-    if (verify_display_fps_row_is_painted() != 0) {
-        fprintf(
-            stderr,
-            "display fps row verification failed\n");
-        goto cleanup;
-    }
-    if (verify_frame_pacing_duration() != 0) {
-        fprintf(
-            stderr,
-            "frame pacing verification failed\n");
-        goto cleanup;
-    }
     if (verify_audio_peak_reset_determinism() != 0) {
         fprintf(
             stderr,
@@ -37978,18 +37089,6 @@ int main(int argc, char **argv)
         fprintf(
             stderr,
             "volume slider pointer verification failed\n");
-        goto cleanup;
-    }
-    if (verify_fps_field_editing() != 0) {
-        fprintf(
-            stderr,
-            "fps field editing verification failed\n");
-        goto cleanup;
-    }
-    if (verify_fps_field_persistence() != 0) {
-        fprintf(
-            stderr,
-            "fps field persistence verification failed\n");
         goto cleanup;
     }
     if (verify_native_extension_ui() != 0) {
@@ -38595,7 +37694,7 @@ int main(int argc, char **argv)
          * rather than the frame rate.
          */
         (void)bounce_debug_tracker_observe(app.debug_tracker, &app);
-        sleep_frame_fps(bounce_app_flow_settings_fps(&app.flow));
+        sleep_frame();
     }
     /*
      * Final read-out so a short interactive run still leaves a state record

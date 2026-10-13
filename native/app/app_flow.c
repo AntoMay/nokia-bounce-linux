@@ -72,41 +72,6 @@ static void bounce_app_flow_reset_settings(BounceSettingsState *settings)
     settings->audio_enabled = true;
     /* BL-004. Default 100: matches the reference mod's mVolume = 100. */
     settings->volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
-    /*
-     * BL-005 PARITY FIX. Default 25: matches the reference mod's mFps = 25
-     * (BounceUI.java:89).
-     *
-     * THIS FIELD WAS NEVER INITIALISED HERE, and it was only ever safe by luck.
-     * The live path always called app_restore_persisted_settings(), whose loader
-     * substitutes BOUNCE_FPS_DEFAULT for an absent record, so a launched game got
-     * a legal value; but any flow built without that restore -- every verifier
-     * that memsets a BounceApp and calls this -- was left holding whatever the
-     * memory happened to contain. With the default changed from 60 to 25 that
-     * became observable rather than merely untidy, and verify_fps_range_
-     * normalization() is what caught it.
-     *
-     * It is stated beside the volume default rather than hidden because both are
-     * the same kind of thing: a setting whose shipped default has to exist before
-     * any store is read.
-     */
-    settings->target_fps = BOUNCE_FPS_DEFAULT;
-    /*
-     * BL-005 -- AND THE EDIT BUFFER STARTS INACTIVE AND EMPTY.
-     *
-     * This is the same omission as target_fps above, and it was found the same way:
-     * the field-editing tests build a BounceAppFlow on the stack and initialise only
-     * through this function, so `fps_edit_active` held whatever was on the stack. When
-     * it happened to read as true, the very first branch of
-     * bounce_ui_shell_handle_press() took the editing path and SWALLOWED LEFT and
-     * RIGHT, which looked exactly like the volume control being dead again -- on a
-     * page that has nothing to do with the FPS field.
-     *
-     * An edit is a mode, and a mode must be entered deliberately. It is initialised
-     * here for the same reason `page` and `selected_index` are.
-     */
-    settings->fps_edit_active = false;
-    settings->fps_edit_len = 0u;
-    settings->fps_edit_digits[0] = '\0';
     /* NATIVE ADDITION: the keypad is off until a player asks for it. */
     /*
      * STEP 38-RESET. ON, not off -- the keypad default is a product decision, and
@@ -139,7 +104,6 @@ static void bounce_app_flow_reset_settings_navigation(
     unsigned int applied_theme;
     bool audio_enabled;
     bool t9_input_enabled;
-    unsigned int target_fps;
 
     if (settings == NULL)
         return;
@@ -147,13 +111,11 @@ static void bounce_app_flow_reset_settings_navigation(
     applied_theme = settings->applied_theme_index;
     audio_enabled = settings->audio_enabled;
     t9_input_enabled = settings->t9_input_enabled;
-    target_fps = settings->target_fps;
     bounce_app_flow_reset_settings(settings);
     settings->applied_language_index = applied;
     settings->applied_theme_index = applied_theme;
     settings->audio_enabled = audio_enabled;
     settings->t9_input_enabled = t9_input_enabled;
-    settings->target_fps = target_fps;
 }
 
 static void bounce_app_flow_reset_gameplay_entry(BounceGameplayEntry *entry)
@@ -760,210 +722,6 @@ int bounce_app_flow_restore_persisted_volume(
     return 0;
 }
 
-/*
- * BL-005 -- read the current target FPS, 10..180 inclusive.
- *
- * Returns BOUNCE_FPS_DEFAULT for a NULL flow, so a caller with no
- * shell attached behaves as "60 FPS" and the pre-existing path is
- * preserved.
- */
-unsigned int bounce_app_flow_settings_fps(
-    const BounceAppFlow *flow
-)
-{
-    if (flow == NULL)
-        return BOUNCE_FPS_DEFAULT;
-    return flow->settings.target_fps;
-}
-
-/*
- * BL-005 -- THE FPS TEXT ENTRY. See the block on these functions in app_flow.h for
- * why the buffer is separate from target_fps and why commit refuses rather than
- * clamps.
- */
-
-/* The buffer is three ASCII digits plus a NUL; see the field's comment. */
-enum { BOUNCE_FPS_EDIT_MAX_DIGITS = 3 };
-
-static void fps_edit_clear(BounceAppFlow *flow)
-{
-    flow->settings.fps_edit_len = 0u;
-    flow->settings.fps_edit_digits[0] = '\0';
-}
-
-bool bounce_app_flow_settings_fps_edit_active(const BounceAppFlow *flow)
-{
-    if (flow == NULL)
-        return false;
-    return flow->settings.fps_edit_active;
-}
-
-int bounce_app_flow_settings_fps_edit_begin(BounceAppFlow *flow)
-{
-    unsigned int value;
-    unsigned int length = 0u;
-
-    if (flow == NULL)
-        return -1;
-    /*
-     * SEEDED FROM THE APPLIED VALUE, so the field is never born empty and never
-     * born out of range. The player edits an existing number rather than typing a
-     * new one from nothing, which is also what the reference does: its TextField is
-     * constructed with String.valueOf(this.mFps) (BounceUI.java:552).
-     */
-    value = flow->settings.target_fps;
-    if (value < BOUNCE_FPS_MIN)
-        value = BOUNCE_FPS_MIN;
-    if (value > BOUNCE_FPS_MAX)
-        value = BOUNCE_FPS_MAX;
-    {
-        char digits[12];
-        int written = snprintf(digits, sizeof digits, "%u", value);
-
-        if (written <= 0 || (unsigned int)written >= sizeof digits)
-            return -1;
-        while (length < (unsigned int)written
-            && length < BOUNCE_FPS_EDIT_MAX_DIGITS) {
-            flow->settings.fps_edit_digits[length]
-                = digits[length];
-            length++;
-        }
-    }
-    flow->settings.fps_edit_len = length;
-    flow->settings.fps_edit_digits[flow->settings.fps_edit_len] = '\0';
-    flow->settings.fps_edit_active = true;
-    return 0;
-}
-
-int bounce_app_flow_settings_fps_edit_digit(
-    BounceAppFlow *flow,
-    unsigned int digit
-)
-{
-    if (flow == NULL)
-        return -1;
-    /*
-     * REFUSED UNLESS AN EDIT IS LIVE, so digits typed on some other Settings page --
-     * or while gameplay has focus -- cannot open a field behind the player's back.
-     * The same guard is what keeps digit keys from being swallowed by navigation:
-     * this is only reachable because the caller already established focus.
-     */
-    if (!flow->settings.fps_edit_active)
-        return -1;
-    if (digit > 9u)
-        return -1;
-    /*
-     * A THIRD DIGIT IS REFUSED, NOT SILENTLY SWALLOWED. Two digits are the whole
-     * legal range (10..60), so a third cannot produce a legal value; refusing it
-     * keeps the buffer honest instead of letting it hold something that will only be
-     * rejected at commit with a message about a number the player cannot see.
-     */
-    if (flow->settings.fps_edit_len >= BOUNCE_FPS_EDIT_MAX_DIGITS)
-        return -1;
-    flow->settings.fps_edit_digits[flow->settings.fps_edit_len]
-        = (char)('0' + (int)digit);
-    flow->settings.fps_edit_len++;
-    flow->settings.fps_edit_digits[flow->settings.fps_edit_len] = '\0';
-    return 0;
-}
-
-int bounce_app_flow_settings_fps_edit_backspace(BounceAppFlow *flow)
-{
-    if (flow == NULL)
-        return -1;
-    if (!flow->settings.fps_edit_active)
-        return -1;
-    if (flow->settings.fps_edit_len == 0u)
-        return 0; /* Nothing to delete; not an error, and not a state change. */
-    flow->settings.fps_edit_len--;
-    flow->settings.fps_edit_digits[flow->settings.fps_edit_len] = '\0';
-    return 0;
-}
-
-int bounce_app_flow_settings_fps_edit_commit(BounceAppFlow *flow)
-{
-    unsigned int value = 0u;
-    unsigned int i;
-
-    if (flow == NULL)
-        return -1;
-    if (!flow->settings.fps_edit_active)
-        return -1;
-    /*
-     * AN EMPTY FIELD COMMITS NOTHING AND IS NOT AN ERROR. The player has simply not
-     * finished typing. Leaving target_fps alone and staying in the field is the
-     * honest answer; the alternative -- committing the previous value and closing --
-     * would look like the field had accepted what was typed.
-     */
-    if (flow->settings.fps_edit_len == 0u)
-        return 0;
-    for (i = 0u; i < flow->settings.fps_edit_len; ++i) {
-        const char c = flow->settings.fps_edit_digits[i];
-
-        /*
-         * EVERY CHARACTER IS CHECKED, not just the first. The buffer is only ever
-         * written through bounce_app_flow_settings_fps_edit_digit(), which refuses
-         * anything above 9, but a parse that did not re-check would turn a corrupted
-         * buffer into a silently wrong FPS rather than a refusal.
-         */
-        if (c < '0' || c > '9')
-            return -1;
-        value = value * 10u + (unsigned int)(c - '0');
-        /* Saturate rather than wrap: 999 digits must not roll over to a legal value. */
-        if (value > BOUNCE_FPS_MAX * 10u)
-            return -1;
-    }
-    if (value < BOUNCE_FPS_MIN || value > BOUNCE_FPS_MAX)
-        return -1;
-    flow->settings.target_fps = value;
-    flow->settings.fps_edit_active = false;
-    fps_edit_clear(flow);
-    return 0;
-}
-
-int bounce_app_flow_settings_fps_edit_cancel(BounceAppFlow *flow)
-{
-    if (flow == NULL)
-        return -1;
-    if (!flow->settings.fps_edit_active)
-        return 0;
-    flow->settings.fps_edit_active = false;
-    fps_edit_clear(flow);
-    return 0;
-}
-
-const char *bounce_app_flow_settings_fps_edit_text(const BounceAppFlow *flow)
-{
-    if (flow == NULL)
-        return "";
-    return flow->settings.fps_edit_digits;
-}
-
-/*
- * BL-005 -- apply a persisted FPS setting at launch.
- *
- * This mirrors bounce_app_flow_restore_persisted_volume(), which exists for the
- * same reason: the store has to be read BEFORE the first frame, not after it,
- * or the player sees the default for one frame and then watches it change.
- *
- * It sets the APPLIED value, not the highlight. Only a stored value in the
- * range 10..180 is honoured -- anything absent or out of range leaves the flow
- * at its default of 60, so a store written before this feature existed reads
- * correctly untouched.
- */
-int bounce_app_flow_restore_persisted_fps(
-    BounceAppFlow *flow,
-    unsigned int fps
-)
-{
-    if (flow == NULL)
-        return -1;
-    if (fps < BOUNCE_FPS_MIN || fps > BOUNCE_FPS_MAX)
-        return -1;
-    flow->settings.target_fps = fps;
-    return 0;
-}
-
 bool bounce_app_flow_settings_audio_enabled(
     const BounceAppFlow *flow
 )
@@ -995,12 +753,6 @@ unsigned int bounce_app_flow_settings_list_count(const BounceAppFlow *flow)
      */
     if (flow->settings.page == BOUNCE_SETTINGS_PAGE_AUDIO)
         return BOUNCE_SETTINGS_AUDIO_VALUE_COUNT;
-    /*
-     * BL-005 -- the Display page now has an FPS control. It uses the same
-     * highlight-and-SELECT shape as the Audio and Input pages.
-     */
-    if (flow->settings.page == BOUNCE_SETTINGS_PAGE_DISPLAY)
-        return BOUNCE_SETTINGS_DISPLAY_VALUE_COUNT;
     /*
      * NATIVE ADDITION. The Input page used to report no rows and was a read-only
      * fact table, so UP, DOWN and SELECT on it all returned 0. It now offers the
@@ -1097,7 +849,6 @@ int bounce_app_flow_reset_to_default(BounceAppFlow *flow)
     flow->settings.audio_enabled = BOUNCE_DEFAULT_AUDIO_ENABLED;
     flow->settings.volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
     flow->settings.t9_input_enabled = BOUNCE_DEFAULT_T9_INPUT_ENABLED;
-    flow->settings.target_fps = BOUNCE_FPS_DEFAULT;
     flow->settings.applied_language_index = BOUNCE_DEFAULT_LANGUAGE_INDEX;
     flow->settings.language_index = 0u;
 
@@ -1175,10 +926,7 @@ int bounce_app_flow_settings_select(BounceAppFlow *flow)
          * below would have made SELECT on it switch audio OFF, because
          * ROW_VOLUME is not ROW_ON and the comparison has only one true answer.
          *
-         * THAT IS NOT A NEW RULE. The Display page's FPS row returns early for
-         * precisely this reason, and its comment below already says it mirrors this
-         * row; the Audio branch was the one that had not caught up. An out-of-range
-         * index is still refused by the guard above, unchanged.
+         * An out-of-range index is still refused by the guard above, unchanged.
          */
         if (flow->settings.selected_index >= count)
             return -1;
@@ -1198,18 +946,6 @@ int bounce_app_flow_settings_select(BounceAppFlow *flow)
             return -1;
         flow->settings.t9_input_enabled
             = (flow->settings.selected_index == BOUNCE_SETTINGS_T9_ROW_ON);
-        return 0;
-    }
-    if (flow->settings.page == BOUNCE_SETTINGS_PAGE_DISPLAY) {
-        /*
-         * BL-005 -- the Display page has one row for the FPS control. SELECT on the
-         * FPS row is a no-op because the FPS is adjusted with LEFT/RIGHT, not SELECT.
-         * This mirrors the Audio page's volume row behavior.
-         */
-        if (flow->settings.selected_index >= count)
-            return -1;
-        if (flow->settings.selected_index == BOUNCE_SETTINGS_DISPLAY_ROW_FPS)
-            return 0;
         return 0;
     }
     /*

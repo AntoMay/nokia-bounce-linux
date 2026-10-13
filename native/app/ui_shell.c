@@ -2098,30 +2098,6 @@ int bounce_ui_shell_handle_click(
             return 0;
         }
         /*
-         * BL-005 -- AND THE DISPLAY PAGE TO FOCUS ITS FPS FIELD.
-         *
-         * Clicking the value focuses it, and clicking it AGAIN commits the edit that
-         * the keyboard already offers, so a pointer user gets both halves of the
-         * field without inventing a separate confirm convention for the mouse.
-         */
-        if (bounce_app_flow_settings_page(flow) == BOUNCE_SETTINGS_PAGE_DISPLAY) {
-            if (x >= 12 && x < 116
-                && y >= BOUNCE_UI_DISPLAY_FPS_LABEL_Y - 2
-                && y <= BOUNCE_UI_DISPLAY_FPS_VALUE_Y + 7) {
-                if (bounce_app_flow_settings_fps_edit_active(flow)) {
-                    return bounce_ui_shell_handle_press(
-                               flow, BOUNCE_UI_INPUT_SELECT) == 0
-                        ? 1
-                        : 0;
-                }
-                return bounce_ui_shell_handle_press(
-                           flow, BOUNCE_UI_INPUT_SELECT) == 0
-                    ? 1
-                    : 0;
-            }
-            return 0;
-        }
-        /*
          * BL-004 -- AND THE INPUT PAGE, whose keypad row was equally unreachable.
          * Same two-step rule as every other settings list, and no more than that.
          */
@@ -2408,51 +2384,6 @@ int bounce_ui_shell_handle_press(
         return 0;
     }
     if (flow->state == BOUNCE_APP_STATE_SETTINGS) {
-        /*
-         * BL-005 -- THE FPS EDIT OWNS THE KEYBOARD WHILE IT IS LIVE.
-         *
-         * THIS IS FIRST, BEFORE EVERY OTHER SETTINGS BRANCH, and that ordering is
-         * the whole requirement. A digit key arriving during an edit must reach the
-         * field and nothing else: if the generic UP/DOWN/SELECT/BACK handling ran
-         * first, a digit would fall through it as BOUNCE_UI_INPUT_OTHER, and --
-         * worse -- a press that the field does not want would still be consumed
-         * here and so could never reach the game either. Digits are only a text-entry
-         * input while an edit is live; on every other screen they stay BOUNCE_UI_INPUT_OTHER
-         * and are routed exactly as before, so nothing about global navigation or the
-         * keypad game controls changes.
-         */
-        if (bounce_app_flow_settings_fps_edit_active(flow)) {
-            if (input >= BOUNCE_UI_INPUT_DIGIT0
-                && input <= BOUNCE_UI_INPUT_DIGIT9) {
-                (void)bounce_app_flow_settings_fps_edit_digit(
-                    flow, (unsigned int)(input - BOUNCE_UI_INPUT_DIGIT0));
-                return 0;
-            }
-            if (input == BOUNCE_UI_INPUT_BACKSPACE) {
-                (void)bounce_app_flow_settings_fps_edit_backspace(flow);
-                return 0;
-            }
-            if (input == BOUNCE_UI_INPUT_SELECT) {
-                /*
-                 * COMMIT, AND LEAVE THE FIELD ON SUCCESS. A rejected entry -- empty,
-                 * or out of range -- leaves the field open with the typed text still
-                 * in it, so the player can correct it rather than losing what they
-                 * typed to a one-line refusal.
-                 */
-                if (bounce_app_flow_settings_fps_edit_commit(flow) == 0
-                    && !bounce_app_flow_settings_fps_edit_active(flow)) {
-                    return 0;
-                }
-                return 0;
-            }
-            if (input == BOUNCE_UI_INPUT_BACK
-                || input == BOUNCE_UI_INPUT_EXIT) {
-                (void)bounce_app_flow_settings_fps_edit_cancel(flow);
-                return 0;
-            }
-            /* LEFT/RIGHT and UP/DOWN are not part of a text field; ignore them. */
-            return 0;
-        }
         /* NATIVE EXTENSION destination. */
         if (input == BOUNCE_UI_INPUT_LEFT
             || input == BOUNCE_UI_INPUT_RIGHT) {
@@ -2485,39 +2416,11 @@ int bounce_ui_shell_handle_press(
                 flow->settings.volume = volume;
                 return 0;
             }
-            /*
-             * BL-005 -- AND LEFT/RIGHT NO LONGER STEP THE FPS.
-             *
-             * They used to, by BOUNCE_SETTINGS_FPS_STEP, which offered exactly six
-             * values -- 10, 20, 30, 40, 50, 60 -- and no other FPS could ever be
-             * reached. The reference has the player TYPE the number into a two-digit
-             * numeric TextField (BounceUI.java:552); the step was never a reference
-             * behaviour, it was a stand-in for one, and a stand-in that silently
-             * excluded 37 is the thing this change removes.
-             *
-             * LEFT/RIGHT are still live keys -- they drive the volume slider on the
-             * Audio page above -- so they are simply not bound here. The absence is
-             * deliberate rather than an oversight, and it is why BOUNCE_SETTINGS_FPS_STEP
-             * is no longer used by any UI code path.
-             */
             return 0;
         }
         if (input == BOUNCE_UI_INPUT_UP
             || input == BOUNCE_UI_INPUT_DOWN
             || input == BOUNCE_UI_INPUT_SELECT) {
-            /*
-             * BL-005 -- SELECT ON THE DISPLAY ROW OPENS THE FIELD.
-             *
-             * It is handled here rather than in the flow's select function because
-             * entering an edit is a UI concern, not a change to the setting:
-             * bounce_app_flow_settings_select() deliberately does nothing on the
-             * Display page, and widening it to write target_fps would put a value
-             * change in the flow on a path every settings caller shares.
-             */
-            if (input == BOUNCE_UI_INPUT_SELECT
-                && bounce_app_flow_settings_page(flow)
-                    == BOUNCE_SETTINGS_PAGE_DISPLAY)
-                return bounce_app_flow_settings_fps_edit_begin(flow);
             /*
              * Display, Input, and Audio are deliberately read-only fact pages and
              * report no navigable list. A press there is a legal no-op, not a
@@ -3338,18 +3241,12 @@ const uint32_t back = ui->accent;
         }
     } else if (bounce_app_flow_settings_page(flow)
                == BOUNCE_SETTINGS_PAGE_DISPLAY) {
-        const uint32_t fps_row_color
-            = (bounce_app_flow_settings_selected_index(flow)
-                   == BOUNCE_SETTINGS_DISPLAY_ROW_FPS)
-                  ? selected_text
-                  : text;
-        char fps_text[8];
         /*
-         * Only the presentation concepts this build actually supports, drawn with
-         * draw_native_size because it uses the real digit font.
+         * Only the presentation concepts this build actually supports.
+         * The numbers are drawn with the real digit font because the placeholder
+         * letter font has no digit glyphs; embedding them in a string would
+         * render the unknown-glyph box instead.
          */
-        (void)snprintf(fps_text, sizeof(fps_text), "%u",
-                       bounce_app_flow_settings_fps(flow));
         if (draw_placeholder_text(
                 renderer, 14, 24, tr(BOUNCE_LOCALE_LOGICAL_RESOLUTION), muted) != 0
             || draw_native_size(renderer, 22, 34, 128, 128, text) != 0
@@ -3360,81 +3257,6 @@ const uint32_t back = ui->accent;
                 renderer, 14, 76, tr(BOUNCE_LOCALE_UI_HUD_REGION), muted) != 0
             || draw_native_size(renderer, 22, 86, 128, 32, text) != 0)
             return -1;
-        /*
-         * BL-005 PARITY FIX -- AND THE FPS CONTROL, WHICH WAS ADJUSTABLE AND
-         * COMPLETELY INVISIBLE.
-         *
-         * The row existed: BOUNCE_SETTINGS_DISPLAY_ROW_FPS was selectable, LEFT and
-         * RIGHT moved it, it was persisted as record 7 and restored at launch, and
-         * sleep_frame_fps() spent it every frame. Nothing drew it. The page rendered
-         * three size facts and stopped, so a player could press LEFT/RIGHT on a
-         * screen that did not change and had no way to tell what the value was --
-         * or even that the setting was there. A setting that cannot be seen cannot
-         * be verified, which is why BOUNCE_LOCALE_TARGET_FPS existed in all five
-         * languages and was never painted, and why the glyphs its strings needed
-         * were missing until the font was regenerated.
-         *
-         * THE LABEL IS WRAPPED, NOT CLIPPED. lang.th-TH's string is 14 clusters,
-         * about 154 px at the Thai advance, on a 128 px surface, and it has no
-         * space to break on. draw_centered_placeholder_wrapped() is the helper this
-         * shell already uses for exactly that case: it splits at a cluster boundary
-         * and draws the second line 10 px down, so no language loses characters and
-         * no renderer error is raised. The renderer clips silently, so a plain
-         * draw_placeholder_text() here would have quietly hidden most of the Thai
-         * label rather than failing.
-         *
-         * NO NEW LOCALE STRING. BOUNCE_LOCALE_TARGET_FPS is already carried in all
-         * five languages and already means this row; the value is drawn as bare
-         * digits because the label beside it already names the unit.
-         *
-         * THE BAND IS TALLER THAN A ROW BAND ON PURPOSE. The Audio and Input pages
-         * highlight 13 px because a row is one line of glyphs. This control is a
-         * label plus a value that may occupy two lines in Thai, and a 13 px band
-         * would highlight a fraction of what the player is selecting.
-         */
-        if (bounce_app_flow_settings_selected_index(flow)
-                == BOUNCE_SETTINGS_DISPLAY_ROW_FPS
-            && bounce_renderer_fill_rect(renderer, 12,
-                    BOUNCE_UI_DISPLAY_FPS_BAND_Y,
-                    BOUNCE_UI_DISPLAY_FPS_BAND_WIDTH,
-                    BOUNCE_UI_DISPLAY_FPS_BAND_HEIGHT, highlight) != 0)
-            return -1;
-        if (draw_centered_placeholder_wrapped(renderer,
-                BOUNCE_UI_DISPLAY_FPS_LABEL_Y,
-                tr(BOUNCE_LOCALE_TARGET_FPS), fps_row_color) != 0
-            || draw_centered_placeholder_text(renderer,
-                   BOUNCE_UI_DISPLAY_FPS_VALUE_Y, fps_text, fps_row_color) != 0)
-            return -1;
-        /*
-         * BL-005 -- THE FIELD SHOWS WHAT IS TYPED, NOT WHAT IS APPLIED, WHILE AN EDIT
-         * IS LIVE, AND SAYS WHICH IS WHICH.
-         *
-         * Drawing the applied value during an edit would be a lie: the player is
-         * looking at a half-typed "3" and the screen would read "25", so they would
-         * have no way of knowing what had been accepted. The typed buffer replaces
-         * the value, and the caret underneath marks it as the line being written.
-         *
-         * THE CARET IS A LINE BECAUSE THE FONT HAS NO BLINKING CURSOR. Drawing one
-         * unconditionally would be indistinguishable from a character; drawing it
-         * only while editing is what makes the two states readable at a glance, and
-         * it costs one fill_rect. There is no blink because nothing in this shell
-         * animates the UI, and adding an animation to make a cursor cursor would be
-         * a larger change than the field itself.
-         */
-        if (bounce_app_flow_settings_fps_edit_active(flow)) {
-            char edit_text[4];
-
-            (void)snprintf(edit_text, sizeof edit_text, "%s",
-                           bounce_app_flow_settings_fps_edit_text(flow));
-            if (draw_centered_placeholder_text(renderer,
-                    BOUNCE_UI_DISPLAY_FPS_VALUE_Y, edit_text,
-                    selected_text) != 0)
-                return -1;
-            if (bounce_renderer_fill_rect(renderer, 60,
-                    BOUNCE_UI_DISPLAY_FPS_VALUE_Y + 8,
-                    8, 1, back) != 0)
-                return -1;
-        }
     } else if (bounce_app_flow_settings_page(flow)
                == BOUNCE_SETTINGS_PAGE_INPUT) {
         /*

@@ -757,8 +757,7 @@ static int write_container(const BouncePersistenceRecords *records12,
     const BouncePersistenceRecord3 *record3, bool have_record3,
     int32_t theme, bool have_theme,
     int32_t t9, bool have_t9,
-    int32_t volume, bool have_volume,
-    int32_t fps, bool have_fps)
+    int32_t volume, bool have_volume)
 {
     static unsigned char payload[BOUNCE_PERSISTENCE_MAX_FILE_SIZE];
     static unsigned char container[BOUNCE_PERSISTENCE_MAX_FILE_SIZE];
@@ -873,24 +872,6 @@ static int write_container(const BouncePersistenceRecords *records12,
         used += 4u;
     }
 
-    if (have_fps) {
-        /*
-         * BL-005 -- record 7, the target render FPS setting. One u32 in range 10..180,
-         * same shape as records 1, 2, 4, 5, and 6.
-         */
-        if (fps < (int32_t)BOUNCE_FPS_MIN)
-            return -1;
-        if ((uint32_t)fps > BOUNCE_FPS_MAX)
-            return -1;
-        if (used + 4u > (uint32_t)sizeof payload)
-            return -1;
-        put_u32(payload + used, (uint32_t)fps);
-        ids[count] = BOUNCE_PERSISTENCE_RECORD_FPS;
-        offsets[count] = used;
-        lengths[count] = 4u;
-        ++count;
-        used += 4u;
-    }
 
     /*
      * Insertion sort the directory by ascending record id. At most seven entries,
@@ -1087,7 +1068,7 @@ int bounce_persistence_save_t9_enabled(int32_t enabled)
     if (bounce_persistence_load_theme_index(&theme) != 0)
         theme = 0;
     ok = write_container(
-        &records12, &record3, have_record3, theme, true, ok_value, true, 0, false, 0, false) == 0;
+        &records12, &record3, have_record3, theme, true, ok_value, true, 0, false) == 0;
     return ok ? 0 : -1;
 }
 
@@ -1181,108 +1162,10 @@ int bounce_persistence_save_volume(int32_t volume)
     if (bounce_persistence_load_t9_enabled(&t9) != 0)
         t9 = 0;
     ok = write_container(
-        &records12, &record3, have_record3, theme, true, t9, true, volume, true, 0, false) == 0;
+        &records12, &record3, have_record3, theme, true, t9, true, volume, true) == 0;
     return ok ? 0 : -1;
 }
 
-/*
- * BL-005 -- NATIVE ADDITION. Read the target render FPS setting, 10..180 inclusive.
- *
- * Returns 0 whenever the answer is well-defined, including "there is no
- * such record", which means the default 60. Returns -1 only for a NULL
- * argument. Same contract as the theme/volume loaders.
- */
-int bounce_persistence_load_fps(int32_t *out_fps)
-{
-    static unsigned char bytes[BOUNCE_PERSISTENCE_MAX_FILE_SIZE];
-    const unsigned char *payload = NULL;
-    uint32_t payload_size = 0u;
-    uint32_t size = 0u;
-    uint32_t version = 0u;
-
-    if (out_fps == NULL)
-        return -1;
-
-    /* The default, applied before anything can fail. 60 = smooth rendering. */
-    *out_fps = BOUNCE_FPS_DEFAULT;
-
-    if (read_container(bytes, (uint32_t)sizeof bytes, &size, &version) != 0)
-        return 0;
-    if (version == BOUNCE_PERSISTENCE_VERSION)
-        return 0; /* A version-1 file has no record 7, correctly absent. */
-    if (version != BOUNCE_PERSISTENCE_VERSION2)
-        return 0; /* Forward rejection. */
-    if (!container_find_record(
-            bytes,
-            size,
-            BOUNCE_PERSISTENCE_RECORD_FPS,
-            &payload,
-            &payload_size))
-        return 0;
-    if (payload_size != 4u)
-        return 0;
-    if (get_u32(payload) > (uint32_t)INT32_MAX)
-        return 0;
-    *out_fps = (int32_t)get_u32(payload);
-    /* Clamp to valid range. */
-    if ((uint32_t)*out_fps > BOUNCE_FPS_MAX)
-        *out_fps = (int32_t)BOUNCE_FPS_MAX;
-    if (*out_fps < (int32_t)BOUNCE_FPS_MIN)
-        *out_fps = (int32_t)BOUNCE_FPS_MIN;
-    return 0;
-}
-
-/*
- * BL-005 -- NATIVE ADDITION. Write the target render FPS setting as record 7,
- * preserving records 1, 2, 3, 4, 5 AND 6. Every writer in this module owns one
- * record and must leave the others alone, so an FPS change cannot reset the
- * theme, keypad, or volume settings.
- *
- * RECORD 4, 5 AND 6 ARE READ BACK AND REWRITTEN, and that is the whole point of
- * doing this as a read-modify-write rather than a partial update. Every writer
- * in this module owns exactly one record and must leave the others alone: a
- * menu Exit snapshots the session, a level completion updates the two scalars,
- * a theme change replaces the profile, a keypad change replaces the flag, a
- * volume change replaces the gain, and an FPS change replaces the target FPS.
- * If any of them rewrote the container from only the records it knows, every
- * one of the other five would silently reset. A partial update must never cost
- * the player a snapshot, a profile, a setting, a volume, or an FPS target.
- *
- * A failure here is never fatal, exactly as for every other write in this
- * module: Java's WriteToStore() swallows its IOException
- * (BounceGame.java:413-414).
- */
-int bounce_persistence_save_fps(int32_t fps)
-{
-    BouncePersistenceRecords records12;
-    BouncePersistenceRecord3 record3;
-    bool have_record3 = false;
-    int32_t theme = 0;
-    int32_t t9 = 0;
-    int32_t volume = 0;
-    bool ok;
-
-    /* Clamp to valid range. */
-    if (fps < (int32_t)BOUNCE_FPS_MIN)
-        fps = (int32_t)BOUNCE_FPS_MIN;
-    if ((uint32_t)fps > BOUNCE_FPS_MAX)
-        fps = (int32_t)BOUNCE_FPS_MAX;
-
-    if (bounce_persistence_load(&records12) != 0) {
-        records12.max_levels = 0;
-        records12.high_score = 0;
-    }
-    (void)bounce_persistence_load_record3(&record3, &have_record3);
-    if (bounce_persistence_load_theme_index(&theme) != 0)
-        theme = 0;
-    if (bounce_persistence_load_t9_enabled(&t9) != 0)
-        t9 = 0;
-    if (bounce_persistence_load_volume(&volume) != 0)
-        volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
-    ok = write_container(
-        &records12, &record3, have_record3, theme, true, t9, true, volume, true, fps, true) == 0;
-    return ok ? 0 : -1;
-}
 
 int bounce_persistence_save_theme_index(int32_t index)
 {
@@ -1318,7 +1201,7 @@ int bounce_persistence_save_theme_index(int32_t index)
     if (bounce_persistence_load_volume(&volume) != 0)
         volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
     ok = write_container(
-        &records12, &record3, have_record3, index, true, t9, true, volume, true, 0, false) == 0;
+        &records12, &record3, have_record3, index, true, t9, true, volume, true) == 0;
     return ok ? 0 : -1;
 }
 
@@ -1363,13 +1246,8 @@ int bounce_persistence_save_record3(const BouncePersistenceRecord3 *in)
     bool have_volume = bounce_persistence_load_volume(&volume) == 0 && volume != 0;
     if (!have_volume)
         volume = 0;
-    /* BL-005 -- also read and preserve the FPS setting. */
-    int32_t fps = 0;
-    bool have_fps = bounce_persistence_load_fps(&fps) == 0 && fps != 0;
-    if (!have_fps)
-        fps = 0;
     return write_container(
-        &records12, in, true, theme, true, t9, have_t9, volume, have_volume, fps, have_fps);
+        &records12, in, true, theme, true, t9, have_t9, volume, have_volume);
 }
 
 /*
@@ -1421,14 +1299,9 @@ int bounce_persistence_delete_record3(void)
     have_volume = bounce_persistence_load_volume(&volume) == 0 && volume != 0;
     if (!have_volume)
         volume = 0;
-    /* BL-005 -- also read and preserve the FPS setting. */
-    int32_t fps = 0;
-    bool have_fps = bounce_persistence_load_fps(&fps) == 0 && fps != 0;
-    if (!have_fps)
-        fps = 0;
     /* have_record3 == false: the record is omitted from the directory entirely. */
     return write_container(
-        &records12, NULL, false, theme, true, t9, have_t9, volume, have_volume, fps, have_fps);
+        &records12, NULL, false, theme, true, t9, have_t9, volume, have_volume);
 }
 
 int bounce_persistence_save_records_12_preserving_record3(
@@ -1480,13 +1353,8 @@ int bounce_persistence_save_records_12_preserving_record3(
     bool have_volume = bounce_persistence_load_volume(&volume) == 0 && volume != 0;
     if (!have_volume)
         volume = 0;
-    /* BL-005 -- record 7 (FPS) rides along too. */
-    int32_t fps = 0;
-    bool have_fps = bounce_persistence_load_fps(&fps) == 0 && fps != 0;
-    if (!have_fps)
-        fps = 0;
     return write_container(
-        in, &existing, present, theme, have_theme, t9, have_t9, volume, have_volume, fps, have_fps);
+        in, &existing, present, theme, have_theme, t9, have_t9, volume, have_volume);
 }
 
 int bounce_persistence_save(const BouncePersistenceRecords *in)

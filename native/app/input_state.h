@@ -159,24 +159,7 @@ typedef enum BounceInputSource {
     BOUNCE_INPUT_SOURCE_KP_UP_LEFT = 31,
     BOUNCE_INPUT_SOURCE_KP_UP_RIGHT = 32,
     BOUNCE_INPUT_SOURCE_KP_DOWN_LEFT = 33,
-    BOUNCE_INPUT_SOURCE_KP_DOWN_RIGHT = 34,
-    /*
-     * BL-005 -- TEXT-EDITING KEYS, FOR THE FPS FIELD.
-     *
-     * APPENDED LAST so no existing enumerator value moves, which is the same rule
-     * BOUNCE_INPUT_SOURCE_HASH states for itself: this header's values are mirrored
-     * by name, not stored, so reordering would still be a gratuitous risk.
-     *
-     * BACKSPACE IS THE ONLY NEW SOURCE. The digits are NOT: BOUNCE_INPUT_SOURCE_NUM0
-     * through NUM9 already exist at 8..17, produced from the top-row digits, and
-     * reusing them is what keeps a digit key meaning one thing in the whole program.
-     *
-     * This source carries no keypad meaning and is never held as a game control --
-     * it exists to be read once, as an edge, by the field that is being edited.
-     * That is why it does not appear in BounceInputState: there is no held state
-     * for a keystroke that only means "delete the last character".
-     */
-    BOUNCE_INPUT_SOURCE_BACKSPACE = 35
+    BOUNCE_INPUT_SOURCE_KP_DOWN_RIGHT = 34
 } BounceInputSource;
 
 typedef struct BounceInputState {

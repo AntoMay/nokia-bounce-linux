@@ -386,57 +386,6 @@ typedef struct BounceSettingsState {
      */
     unsigned int volume;
     /*
-     * BL-005 -- NATIVE ADDITION. The target render FPS, 10..180 inclusive.
-     *
-     * The reference mod (BounceUI.java:89, :552) exposes an FPS value 10-60
-     * with a default of 25, stored in settings RMS. The native system extends
-     * this range to 10-180 for rendering FPS, while keeping the simulation
-     * timestep fixed at 40ms (25 Hz) to preserve gameplay behavior.
-     *
-     * THE VALUE IS THE APPLIED ONE, exactly as audio_enabled is:
-     * `selected_index` is only the highlight on the Display page and means nothing
-     * until SELECT is pressed. The FPS is applied to the render loop when
-     * SELECT confirms a new value.
-     *
-     * IT IS PERSISTED, like the keypad setting, because a player who changes
-     * the FPS has asked for it to stay changed. It rides the same
-     * version-2 container as the keypad setting, as record 7; see
-     * persistence.h.
-     *
-     * DEFAULT IS 60 FPS for rendering, providing smooth visuals on modern
-     * displays while keeping the simulation at the original 25 Hz.
-     */
-    unsigned int target_fps;
-    /*
-     * ===================================================================
-     * BL-005 -- THE EDIT BUFFER BEHIND THE FPS FIELD.
-     * ===================================================================
-     *
-     * THIS IS WHAT MAKES THE FIELD EDITABLE RATHER THAN STEPPABLE. LEFT and RIGHT
-     * moved the value in tens and stopped there: 10, 20, 30, 40, 50, 60, and no
-     * other value could ever be reached. The reference lets the player TYPE an FPS
-     * into a two-digit numeric TextField (BounceUI.java:552), which is the whole
-     * reason the reference's clamp is written as "if it parses, keep it between 10
-     * and 60" (:296-303) rather than as a step. An editable field needs somewhere to
-     * hold what has been typed before it is a legal value, and that cannot be
-     * target_fps: half-typed input like "1" is not a legal FPS and must not be
-     * written to the setting, or leaving the field would commit a broken value.
-     *
-     * So the buffer is separate, and target_fps only ever changes on COMMIT. That is
-     * also what makes Backspace meaningful and cancel safe: the applied value is
-     * untouched until the edit is accepted.
-     *
-     * fps_edit_digits holds ASCII digits with an explicit length rather than being
-     * NUL-terminated mid-edit, so an empty field is representable and a partially
-     * filled one never has to be padded. It is three bytes because the reference
-     * field is two digits (maxSize=2) and 100 would overflow the range anyway; the
-     * third byte leaves room to type a third digit and then reject it on commit
-     * rather than silently ignoring the keystroke.
-     */
-    bool fps_edit_active;
-    unsigned int fps_edit_len;
-    char fps_edit_digits[4];
-    /*
      * BL-005 -- NATIVE ADDITION. The reset-to-default flag.
      *
      * WHY IT LIVES HERE AND NOT IN THE RESULT. bounce_app_flow_settings_select() only
@@ -866,53 +815,6 @@ unsigned int bounce_app_flow_level_selection_selected_index(
  */
 #define BOUNCE_PERSISTENCE_RECORD_VOLUME 6u
 
-/*
- * BL-005 -- NATIVE ADDITION. The FPS setting range.
- *
- * THE RANGE AND THE DEFAULT ARE NOW THE REFERENCE'S, and the earlier values were
- * not. They used to read
- *
- *     The native system extends this range to 10-180 for rendering FPS ...
- *     DEFAULT IS 60 FPS for rendering, providing smooth visuals on modern displays
- *
- * which is an assertion about what this project wanted, not about what LKT Pro
- * does. The reference clamps a typed value to 10..60 and defaults it to 25
- * (BounceUI.java:296-306, :89), and the 180 upper bound had no source behind it at
- * all. A parity target is taken from the reference, so 10..60 and 25 are what a
- * stored or default value now means, and an existing player who somehow has 120
- * persisted lands on 60 through the loader's clamp rather than keeping a value
- * outside the contract.
- *
- * WHAT IS STILL NATIVE, AND IS NOT PARITY. The reference applies this number as the
- * period of the one TimerTask whose body both steps the simulation and repaints
- * (GameTimer.java:16-25 -> TileCanvas.timerTrigger() -> BounceCanvas.run()), with no
- * delta-time compensation anywhere -- so there, raising the FPS also raises the
- * game's speed. This build keeps the simulation on its own fixed 40 ms / 25 Hz tick
- * (BOUNCE_GAME_TIMER_PERIOD_MS) and applies the setting to RENDER PACING ONLY. That
- * decoupling is a deliberate, documented deviation; see sleep_frame_fps() in
- * vertical_slice.c. It is why a value in this range cannot be called full parity
- * with the reference, and why the setting must never be described as one.
- *
- * The simulation tick is gameplay and is not changed by that decision.
- */
-#define BOUNCE_FPS_MIN 10u
-#define BOUNCE_FPS_MAX 60u
-#define BOUNCE_FPS_DEFAULT 25u
-
-/*
- * BL-005 -- NATIVE ADDITION. The Display page has one row for the FPS control.
- * SELECT on the FPS row is a no-op; the FPS is adjusted with LEFT/RIGHT.
- *
- * BOUNCE_SETTINGS_FPS_STEP divides BOUNCE_FPS_MIN..BOUNCE_FPS_MAX exactly, so the
- * value is always on a stop: 10, 20, 30, 40, 50, 60. The reference lets the player
- * TYPE any number (a two-digit numeric TextField, BounceUI.java:552) and clamps
- * the result to the same 10..60, so the native control offers fewer stops than the
- * reference does. That is a deliberate consequence of having no text entry on a
- * keypad-driven shell, not a claim that ten is what the reference produces.
- */
-#define BOUNCE_SETTINGS_FPS_STEP 10u
-#define BOUNCE_SETTINGS_DISPLAY_VALUE_COUNT 1u
-#define BOUNCE_SETTINGS_DISPLAY_ROW_FPS 0u
 
 /*
  * STEP 34-F-K. Whether gameplay audio events should be delivered to the audio
@@ -1041,79 +943,6 @@ int bounce_app_flow_restore_persisted_volume(
     unsigned int volume
 );
 
-/*
- * BL-005 -- read the current target FPS, 10..180 inclusive.
- *
- * Returns BOUNCE_FPS_DEFAULT for a NULL flow, so a caller with no
- * shell attached behaves as "60 FPS" and the pre-existing path is
- * preserved.
- */
-unsigned int bounce_app_flow_settings_fps(
-    const BounceAppFlow *flow
-);
-
-/*
- * ===================================================================
- * BL-005 -- EDITING THE FPS FIELD, WHICH IS A TEXT ENTRY AND NOT A STEPPER.
- * ===================================================================
- *
- * The five verbs below are the whole interface. SELECT on the Display row starts an
- * edit; digits and Backspace change it; SELECT again commits; BACK cancels. Nothing
- * writes target_fps except commit, which is what makes cancel correct.
- *
- * NO VALID VALUE IS GUESSED. An empty field, a field that does not parse, and a value
- * outside BOUNCE_FPS_MIN..BOUNCE_FPS_MAX are all refused by commit, which leaves the
- * previous value in place and reports failure -- it never clamps a rejected entry into
- * the setting. That differs from the reference, which clamps a parsed value into
- * range (BounceUI.java:297-302); here the clamp lives on the value the field SEEDED,
- * so a player who types 999 is told it is wrong rather than silently given 60. The
- * seed itself is already in range by construction, because it starts from the
- * current target_fps.
- *
- * digit is 0..9 and is REFUSED otherwise, so a caller that forwards an arbitrary
- * input value cannot write a non-digit into the buffer.
- */
-bool bounce_app_flow_settings_fps_edit_active(const BounceAppFlow *flow);
-
-/* Start editing, seeding the buffer with the current FPS as decimal digits. */
-int bounce_app_flow_settings_fps_edit_begin(BounceAppFlow *flow);
-
-/* Append one decimal digit. Refuses a digit above 9, and refuses to grow past 3. */
-int bounce_app_flow_settings_fps_edit_digit(BounceAppFlow *flow, unsigned int digit);
-
-/* Delete the last typed digit. Succeeds on an already-empty buffer (a no-op). */
-int bounce_app_flow_settings_fps_edit_backspace(BounceAppFlow *flow);
-
-/* Commit: parse, range-check, write target_fps, and leave edit mode. */
-int bounce_app_flow_settings_fps_edit_commit(BounceAppFlow *flow);
-
-/* Abandon the edit. target_fps is not touched. Always succeeds on a live edit. */
-int bounce_app_flow_settings_fps_edit_cancel(BounceAppFlow *flow);
-
-/*
- * What the field should display while editing: the digits typed so far, or the empty
- * string when nothing has been typed. Never NULL. Only meaningful while
- * bounce_app_flow_settings_fps_edit_active() is true; otherwise the applied value is
- * what is shown.
- */
-const char *bounce_app_flow_settings_fps_edit_text(const BounceAppFlow *flow);
-
-/*
- * BL-005 -- apply a persisted FPS setting at launch.
- *
- * This mirrors bounce_app_flow_restore_persisted_volume(), which exists for the
- * same reason: the store has to be read BEFORE the first frame, not after it,
- * or the player sees the default for one frame and then watches it change.
- *
- * It sets the APPLIED value, not the highlight. Only a stored value in the
- * range 10..180 is honoured -- anything absent or out of range leaves the flow
- * at its default of 60, so a store written before this feature existed reads
- * correctly untouched.
- */
-int bounce_app_flow_restore_persisted_fps(
-    BounceAppFlow *flow,
-    unsigned int fps
-);
 
 /*
  * STEP 12X-P4-C-D-B-R2: consume the one-shot New Game intent.

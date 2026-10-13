@@ -126,12 +126,6 @@ typedef enum BounceLocaleKey {
      * but the native UI uses a row label instead.
      */
     BOUNCE_LOCALE_VOLUME,
-    /*
-     * BL-005 -- the target FPS label on the Display settings page.
-     * NATIVE ADDITION: the reference mod has a TextField for FPS, but the
-     * native UI uses a row label instead.
-     */
-    BOUNCE_LOCALE_TARGET_FPS,
     BOUNCE_LOCALE_NOT_YET_IMPLEMENTED,
     BOUNCE_LOCALE_NO_AUDIO_PATH_YET,
     /* Settings > Language. */
