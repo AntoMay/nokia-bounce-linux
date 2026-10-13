@@ -82,6 +82,14 @@ struct BounceAudioPlayer {
 
     /* Counters, all guarded by `mutex`. */
     BounceAudioPlayerStats stats;
+
+    /*
+     * BL-004 -- the volume, 0..100 inclusive. Written by the gameplay thread
+     * through bounce_audio_player_set_volume(), read by the worker at render
+     * time. A single unsigned int write is atomic on every supported
+     * platform, so no lock is needed for the volume itself.
+     */
+    unsigned int volume;
 };
 
 /* Identity -> cached song index. Mirrors audio_synth's mapping exactly. */
@@ -319,7 +327,39 @@ static void *bounce_audio_player_worker(void *argument)
                                                 player->slot_frames, &frames)
                         == BOUNCE_SYNTH_OK);
             if (rendered) {
-                /* MAY BLOCK. This is the only place a device is touched. */
+                /*
+                 * BL-004 -- apply the volume gain.
+                 *
+                 * The reference mod applies volume at playback time via
+                 * VolumeControl.setLevel() (BounceCanvas.java:667-669).
+                 * The native backend has no gain control, so the gain is
+                 * applied here, after rendering and before writing.
+                 *
+                 * The gain factor is volume/100, so:
+                 *   volume 0   -> all samples become 0 (silence)
+                 *   volume 100 -> samples unchanged (full gain)
+                 *   volume 50  -> samples halved
+                 *
+                 * The multiplication is done in double precision to avoid
+                 * integer overflow, then clamped to int16_t range. The
+                 * volume is read here, after dequeuing, so a change takes
+                 * effect on the next rendered sound.
+                 */
+                if (player->volume < BOUNCE_AUDIO_VOLUME_MAX) {
+                    const double gain
+                        = (double)player->volume
+                          / (double)BOUNCE_AUDIO_VOLUME_MAX;
+                    size_t i;
+                    for (i = 0u; i < frames; i++) {
+                        double scaled = (double)slot->pcm[i] * gain;
+                        if (scaled > 32767.0) {
+                            scaled = 32767.0;
+                        } else if (scaled < -32768.0) {
+                            scaled = -32768.0;
+                        }
+                        slot->pcm[i] = (int16_t)scaled;
+                    }
+                }
                 written = (player->backend.write_pcm(&player->backend, slot->pcm,
                                                      frames)
                            == BOUNCE_AUDIO_BACKEND_OK);
@@ -372,6 +412,7 @@ BounceAudioPlayer *bounce_audio_player_create(
     player->requested = config->backend;
     player->shutdown = config->shutdown;
     player->drain_timeout_ms = config->drain_timeout_ms;
+    player->volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
     bounce_synth_default_config(&player->synth);
     bounce_audio_backend_default_format(&player->format);
 
@@ -508,6 +549,29 @@ int bounce_audio_player_stats(BounceAudioPlayer *player,
     *out = player->stats;
     (void)pthread_mutex_unlock(&player->mutex);
     return 1;
+}
+
+int bounce_audio_player_set_volume(BounceAudioPlayer *player,
+                                   unsigned int volume)
+{
+    if (player == NULL) {
+        return -1;
+    }
+    /* Clamp, never wrap: a user-facing control must not produce an
+     * out-of-range value by arithmetic. */
+    if (volume > BOUNCE_AUDIO_VOLUME_MAX) {
+        volume = BOUNCE_AUDIO_VOLUME_MAX;
+    }
+    player->volume = volume;
+    return 0;
+}
+
+unsigned int bounce_audio_player_get_volume(const BounceAudioPlayer *player)
+{
+    if (player == NULL) {
+        return BOUNCE_AUDIO_VOLUME_DEFAULT;
+    }
+    return player->volume;
 }
 
 /* Absolute deadline `timeout_ms` from now, for the drain wait. */

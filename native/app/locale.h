@@ -120,6 +120,12 @@ typedef enum BounceLocaleKey {
      */
     BOUNCE_LOCALE_ON,
     BOUNCE_LOCALE_OFF,
+    /*
+     * BL-004 -- the volume control label on the Audio settings page.
+     * NATIVE ADDITION: the reference mod has a Volume Gauge in its settings,
+     * but the native UI uses a row label instead.
+     */
+    BOUNCE_LOCALE_VOLUME,
     BOUNCE_LOCALE_NOT_YET_IMPLEMENTED,
     BOUNCE_LOCALE_NO_AUDIO_PATH_YET,
     /* Settings > Language. */

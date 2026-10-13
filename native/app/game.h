@@ -650,6 +650,8 @@ typedef struct BounceGame {
     /* STEP 13E: NULL unless NBB_DEBUG selects a level. Observational only. */
     BounceDebugTracker *debug_tracker;
     int64_t next_player_tick_ms;
+    /* BL-004 -- the last persisted volume, used to detect changes and persist. */
+    unsigned int last_persisted_volume;
 } BounceGame;
 
 #define BOUNCE_GAME_LEVEL_ID_UNKNOWN 0

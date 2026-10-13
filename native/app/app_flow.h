@@ -363,27 +363,28 @@ typedef struct BounceSettingsState {
      */
     bool t9_input_enabled;
     /*
-     * STEP 38-RESET -- the one-shot "the player confirmed a reset" intent.
+     * BL-004 -- NATIVE ADDITION. The volume, 0..100 inclusive.
      *
-     * WHY IT LIVES HERE AND NOT IN THE RESULT. bounce_app_flow_settings_select() only
-     * receives a BounceAppFlow*, so it can reset flow state but it cannot touch the
-     * store: deleting Record 3 and rewriting records 1, 2, 4 and 5 is I/O, and the
-     * flow layer does no I/O anywhere. This is the same split the rest of this file
-     * already uses -- bounce_app_flow_menu_set_continue_available() records a fact
-     * and the shell acts on it, and bounce_app_flow_consume_new_game_score_reset() is
-     * a one-shot flag read and cleared by its consumer.
+     * The reference mod (BounceUI.java:90) exposes a volume value 0-100 with a
+     * default of 100, applied at playback time via VolumeControl.setLevel()
+     * (BounceCanvas.java:667-669). The native system has no volume control; this
+     * field and the accompanying API add one.
      *
-     * It is a FLAG rather than a return value because the caller cannot act on a
-     * return value: bounce_ui_shell_handle_press() collapses every settings action
-     * into "handled / not handled", so a "reset happened" signal has to survive until
-     * the shell looks for it.
+     * THE VALUE IS THE APPLIED ONE, exactly as audio_enabled is:
+     * `selected_index` is only the highlight on the Audio page and means nothing
+     * until SELECT is pressed. The volume is applied to the audio player when
+     * SELECT confirms a new value.
      *
-     * ONE-SHOT BY CONSTRUCTION. It is set only by
-     * bounce_app_flow_settings_select() on the Confirm row, and it is read only
-     * through bounce_app_flow_consume_reset_to_default(), which clears it as it
-     * reads. A stale true could therefore never carry into a later press, which
-     * matters because the consumer performs deletions.
+     * IT IS PERSISTED, like the keypad setting, because a player who changes
+     * the volume has asked for it to stay changed. It rides the same
+     * version-2 container as the keypad setting, as record 6; see
+     * persistence.h.
+     *
+     * DEFAULT IS 100, matching the reference mod's mVolume = 100. A fresh
+     * install therefore behaves exactly as it did before this feature existed:
+     * full gain.
      */
+    unsigned int volume;
     bool reset_to_default_pending;
 } BounceSettingsState;
 
@@ -727,9 +728,39 @@ unsigned int bounce_app_flow_level_selection_selected_index(
  * STEP 34-F-K -- NATIVE ADDITION. The two rows of the Audio settings page:
  * row 0 is ON, row 1 is OFF. There is no third state.
  */
-#define BOUNCE_SETTINGS_AUDIO_VALUE_COUNT 2u
+#define BOUNCE_SETTINGS_AUDIO_VALUE_COUNT 3u
 #define BOUNCE_SETTINGS_AUDIO_ROW_ON  0u
 #define BOUNCE_SETTINGS_AUDIO_ROW_OFF 1u
+#define BOUNCE_SETTINGS_AUDIO_ROW_VOLUME 2u
+
+/*
+ * BL-004 -- NATIVE ADDITION. The volume setting range, 0..100 inclusive.
+ *
+ * The reference mod (BounceUI.java:90) exposes a volume value 0-100 with a
+ * default of 100, stored in settings RMS. The native system mirrors
+ * this range and default.
+ *
+ * DEFAULT IS 100, matching the reference mod's mVolume = 100. A fresh
+ * install therefore behaves exactly as it did before this feature existed:
+ * full gain.
+ */
+#define BOUNCE_AUDIO_VOLUME_MIN 0u
+#define BOUNCE_AUDIO_VOLUME_MAX 100u
+#define BOUNCE_AUDIO_VOLUME_DEFAULT 100u
+
+/*
+ * BL-004 -- NATIVE ADDITION. The volume setting, as record 6 of the SAME
+ * container.
+ *
+ * The reference mod (BounceUI.java:607, :580) persists volume in its settings
+ * RMS record. The native system uses the same version-2 container as records
+ * 4 and 5. The payload is a single u32 with range 0..100.
+ *
+ * DEFAULT IS 100, matching the reference mod's mVolume = 100. A fresh
+ * install therefore behaves exactly as it did before this feature existed:
+ * full gain.
+ */
+#define BOUNCE_PERSISTENCE_RECORD_VOLUME 6u
 
 /*
  * STEP 34-F-K. Whether gameplay audio events should be delivered to the audio
@@ -828,6 +859,34 @@ bool bounce_app_flow_settings_t9_enabled(
 int bounce_app_flow_restore_persisted_t9(
     BounceAppFlow *flow,
     bool enabled
+);
+
+/*
+ * BL-004 -- read the current volume, 0..100 inclusive.
+ *
+ * Returns BOUNCE_AUDIO_VOLUME_DEFAULT for a NULL flow, so a caller with no
+ * shell attached behaves as "full volume" and the pre-existing path is
+ * preserved.
+ */
+unsigned int bounce_app_flow_settings_volume(
+    const BounceAppFlow *flow
+);
+
+/*
+ * BL-004 -- apply a persisted volume setting at launch.
+ *
+ * This mirrors bounce_app_flow_restore_persisted_t9(), which exists for the
+ * same reason: the store has to be read BEFORE the first frame, not after it,
+ * or the player sees the default for one frame and then watches it change.
+ *
+ * It sets the APPLIED value, not the highlight. Only a stored value in the
+ * range 0..100 is honoured -- anything absent or out of range leaves the flow
+ * at its default of 100, so a store written before this feature existed reads
+ * correctly untouched.
+ */
+int bounce_app_flow_restore_persisted_volume(
+    BounceAppFlow *flow,
+    unsigned int volume
 );
 
 /*

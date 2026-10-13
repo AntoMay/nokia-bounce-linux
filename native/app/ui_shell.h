@@ -137,7 +137,14 @@ typedef enum BounceUiInput {
     BOUNCE_UI_INPUT_DOWN = 2,
     BOUNCE_UI_INPUT_SELECT = 3,
     BOUNCE_UI_INPUT_EXIT = 4,
-    BOUNCE_UI_INPUT_BACK = 5
+    BOUNCE_UI_INPUT_BACK = 5,
+    /*
+     * BL-004 -- LEFT and RIGHT for volume adjustment on the Audio page.
+     * When the volume row is selected, LEFT decreases and RIGHT increases
+     * the volume by 10. These inputs are ignored on all other pages.
+     */
+    BOUNCE_UI_INPUT_LEFT = 6,
+    BOUNCE_UI_INPUT_RIGHT = 7
 } BounceUiInput;
 
 /*

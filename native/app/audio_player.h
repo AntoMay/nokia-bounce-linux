@@ -152,6 +152,34 @@ typedef struct BounceAudioPlayerStats {
     int accepting;
 } BounceAudioPlayerStats;
 
+/*
+ * BL-004 -- VOLUME CONTROL.
+ *
+ * The reference mod (BounceUI.java:90) exposes a volume value 0-100 with a
+ * default of 100, applied at playback time via VolumeControl.setLevel()
+ * (BounceCanvas.java:667-669). The native system has no volume control; this
+ * type and the accompanying API add one.
+ *
+ * THE VALUE IS AN INTEGER PERCENTAGE, 0..100 INCLUSIVE. It is stored as
+ * unsigned because the range is bounded and a negative value is meaningless;
+ * the setter clamps rather than wrapping, so a caller can never produce an
+ * out-of-range value by arithmetic.
+ *
+ * DEFAULT IS 100, matching the reference mod's mVolume = 100. A fresh player
+ * therefore behaves exactly as it did before this feature existed: full gain.
+ *
+ * THREAD SAFETY: the volume is read by the audio worker thread at render time
+ * and written by the gameplay thread through the setter. A single unsigned
+ * int write is atomic on every supported platform, and the value is only
+ * ever read as a whole, so no lock is needed for the volume itself. The
+ * worker reads it after dequeuing an event, so a volume change takes effect
+ * on the next rendered sound, which is the same "applies to already-playing
+ * audio" semantics the reference mod has.
+ */
+#define BOUNCE_AUDIO_VOLUME_MIN 0u
+#define BOUNCE_AUDIO_VOLUME_MAX 100u
+#define BOUNCE_AUDIO_VOLUME_DEFAULT 100u
+
 typedef struct BounceAudioPlayer BounceAudioPlayer;
 
 /* Fill `out` with the documented defaults: AUTO backend, DISCARD shutdown. */
@@ -188,6 +216,28 @@ const char *bounce_audio_player_backend_name(const BounceAudioPlayer *player);
 /* Copy the current counters under the lock. Safe with NULL. */
 int bounce_audio_player_stats(BounceAudioPlayer *player,
                               BounceAudioPlayerStats *out);
+
+/*
+ * BL-004 -- set the volume, 0..100 inclusive.
+ *
+ * Values outside the range are CLAMPED, not rejected: a caller that passes
+ * -1 or 255 gets 0 or 100 respectively, which is the safe direction for a
+ * user-facing control. The value takes effect on the next rendered sound,
+ * so a change applies to audio that is already queued or playing.
+ *
+ * Returns 0 on success, -1 for a NULL player.
+ */
+int bounce_audio_player_set_volume(BounceAudioPlayer *player,
+                                   unsigned int volume);
+
+/*
+ * BL-004 -- read the current volume, 0..100 inclusive.
+ *
+ * Returns BOUNCE_AUDIO_VOLUME_DEFAULT for a NULL player, so a caller with no
+ * player attached behaves as "full volume" and the pre-existing path is
+ * preserved.
+ */
+unsigned int bounce_audio_player_get_volume(const BounceAudioPlayer *player);
 
 /*
  * Stop accepting, wake the worker, join it, close the backend, and free

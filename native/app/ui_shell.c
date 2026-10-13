@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 /*
@@ -2180,6 +2181,29 @@ int bounce_ui_shell_handle_press(
     }
     if (flow->state == BOUNCE_APP_STATE_SETTINGS) {
         /* NATIVE EXTENSION destination. */
+        if (input == BOUNCE_UI_INPUT_LEFT
+            || input == BOUNCE_UI_INPUT_RIGHT) {
+            /*
+             * BL-004 -- LEFT/RIGHT adjusts the volume when the Audio page's
+             * volume row is selected. The step is 10, clamped to 0..100.
+             */
+            if (bounce_app_flow_settings_page(flow)
+                    == BOUNCE_SETTINGS_PAGE_AUDIO
+                && bounce_app_flow_settings_selected_index(flow)
+                    == BOUNCE_SETTINGS_AUDIO_ROW_VOLUME) {
+                unsigned int volume = bounce_app_flow_settings_volume(flow);
+                if (input == BOUNCE_UI_INPUT_LEFT) {
+                    if (volume >= 10u)
+                        volume -= 10u;
+                } else {
+                    if (volume <= 90u)
+                        volume += 10u;
+                }
+                flow->settings.volume = volume;
+                return 0;
+            }
+            return 0;
+        }
         if (input == BOUNCE_UI_INPUT_UP
             || input == BOUNCE_UI_INPUT_DOWN
             || input == BOUNCE_UI_INPUT_SELECT) {
@@ -3045,8 +3069,12 @@ const uint32_t back = ui->accent;
          * highlight-and-SELECT shape the Language and Theme pages use, drawn
          * with the same primitives; nothing new was introduced.
          *
-         * It is deliberately minimal. There is no device row, no volume, no
-         * mute, no test button, no backend report and no status line: the
+         * BL-004 -- row 2 is the volume control. It shows the current volume
+         * as a percentage and is adjusted with LEFT/RIGHT arrows. The step
+         * is 10, clamped to 0..100.
+         *
+         * It is deliberately minimal. There is no device row, no mute, no
+         * test button, no backend report and no status line: the
          * decision to keep this page at one setting is the point of the step.
          *
          * The row shows the value the user is ABOUT to choose, which is what
@@ -3059,7 +3087,8 @@ const uint32_t back = ui->accent;
         static const BounceLocaleKey value_keys[BOUNCE_SETTINGS_AUDIO_VALUE_COUNT]
             = {
                 BOUNCE_LOCALE_ON,
-                BOUNCE_LOCALE_OFF
+                BOUNCE_LOCALE_OFF,
+                BOUNCE_LOCALE_VOLUME
             };
         const unsigned int count = bounce_app_flow_settings_list_count(flow);
         const unsigned int limit
@@ -3071,6 +3100,7 @@ const uint32_t back = ui->accent;
             = bounce_app_flow_settings_audio_enabled(flow)
                   ? BOUNCE_SETTINGS_AUDIO_ROW_ON
                   : BOUNCE_SETTINGS_AUDIO_ROW_OFF;
+        const unsigned int volume = bounce_app_flow_settings_volume(flow);
         unsigned int row;
         int y;
 
@@ -3098,10 +3128,27 @@ const uint32_t back = ui->accent;
                 && bounce_renderer_fill_rect(
                         renderer, 12, y - 2, 104, 13, highlight) != 0)
                 return -1;
-            if (draw_placeholder_text(renderer, 24, y, &marker, mark_color) != 0
-                || draw_placeholder_text(
-                       renderer, 36, y, tr(value_keys[row]), row_color) != 0)
-                return -1;
+            if (row == BOUNCE_SETTINGS_AUDIO_ROW_VOLUME) {
+                /*
+                 * BL-004 -- the volume row shows the current volume as a
+                 * percentage. The volume is adjusted with LEFT/RIGHT, not
+                 * SELECT, so there is no applied marker.
+                 */
+                char volume_text[8];
+                (void)snprintf(volume_text, sizeof(volume_text), "%u%%",
+                               volume);
+                if (draw_placeholder_text(renderer, 24, y, " ", muted) != 0
+                    || draw_placeholder_text(
+                           renderer, 36, y, tr(value_keys[row]), row_color) != 0
+                    || draw_placeholder_text(
+                           renderer, 80, y, volume_text, row_color) != 0)
+                    return -1;
+            } else {
+                if (draw_placeholder_text(renderer, 24, y, &marker, mark_color) != 0
+                    || draw_placeholder_text(
+                           renderer, 36, y, tr(value_keys[row]), row_color) != 0)
+                    return -1;
+            }
         }
     } else if (bounce_app_flow_settings_page(flow)
                == BOUNCE_SETTINGS_PAGE_RESET) {

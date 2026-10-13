@@ -2463,6 +2463,14 @@ static void app_restore_persisted_settings(BounceApp *app)
         && stored_t9 != 0) {
         (void)bounce_app_flow_restore_persisted_t9(&app->flow, true);
     }
+
+    /* BL-004 -- restore the volume setting at startup. */
+    int32_t stored_volume = 0;
+    if (bounce_persistence_load_volume(&stored_volume) == 0
+        && stored_volume != 0) {
+        (void)bounce_app_flow_restore_persisted_volume(&app->flow,
+            (unsigned int)stored_volume);
+    }
 }
 
 /*
@@ -2632,6 +2640,36 @@ static void app_persist_theme(BounceApp *app)
         return;
     (void)bounce_persistence_save_theme_index(
         (int32_t)bounce_app_flow_settings_applied_theme_index(&app->flow));
+}
+
+/*
+ * BL-004 -- commit the volume if, and only if, this input changed it.
+ *
+ * The same rationale as app_commit_theme_change() applies: write on the edge
+ * that produces the change, not at shutdown.
+ */
+static void app_persist_volume(BounceApp *app)
+{
+    if (app == NULL)
+        return;
+    (void)bounce_persistence_save_volume(
+        (int32_t)bounce_app_flow_settings_volume(&app->flow));
+}
+
+/*
+ * BL-004 -- commit the volume if, and only if, this input changed it.
+ *
+ * The same rationale as app_commit_theme_change() applies: write on the edge
+ * that produces the change, not at shutdown.
+ */
+static void app_commit_volume_change(BounceApp *app, unsigned int volume_before)
+{
+    if (app == NULL)
+        return;
+    if (bounce_app_flow_settings_volume(&app->flow) == volume_before)
+        return;
+    app_persist_volume(app);
+    app->last_persisted_volume = bounce_app_flow_settings_volume(&app->flow);
 }
 
 /*
@@ -26426,6 +26464,8 @@ static int x11_dispatch_event(
         unsigned int theme_before;
         /* NATIVE ADDITION: the same sample for the keypad setting. */
         bool t9_before;
+        /* BL-004: sampled before the UI press, to detect a volume change. */
+        unsigned int volume_before;
         /*
          * STEP CONTINUE-RETURN: sampled before the UI press, so the arrival at the main
          * menu can be told apart from a press made while already there. See the refresh
@@ -26952,6 +26992,12 @@ static int x11_dispatch_event(
                  */
                 t9_before = bounce_app_flow_settings_t9_enabled(&app->flow);
                 /*
+                 * BL-004 -- and the volume setting, sampled at the same point
+                 * for the same reason: only a real change (LEFT/RIGHT on the
+                 * volume row) commits, and navigation writes nothing.
+                 */
+                volume_before = bounce_app_flow_settings_volume(&app->flow);
+                /*
                  * STEP CONTINUE-RETURN -- AND THE MAIN MENU ARRIVAL IS SAMPLED TOO.
                  * bounce_app_flow_enter_menu() resets the menu, so this flag has to be
                  * re-derived on every arrival rather than only the two that already were.
@@ -26979,6 +27025,11 @@ static int x11_dispatch_event(
                  * the same edge for the same reason.
                  */
                 app_commit_t9_change(app, t9_before);
+                /*
+                 * BL-004 -- and the volume setting, committed on the same edge
+                 * for the same reason.
+                 */
+                app_commit_volume_change(app, volume_before);
                 /*
                  * STEP CONTINUE-RETURN -- RE-DERIVE CONTINUE ON EVERY ARRIVAL AT THE
                  * MAIN MENU. THIS IS THE FIX.

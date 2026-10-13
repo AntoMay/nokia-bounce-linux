@@ -141,6 +141,20 @@ typedef struct BouncePersistenceRecords {
 #define BOUNCE_PERSISTENCE_RECORD_T9_INPUT 5u
 
 /*
+ * BL-004 -- NATIVE ADDITION. The volume setting, as record 6 of the SAME
+ * container.
+ *
+ * The reference mod (BounceUI.java:607, :580) persists volume in its settings
+ * RMS record. The native system uses the same version-2 container as records
+ * 4 and 5. The payload is a single u32 with range 0..100.
+ *
+ * DEFAULT IS 100, matching the reference mod's mVolume = 100. A fresh
+ * install therefore behaves exactly as it did before this feature existed:
+ * full gain.
+ */
+#define BOUNCE_PERSISTENCE_RECORD_VOLUME 6u
+
+/*
  * G-R3-P1 -- the fixed prefix of Java's Record 3, in bytes.
  *
  * BounceGame.java:360-379 writes, in order: a long timestamp, five bytes
@@ -392,6 +406,23 @@ int bounce_persistence_load_t9_enabled(int32_t *out_enabled);
  * keypad change cannot reset the color profile.
  */
 int bounce_persistence_save_t9_enabled(int32_t enabled);
+
+/*
+ * BL-004 -- NATIVE ADDITION. Read the volume setting, 0..100 inclusive.
+ *
+ * Returns 0 whenever the answer is well-defined, including "there is no
+ * such record", which means the default 100. Returns -1 only for a NULL
+ * argument. Same contract as the theme/T9 loaders.
+ */
+int bounce_persistence_load_volume(int32_t *out_volume);
+
+/*
+ * BL-004 -- NATIVE ADDITION. Write the volume setting as record 6, preserving
+ * records 1, 2, 3, 4 AND 5. Every writer in this module owns one record and
+ * must leave the others alone, so a volume change cannot reset the theme or
+ * keypad setting.
+ */
+int bounce_persistence_save_volume(int32_t volume);
 
 /*
  * The serialised Record 3 length for the given counts, which Java fixes at

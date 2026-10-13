@@ -69,6 +69,8 @@ static void bounce_app_flow_reset_settings(BounceSettingsState *settings)
     settings->applied_theme_index = 0u;
     /* STEP 34-F-K. Default ON: matches the pre-existing no-setting behaviour. */
     settings->audio_enabled = true;
+    /* BL-004. Default 100: matches the reference mod's mVolume = 100. */
+    settings->volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
     /* NATIVE ADDITION: the keypad is off until a player asks for it. */
     /*
      * STEP 38-RESET. ON, not off -- the keypad default is a product decision, and
@@ -678,6 +680,47 @@ bool bounce_app_flow_settings_t9_enabled(
     return flow->settings.t9_input_enabled;
 }
 
+/*
+ * BL-004 -- read the current volume, 0..100 inclusive.
+ *
+ * Returns BOUNCE_AUDIO_VOLUME_DEFAULT for a NULL flow, so a caller with no
+ * shell attached behaves as "full volume" and the pre-existing path is
+ * preserved.
+ */
+unsigned int bounce_app_flow_settings_volume(
+    const BounceAppFlow *flow
+)
+{
+    if (flow == NULL)
+        return BOUNCE_AUDIO_VOLUME_DEFAULT;
+    return flow->settings.volume;
+}
+
+/*
+ * BL-004 -- apply a persisted volume setting at launch.
+ *
+ * This mirrors bounce_app_flow_restore_persisted_t9(), which exists for the
+ * same reason: the store has to be read BEFORE the first frame, not after it,
+ * or the player sees the default for one frame and then watches it change.
+ *
+ * It sets the APPLIED value, not the highlight. Only a stored value in the
+ * range 0..100 is honoured -- anything absent or out of range leaves the flow
+ * at its default of 100, so a store written before this feature existed reads
+ * correctly untouched.
+ */
+int bounce_app_flow_restore_persisted_volume(
+    BounceAppFlow *flow,
+    unsigned int volume
+)
+{
+    if (flow == NULL)
+        return -1;
+    if (volume > BOUNCE_AUDIO_VOLUME_MAX)
+        return -1;
+    flow->settings.volume = volume;
+    return 0;
+}
+
 bool bounce_app_flow_settings_audio_enabled(
     const BounceAppFlow *flow
 )
@@ -704,8 +747,8 @@ unsigned int bounce_app_flow_settings_list_count(const BounceAppFlow *flow)
         return BOUNCE_UI_THEME_COUNT;
     /*
      * STEP 34-F-K. The Audio page is no longer a read-only fact page: it has
-     * exactly two rows, ON and OFF. It is still a single setting with no
-     * device row, no volume, no mute and no test control.
+     * exactly three rows, ON, OFF and VOLUME. It is still a single setting with no
+     * device row, no mute and no test control.
      */
     if (flow->settings.page == BOUNCE_SETTINGS_PAGE_AUDIO)
         return BOUNCE_SETTINGS_AUDIO_VALUE_COUNT;
@@ -803,6 +846,7 @@ int bounce_app_flow_reset_to_default(BounceAppFlow *flow)
      * profile the game is not using -- the same defect the restore path documents. */
     flow->settings.theme_index = 0u;
     flow->settings.audio_enabled = BOUNCE_DEFAULT_AUDIO_ENABLED;
+    flow->settings.volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
     flow->settings.t9_input_enabled = BOUNCE_DEFAULT_T9_INPUT_ENABLED;
     flow->settings.applied_language_index = BOUNCE_DEFAULT_LANGUAGE_INDEX;
     flow->settings.language_index = 0u;
