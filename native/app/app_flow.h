@@ -956,6 +956,34 @@ int bounce_app_flow_restore_persisted_volume(
 );
 
 /*
+ * BL-005 -- read the current target FPS, 10..180 inclusive.
+ *
+ * Returns BOUNCE_FPS_DEFAULT for a NULL flow, so a caller with no
+ * shell attached behaves as "60 FPS" and the pre-existing path is
+ * preserved.
+ */
+unsigned int bounce_app_flow_settings_fps(
+    const BounceAppFlow *flow
+);
+
+/*
+ * BL-005 -- apply a persisted FPS setting at launch.
+ *
+ * This mirrors bounce_app_flow_restore_persisted_volume(), which exists for the
+ * same reason: the store has to be read BEFORE the first frame, not after it,
+ * or the player sees the default for one frame and then watches it change.
+ *
+ * It sets the APPLIED value, not the highlight. Only a stored value in the
+ * range 10..180 is honoured -- anything absent or out of range leaves the flow
+ * at its default of 60, so a store written before this feature existed reads
+ * correctly untouched.
+ */
+int bounce_app_flow_restore_persisted_fps(
+    BounceAppFlow *flow,
+    unsigned int fps
+);
+
+/*
  * STEP 12X-P4-C-D-B-R2: consume the one-shot New Game intent.
  *
  * Returns the flag AND clears it in the same operation, so the reset can be applied at
