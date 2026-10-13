@@ -385,6 +385,50 @@ typedef struct BounceSettingsState {
      * full gain.
      */
     unsigned int volume;
+    /*
+     * BL-005 -- NATIVE ADDITION. The target render FPS, 10..180 inclusive.
+     *
+     * The reference mod (BounceUI.java:89, :552) exposes an FPS value 10-60
+     * with a default of 25, stored in settings RMS. The native system extends
+     * this range to 10-180 for rendering FPS, while keeping the simulation
+     * timestep fixed at 40ms (25 Hz) to preserve gameplay behavior.
+     *
+     * THE VALUE IS THE APPLIED ONE, exactly as audio_enabled is:
+     * `selected_index` is only the highlight on the Display page and means nothing
+     * until SELECT is pressed. The FPS is applied to the render loop when
+     * SELECT confirms a new value.
+     *
+     * IT IS PERSISTED, like the keypad setting, because a player who changes
+     * the FPS has asked for it to stay changed. It rides the same
+     * version-2 container as the keypad setting, as record 7; see
+     * persistence.h.
+     *
+     * DEFAULT IS 60 FPS for rendering, providing smooth visuals on modern
+     * displays while keeping the simulation at the original 25 Hz.
+     */
+    unsigned int target_fps;
+    /*
+     * BL-005 -- NATIVE ADDITION. The reset-to-default flag.
+     *
+     * WHY IT LIVES HERE AND NOT IN THE RESULT. bounce_app_flow_settings_select() only
+     * receives a BounceAppFlow*, so it can reset flow state but it cannot touch the
+     * store: deleting Record 3 and rewriting records 1, 2, 4, 5, 6 and 7 is I/O, and the
+     * flow layer does no I/O anywhere. This is the same split the rest of this file
+     * already uses -- bounce_app_flow_menu_set_continue_available() records a fact
+     * and the shell acts on it, and bounce_app_flow_consume_new_game_score_reset() is
+     * a one-shot flag read and cleared by its consumer.
+     *
+     * It is a FLAG rather than a return value because the caller cannot act on a
+     * return value: bounce_ui_shell_handle_press() collapses every settings action
+     * into "handled / not handled", so a "reset happened" signal has to survive until
+     * the shell looks for it.
+     *
+     * ONE-SHOT BY CONSTRUCTION. It is set only by
+     * bounce_app_flow_settings_select() on the Confirm row, and it is read only
+     * through bounce_app_flow_consume_reset_to_default(), which clears it as it
+     * reads. A stale true could therefore never carry into a later press, which
+     * matters because the consumer performs deletions.
+     */
     bool reset_to_default_pending;
 } BounceSettingsState;
 
@@ -761,6 +805,28 @@ unsigned int bounce_app_flow_level_selection_selected_index(
  * full gain.
  */
 #define BOUNCE_PERSISTENCE_RECORD_VOLUME 6u
+
+/*
+ * BL-005 -- NATIVE ADDITION. The FPS setting range.
+ *
+ * The reference mod (BounceUI.java:89, :552) exposes an FPS value 10-60
+ * with a default of 25, stored in settings RMS. The native system extends
+ * this range to 10-180 for rendering FPS, while keeping the simulation
+ * timestep fixed at 40ms (25 Hz) to preserve gameplay behavior.
+ *
+ * DEFAULT IS 60 FPS for rendering, providing smooth visuals on modern
+ * displays while keeping the simulation at the original 25 Hz.
+ */
+#define BOUNCE_FPS_MIN 10u
+#define BOUNCE_FPS_MAX 180u
+#define BOUNCE_FPS_DEFAULT 60u
+
+/*
+ * BL-005 -- NATIVE ADDITION. The Display page has one row for the FPS control.
+ * SELECT on the FPS row is a no-op; the FPS is adjusted with LEFT/RIGHT.
+ */
+#define BOUNCE_SETTINGS_DISPLAY_VALUE_COUNT 1u
+#define BOUNCE_SETTINGS_DISPLAY_ROW_FPS 0u
 
 /*
  * STEP 34-F-K. Whether gameplay audio events should be delivered to the audio

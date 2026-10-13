@@ -155,6 +155,20 @@ typedef struct BouncePersistenceRecords {
 #define BOUNCE_PERSISTENCE_RECORD_VOLUME 6u
 
 /*
+ * BL-005 -- NATIVE ADDITION. The target render FPS setting, as record 7 of the
+ * SAME container.
+ *
+ * The reference mod (BounceUI.java:89, :552) exposes an FPS value 10-60
+ * with a default of 25, stored in settings RMS. The native system extends
+ * this range to 10-180 for rendering FPS, while keeping the simulation
+ * timestep fixed at 40ms (25 Hz) to preserve gameplay behavior.
+ *
+ * DEFAULT IS 60 FPS for rendering, providing smooth visuals on modern
+ * displays while keeping the simulation at the original 25 Hz.
+ */
+#define BOUNCE_PERSISTENCE_RECORD_FPS 7u
+
+/*
  * G-R3-P1 -- the fixed prefix of Java's Record 3, in bytes.
  *
  * BounceGame.java:360-379 writes, in order: a long timestamp, five bytes
@@ -423,6 +437,23 @@ int bounce_persistence_load_volume(int32_t *out_volume);
  * keypad setting.
  */
 int bounce_persistence_save_volume(int32_t volume);
+
+/*
+ * BL-005 -- NATIVE ADDITION. Read the target render FPS setting, 10..180 inclusive.
+ *
+ * Returns 0 whenever the answer is well-defined, including "there is no
+ * such record", which means the default 60. Returns -1 only for a NULL
+ * argument. Same contract as the theme/volume loaders.
+ */
+int bounce_persistence_load_fps(int32_t *out_fps);
+
+/*
+ * BL-005 -- NATIVE ADDITION. Write the target render FPS setting as record 7,
+ * preserving records 1, 2, 3, 4, 5 AND 6. Every writer in this module owns one
+ * record and must leave the others alone, so an FPS change cannot reset the
+ * theme, keypad, or volume settings.
+ */
+int bounce_persistence_save_fps(int32_t fps);
 
 /*
  * The serialised Record 3 length for the given counts, which Java fixes at

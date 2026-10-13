@@ -103,6 +103,7 @@ static void bounce_app_flow_reset_settings_navigation(
     unsigned int applied_theme;
     bool audio_enabled;
     bool t9_input_enabled;
+    unsigned int target_fps;
 
     if (settings == NULL)
         return;
@@ -110,11 +111,13 @@ static void bounce_app_flow_reset_settings_navigation(
     applied_theme = settings->applied_theme_index;
     audio_enabled = settings->audio_enabled;
     t9_input_enabled = settings->t9_input_enabled;
+    target_fps = settings->target_fps;
     bounce_app_flow_reset_settings(settings);
     settings->applied_language_index = applied;
     settings->applied_theme_index = applied_theme;
     settings->audio_enabled = audio_enabled;
     settings->t9_input_enabled = t9_input_enabled;
+    settings->target_fps = target_fps;
 }
 
 static void bounce_app_flow_reset_gameplay_entry(BounceGameplayEntry *entry)
@@ -721,6 +724,47 @@ int bounce_app_flow_restore_persisted_volume(
     return 0;
 }
 
+/*
+ * BL-005 -- read the current target FPS, 10..180 inclusive.
+ *
+ * Returns BOUNCE_FPS_DEFAULT for a NULL flow, so a caller with no
+ * shell attached behaves as "60 FPS" and the pre-existing path is
+ * preserved.
+ */
+unsigned int bounce_app_flow_settings_fps(
+    const BounceAppFlow *flow
+)
+{
+    if (flow == NULL)
+        return BOUNCE_FPS_DEFAULT;
+    return flow->settings.target_fps;
+}
+
+/*
+ * BL-005 -- apply a persisted FPS setting at launch.
+ *
+ * This mirrors bounce_app_flow_restore_persisted_volume(), which exists for the
+ * same reason: the store has to be read BEFORE the first frame, not after it,
+ * or the player sees the default for one frame and then watches it change.
+ *
+ * It sets the APPLIED value, not the highlight. Only a stored value in the
+ * range 10..180 is honoured -- anything absent or out of range leaves the flow
+ * at its default of 60, so a store written before this feature existed reads
+ * correctly untouched.
+ */
+int bounce_app_flow_restore_persisted_fps(
+    BounceAppFlow *flow,
+    unsigned int fps
+)
+{
+    if (flow == NULL)
+        return -1;
+    if (fps < BOUNCE_FPS_MIN || fps > BOUNCE_FPS_MAX)
+        return -1;
+    flow->settings.target_fps = fps;
+    return 0;
+}
+
 bool bounce_app_flow_settings_audio_enabled(
     const BounceAppFlow *flow
 )
@@ -753,9 +797,15 @@ unsigned int bounce_app_flow_settings_list_count(const BounceAppFlow *flow)
     if (flow->settings.page == BOUNCE_SETTINGS_PAGE_AUDIO)
         return BOUNCE_SETTINGS_AUDIO_VALUE_COUNT;
     /*
+     * BL-005 -- the Display page now has an FPS control. It uses the same
+     * highlight-and-SELECT shape as the Audio and Input pages.
+     */
+    if (flow->settings.page == BOUNCE_SETTINGS_PAGE_DISPLAY)
+        return BOUNCE_SETTINGS_DISPLAY_VALUE_COUNT;
+    /*
      * NATIVE ADDITION. The Input page used to report no rows and was a read-only
      * fact table, so UP, DOWN and SELECT on it all returned 0. It now offers the
-     * one setting it has, in the same two-row shape as the Audio page.
+     * one setting it has, in the same shape as the Audio page.
      */
     if (flow->settings.page == BOUNCE_SETTINGS_PAGE_INPUT)
         return BOUNCE_SETTINGS_T9_VALUE_COUNT;
@@ -848,6 +898,7 @@ int bounce_app_flow_reset_to_default(BounceAppFlow *flow)
     flow->settings.audio_enabled = BOUNCE_DEFAULT_AUDIO_ENABLED;
     flow->settings.volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
     flow->settings.t9_input_enabled = BOUNCE_DEFAULT_T9_INPUT_ENABLED;
+    flow->settings.target_fps = BOUNCE_FPS_DEFAULT;
     flow->settings.applied_language_index = BOUNCE_DEFAULT_LANGUAGE_INDEX;
     flow->settings.language_index = 0u;
 
@@ -936,6 +987,18 @@ int bounce_app_flow_settings_select(BounceAppFlow *flow)
             return -1;
         flow->settings.t9_input_enabled
             = (flow->settings.selected_index == BOUNCE_SETTINGS_T9_ROW_ON);
+        return 0;
+    }
+    if (flow->settings.page == BOUNCE_SETTINGS_PAGE_DISPLAY) {
+        /*
+         * BL-005 -- the Display page has one row for the FPS control. SELECT on the
+         * FPS row is a no-op because the FPS is adjusted with LEFT/RIGHT, not SELECT.
+         * This mirrors the Audio page's volume row behavior.
+         */
+        if (flow->settings.selected_index >= count)
+            return -1;
+        if (flow->settings.selected_index == BOUNCE_SETTINGS_DISPLAY_ROW_FPS)
+            return 0;
         return 0;
     }
     /*

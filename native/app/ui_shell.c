@@ -3,6 +3,7 @@
 #include "locale.h"
 #include "script_font.h"
 #include "visual_assets.h"
+#include "app_flow.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -2200,6 +2201,25 @@ int bounce_ui_shell_handle_press(
                         volume += 10u;
                 }
                 flow->settings.volume = volume;
+                return 0;
+            }
+            /*
+             * BL-005 -- LEFT/RIGHT adjusts the FPS when the Display page's
+             * FPS row is selected. The step is 10, clamped to 10..180.
+             */
+            if (bounce_app_flow_settings_page(flow)
+                    == BOUNCE_SETTINGS_PAGE_DISPLAY
+                && bounce_app_flow_settings_selected_index(flow)
+                    == BOUNCE_SETTINGS_DISPLAY_ROW_FPS) {
+                unsigned int fps = bounce_app_flow_settings_fps(flow);
+                if (input == BOUNCE_UI_INPUT_LEFT) {
+                    if (fps >= 20u)
+                        fps -= 10u;
+                } else {
+                    if (fps <= 170u)
+                        fps += 10u;
+                }
+                flow->settings.target_fps = fps;
                 return 0;
             }
             return 0;

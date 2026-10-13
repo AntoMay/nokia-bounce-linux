@@ -2471,6 +2471,14 @@ static void app_restore_persisted_settings(BounceApp *app)
         (void)bounce_app_flow_restore_persisted_volume(&app->flow,
             (unsigned int)stored_volume);
     }
+
+    /* BL-005 -- restore the FPS setting at startup. */
+    int32_t stored_fps = 0;
+    if (bounce_persistence_load_fps(&stored_fps) == 0
+        && stored_fps != 0) {
+        (void)bounce_app_flow_restore_persisted_fps(&app->flow,
+            (unsigned int)stored_fps);
+    }
 }
 
 /*
@@ -2670,6 +2678,29 @@ static void app_commit_volume_change(BounceApp *app, unsigned int volume_before)
         return;
     app_persist_volume(app);
     app->last_persisted_volume = bounce_app_flow_settings_volume(&app->flow);
+}
+
+/*
+ * BL-005 -- commit the FPS if, and only if, this input changed it.
+ *
+ * The same rationale as app_commit_theme_change() applies: write on the edge
+ * that produces the change, not at shutdown.
+ */
+static void app_persist_fps(BounceApp *app)
+{
+    if (app == NULL)
+        return;
+    (void)bounce_persistence_save_fps(
+        (int32_t)bounce_app_flow_settings_fps(&app->flow));
+}
+
+static void app_commit_fps_change(BounceApp *app, unsigned int fps_before)
+{
+    if (app == NULL)
+        return;
+    if ((int)bounce_app_flow_settings_fps(&app->flow) == (int)fps_before)
+        return;
+    app_persist_fps(app);
 }
 
 /*
@@ -26466,6 +26497,8 @@ static int x11_dispatch_event(
         bool t9_before;
         /* BL-004: sampled before the UI press, to detect a volume change. */
         unsigned int volume_before;
+        /* BL-005: sampled before the UI press, to detect an FPS change. */
+        unsigned int fps_before;
         /*
          * STEP CONTINUE-RETURN: sampled before the UI press, so the arrival at the main
          * menu can be told apart from a press made while already there. See the refresh
@@ -26998,6 +27031,12 @@ static int x11_dispatch_event(
                  */
                 volume_before = bounce_app_flow_settings_volume(&app->flow);
                 /*
+                 * BL-005 -- and the FPS setting, sampled at the same point
+                 * for the same reason: only a real change (LEFT/RIGHT on the
+                 * FPS row) commits, and navigation writes nothing.
+                 */
+                fps_before = bounce_app_flow_settings_fps(&app->flow);
+                /*
                  * STEP CONTINUE-RETURN -- AND THE MAIN MENU ARRIVAL IS SAMPLED TOO.
                  * bounce_app_flow_enter_menu() resets the menu, so this flag has to be
                  * re-derived on every arrival rather than only the two that already were.
@@ -27030,6 +27069,11 @@ static int x11_dispatch_event(
                  * for the same reason.
                  */
                 app_commit_volume_change(app, volume_before);
+                /*
+                 * BL-005 -- and the FPS setting, committed on the same edge
+                 * for the same reason.
+                 */
+                app_commit_fps_change(app, fps_before);
                 /*
                  * STEP CONTINUE-RETURN -- RE-DERIVE CONTINUE ON EVERY ARRIVAL AT THE
                  * MAIN MENU. THIS IS THE FIX.
@@ -31358,12 +31402,22 @@ static void present_to_x11(
         render_trace_presentation(context->render_trace);
 }
 
-static void sleep_frame(void)
+static void sleep_frame_fps(unsigned int target_fps)
 {
     struct timespec duration;
     duration.tv_sec = 0;
-    duration.tv_nsec = 16L * 1000L * 1000L;
+    if (target_fps == 0)
+        target_fps = BOUNCE_FPS_DEFAULT;
+    duration.tv_nsec = (1000L * 1000L * 1000L) / target_fps;
+    duration.tv_sec = 0;
     (void)nanosleep(&duration, NULL);
+}
+
+/* sleep_frame is now a wrapper; kept for compatibility but unused in production. */
+static void sleep_frame(void) __attribute__((unused));
+static void sleep_frame(void)
+{
+    sleep_frame_fps(BOUNCE_FPS_DEFAULT);
 }
 
 static void print_usage(const char *program)
@@ -36790,7 +36844,7 @@ int main(int argc, char **argv)
          * rather than the frame rate.
          */
         (void)bounce_debug_tracker_observe(app.debug_tracker, &app);
-        sleep_frame();
+        sleep_frame_fps(bounce_app_flow_settings_fps(&app.flow));
     }
     /*
      * Final read-out so a short interactive run still leaves a state record
