@@ -116,17 +116,42 @@ int bounce_level_dyn_thorn_record(
     bytes = payload + offset;
 
     /*
-     * Recovered 8-byte layout; see dyn_thorns.h. Each field is a Java
-     * (short) levelDIS.read(), i.e. the signed byte value.
+     * Recovered 8-byte layout; see dyn_thorns.h.
+     *
+     * EACH BYTE IS UNSIGNED. The recovered reader is `(short) input.read()`
+     * (b.java:302-308, and the LKT Pro decompile at TileCanvas.java:218-225),
+     * and java.io.InputStream.read() returns 0..255, so the narrowing cast to
+     * short leaves every field in 0..255. It is readByte() that would sign-
+     * extend here, and no recovered source calls it.
+     *
+     * `bytes` is uint8_t, so the conversion below is a widening zero-extension
+     * and nothing else: a byte of 146 becomes 146, not -110. An earlier
+     * revision cast through int8_t first, which sign-extended, and that is a
+     * different value for every byte >= 0x80.
+     *
+     * WHY IT MATTERS, MEASURED OVER THE SHIPPED DATA. Across the eleven levels
+     * there are 71 records. Read unsigned, every one lies inside its own map
+     * with TopRight strictly beyond BottomLeft, and 69 of the 71 boxes are made
+     * entirely of tile 10, the moving-object tile. Read signed, two records in
+     * J2MElvl.011 decode to a negative X -- bottom_left (-110,52) for record 3
+     * and top_right (-127,6) for record 4 -- which puts them off the left edge
+     * of a 178-wide map, where bounce_dyn_thorns_test_point_inside() can never
+     * match any tile column, so those two thorns were neither lethal nor drawn.
+     * Five further records carry a high byte in ae or w rather than in a
+     * coordinate: sign-extending those flipped a thorn's travel direction or
+     * started it at the wrong end of its track, without moving it off the map.
+     *
+     * The bounds this feeds are unaffected either way, because they are computed
+     * from (TopRight - BottomLeft) and both operands sign-extend together.
      */
-    record_out->bottom_left.x = (int16_t)(int8_t)bytes[0];
-    record_out->bottom_left.y = (int16_t)(int8_t)bytes[1];
-    record_out->top_right.x = (int16_t)(int8_t)bytes[2];
-    record_out->top_right.y = (int16_t)(int8_t)bytes[3];
-    record_out->ae.x = (int16_t)(int8_t)bytes[4];
-    record_out->ae.y = (int16_t)(int8_t)bytes[5];
-    record_out->w.x = (int16_t)(int8_t)bytes[6];
-    record_out->w.y = (int16_t)(int8_t)bytes[7];
+    record_out->bottom_left.x = (int16_t)bytes[0];
+    record_out->bottom_left.y = (int16_t)bytes[1];
+    record_out->top_right.x = (int16_t)bytes[2];
+    record_out->top_right.y = (int16_t)bytes[3];
+    record_out->ae.x = (int16_t)bytes[4];
+    record_out->ae.y = (int16_t)bytes[5];
+    record_out->w.x = (int16_t)bytes[6];
+    record_out->w.y = (int16_t)bytes[7];
     return 0;
 }
 

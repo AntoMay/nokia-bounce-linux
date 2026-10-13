@@ -14466,14 +14466,14 @@ static int dyn_thorn_refs_load(const BounceLevel *level, DynThornRef **out)
         return -1;
     for (t = 0; t < count; ++t) {
         const uint8_t *r = payload + (size_t)t * 8u;
-        refs[t].blx = (int32_t)(int8_t)r[0];
-        refs[t].bly = (int32_t)(int8_t)r[1];
-        refs[t].trx = (int32_t)(int8_t)r[2];
-        refs[t].try_ = (int32_t)(int8_t)r[3];
-        refs[t].aex = (int32_t)(int8_t)r[4];
-        refs[t].aey = (int32_t)(int8_t)r[5];
-        refs[t].wx = (int32_t)(int8_t)r[6];
-        refs[t].wy = (int32_t)(int8_t)r[7];
+        refs[t].blx = (int32_t)r[0];
+        refs[t].bly = (int32_t)r[1];
+        refs[t].trx = (int32_t)r[2];
+        refs[t].try_ = (int32_t)r[3];
+        refs[t].aex = (int32_t)r[4];
+        refs[t].aey = (int32_t)r[5];
+        refs[t].wx = (int32_t)r[6];
+        refs[t].wy = (int32_t)r[7];
     }
     *out = refs;
     return 0;
