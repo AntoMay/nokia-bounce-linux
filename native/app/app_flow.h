@@ -769,8 +769,19 @@ unsigned int bounce_app_flow_level_selection_selected_index(
 );
 
 /*
- * STEP 34-F-K -- NATIVE ADDITION. The two rows of the Audio settings page:
- * row 0 is ON, row 1 is OFF. There is no third state.
+ * STEP 34-F-K -- NATIVE ADDITION. The Audio settings page's rows: row 0 is ON and
+ * row 1 is OFF, and BL-004 added row 2 as the volume control.
+ *
+ * ROW_VOLUME IS NOT A THIRD AUDIO STATE. It carries no applied value and no SELECT
+ * action -- it is adjusted with LEFT/RIGHT -- so bounce_app_flow_settings_select()
+ * returns early for it and leaves audio_enabled alone. Selecting it is not how audio
+ * is switched off; selecting ROW_OFF is.
+ *
+ * The wording here used to read "The two rows ... There is no third state", which was
+ * true of the ON/OFF setting and stopped being true of the LIST when BL-004 added the
+ * volume row. It was left standing long enough to contradict the three macros
+ * immediately below it, which is the only kind of comment error worth correcting by
+ * rewriting rather than by appending to.
  */
 #define BOUNCE_SETTINGS_AUDIO_VALUE_COUNT 3u
 #define BOUNCE_SETTINGS_AUDIO_ROW_ON  0u

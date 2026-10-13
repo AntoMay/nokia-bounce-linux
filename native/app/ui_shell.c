@@ -560,7 +560,7 @@ static const char high_score_value[] = "0";
  */
 static const char level_selection_back[] = "Back";
 
-static const uint8_t placeholder_glyph_rows[40][7] = {
+static const uint8_t placeholder_glyph_rows[41][7] = {
     {0x0eu, 0x11u, 0x11u, 0x1fu, 0x11u, 0x11u, 0x11u}, /* A */
     {0x1eu, 0x11u, 0x11u, 0x1eu, 0x11u, 0x11u, 0x1eu}, /* B */
     {0x0fu, 0x10u, 0x10u, 0x10u, 0x10u, 0x10u, 0x0fu}, /* C */
@@ -612,7 +612,12 @@ static const uint8_t placeholder_glyph_rows[40][7] = {
     /* Rows 37..39, punctuation, native font work like the '!' above. */
     {0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x0cu, 0x04u}, /* 37 '.' */
     {0x00u, 0x00u, 0x00u, 0x00u, 0x0cu, 0x04u, 0x08u}, /* 38 ',' */
-    {0x11u, 0x0au, 0x04u, 0x1fu, 0x04u, 0x0au, 0x11u}  /* 39 '*' */
+    {0x11u, 0x0au, 0x04u, 0x1fu, 0x04u, 0x0au, 0x11u}, /* 39 '*' */
+    /*
+     * Row 40, the percentage sign. See the note under the table for how this row
+     * was chosen, which string reaches for it, and why it is not a guess.
+     */
+    {0x03u, 0x06u, 0x04u, 0x08u, 0x08u, 0x10u, 0x18u}  /* 40 '%' */
 };
 
 /*
@@ -660,6 +665,29 @@ static const uint8_t placeholder_glyph_rows[40][7] = {
  * NOTHING ELSE WAS ADDED. Letters, space and '!' complete the ASCII the screens
  * need; every other character a future resource might use still draws the box,
  * which is the honest fallback rather than a guessed shape.
+ */
+
+/*
+ * WHY ROW 40 EXISTS. The heading above is superseded and left standing, per the
+ * convention every other note in this file uses: it records what was measured
+ * then, this records the next measurement.
+ *
+ * FOUND BY the coverage sweep, which reported one box per language. Breaking at
+ * the one site in draw_placeholder_text() that picks placeholder_unknown_rows
+ * gave the character: U+0025 '%', in "100%", from BL-004's volume row.
+ *
+ * All five languages failed together because that format string is
+ * language-independent, so one missing glyph produced one box in each. The row
+ * is native extension text, which is the same category as the '.' and the digits
+ * V-2 measured, so it belongs in this table by the same rule.
+ *
+ * A row rather than a reworded string: dropping the '%' would pass the check by
+ * deleting the character, and "50" without a unit is a worse label than "50%".
+ *
+ * PROVENANCE: like the '!' above, there is no Nokia '%' bitmap in this tree to
+ * copy -- the original used the handset's system font. This is native font work
+ * at the same 5x7, claiming no recovered glyph. It is the diagonal between two
+ * corner wedges '%' has in every 5x7 font.
  */
 
 static const uint8_t placeholder_space_rows[7] = {
@@ -870,7 +898,8 @@ static int placeholder_text_index(char character)
      * V-2 -- the measured remainder of the ASCII the screens paint. '!' is the
      * only one a SHIPPED RESOURCE reaches: lang.th-TH's GAME_END_CONGRATS,
      * LEVEL_COMPLETED and NEW_HIGH_SCORE each end in it. The digits and the
-     * three punctuation marks come from this shell's own native strings.
+     * three punctuation marks come from this shell's own native strings, and '%'
+     * is the fourth of those: BL-004's volume row formats "100%".
      */
     switch (character) {
         case '!': return 26;
@@ -887,6 +916,7 @@ static int placeholder_text_index(char character)
         case '.': return 37;
         case ',': return 38;
         case '*': return 39;
+        case '%': return 40;
         default: break;
     }
     return -1;
@@ -924,6 +954,19 @@ int bounce_ui_shell_can_draw_ascii(int codepoint)
     /* placeholder_text_index() returns the row index, and -1 for no glyph. */
     return placeholder_text_index((char)codepoint) >= 0 ? 1 : 0;
 }
+
+/*
+ * WHY THERE IS NO STRING-LEVEL QUERY HERE. locale.c stores raw text that includes
+ * substitution placeholders, '\n' breaks, and text past the bounded Instructions
+ * excerpt, none of which reaches the glyph painter -- so a per-string check would
+ * need an exception list that cannot tell a new glyph from a new exclusion.
+ *
+ * verify_script_glyph_coverage() needs none of that: it renders ninety screens in
+ * five languages with the negative control armed and demands zero boxes. Its
+ * earlier root-cause work found the missing ASCII '%' glyph, added above for
+ * BL-004's "100%" volume row, and the missing script glyphs, fixed by regenerating
+ * script_font.c with tools/gen_script_font.py.
+ */
 
 static int draw_placeholder_text(
     BounceRenderer *renderer,

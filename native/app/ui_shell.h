@@ -91,6 +91,13 @@ const BounceUiPalette *bounce_ui_shell_palette(void);
 int bounce_ui_shell_can_draw_ascii(int codepoint);
 
 /*
+ * There is deliberately no string-level companion to this one. See the note above
+ * draw_placeholder_text() in ui_shell.c for the three classes of character that
+ * reach a locale string but provably never reach the glyph painter, and for why a
+ * per-string predicate would have to exclude each of them explicitly.
+ */
+
+/*
  * V-2 -- The number of unknown-glyph boxes this shell has painted, as a flag.
  *
  * Non-zero means at least one box has been drawn since the last reset. It is

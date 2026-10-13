@@ -20781,6 +20781,7 @@ static int verify_native_extension_ui(void)
     BounceRenderer *renderer;
     unsigned int index;
     unsigned int walk;
+    unsigned int fps_before;
     int nonblank;
 
     memset(&flow, 0, sizeof flow);
@@ -20928,30 +20929,57 @@ static int verify_native_extension_ui(void)
     }
 
     /*
-     * STEP 34-F-K: Display and Input remained read-only fact pages with no
-     * navigable list. Audio did not, and now neither does Input: the numeric
-     * keypad setting added to Input gives it a two-row list.
+     * STEP 34-F-K: Input used to be a read-only fact page with no navigable list,
+     * and so was Display. Neither is any more. Input has the numeric keypad setting
+     * and Display has the BL-005 FPS control, so each gets its own block below, in
+     * the same shape as the Audio one.
      *
-     * THE INVARIANT IS NOT WEAKENED, IT IS SCOPED. This loop used to cover
-     * DISPLAY..INPUT together and assert, for both, that the page reports zero
-     * rows and that UP, DOWN and SELECT all fail. Display still satisfies that in
-     * full and is still asserted here. Input no longer does, and cannot: a
-     * setting the player cannot reach is not a setting, so asserting it would be
-     * asserting the absence of the feature this change exists to add.
+     * THE INVARIANT IS NOT WEAKENED, IT IS RE-SCOPED. This block used to assert that
+     * the Display page reported zero rows and that UP, DOWN and SELECT all failed.
+     * That was true while Display was a fact table, and BL-005 ended it: app_flow.h
+     * now defines BOUNCE_SETTINGS_DISPLAY_VALUE_COUNT and BOUNCE_SETTINGS_DISPLAY_ROW_FPS,
+     * and bounce_app_flow_settings_list_count() returns the former for this page. The
+     * block below asserts the page's real shape instead of the shape it no longer has.
      *
-     * Input is verified in its own block below, in the same shape as the Audio
-     * one -- two rows, moving does not apply, SELECT applies -- so what replaced
-     * the invariant is a real assertion rather than a removal.
+     * It stayed green until now only because verify_script_glyph_coverage() runs
+     * earlier and aborted the suite on its own failure. Nothing about the Display
+     * page changed when that was fixed; the stale assertion was simply reachable.
      */
     flow.settings.page = BOUNCE_SETTINGS_PAGE_DISPLAY;
-    if (bounce_app_flow_settings_list_count(&flow) != 0u
-        || bounce_app_flow_settings_move(
-               &flow,
-               BOUNCE_MENU_DIRECTION_DOWN) != -1
-        || bounce_app_flow_settings_move(
-               &flow,
-               BOUNCE_MENU_DIRECTION_UP) != -1
-        || bounce_app_flow_settings_select(&flow) != -1)
+    /*
+     * The FPS is read BEFORE the walk rather than compared against a constant. What
+     * this block is about is that SELECT does not change it, and pinning the literal
+     * default here would restate a shipped-default claim that verify_default_state()
+     * already owns.
+     */
+    fps_before = bounce_app_flow_settings_fps(&flow);
+    if (bounce_app_flow_settings_list_count(&flow)
+            != BOUNCE_SETTINGS_DISPLAY_VALUE_COUNT
+        || BOUNCE_SETTINGS_DISPLAY_ROW_FPS != 0u
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_DISPLAY_ROW_FPS)
+        return -1;
+    /*
+     * ONE ROW, SO BOTH DIRECTIONS CLAMP AND NEITHER IS AN ERROR. The generic
+     * settings move is bounded and non-wrapping, the same rule the main menu and the
+     * level list use, so a DOWN past the last row returns 0 with the highlight still
+     * on the FPS row rather than wrapping or failing.
+     */
+    if (bounce_app_flow_settings_move(&flow, BOUNCE_MENU_DIRECTION_DOWN) != 0
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_DISPLAY_ROW_FPS
+        || bounce_app_flow_settings_move(&flow, BOUNCE_MENU_DIRECTION_UP) != 0
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_DISPLAY_ROW_FPS)
+        return -1;
+    /*
+     * SELECT IS A NO-OP HERE, and that is the point of the page rather than an
+     * omission: the FPS is adjusted with LEFT/RIGHT in the shell's input seam, so
+     * the flow's select path recognises the FPS row and changes nothing. Asserted
+     * as "unchanged", which holds whatever the current value is.
+     */
+    if (bounce_app_flow_settings_select(&flow) != 0
+        || bounce_app_flow_settings_fps(&flow) != fps_before)
         return -1;
 
     /*
@@ -21043,17 +21071,27 @@ static int verify_native_extension_ui(void)
         return -1;
 
     /*
-     * STEP 34-F-K -- the Audio ON/OFF setting. A fresh flow is ON; the page has
-     * exactly two rows; moving the highlight does not change the applied value;
-     * SELECT applies the highlighted row; and ON is restored by selecting row 0
-     * again. The value is not persisted, so re-entering Settings keeps it
-     * (reset_settings_navigation) while a fresh launch returns to ON.
+     * STEP 34-F-K -- the Audio ON/OFF setting, plus BL-004's volume row. A fresh
+     * flow is ON; the page has THREE rows, ON, OFF and VOLUME; moving the highlight
+     * does not change the applied value; SELECT applies ON or OFF and nothing else;
+     * and ON is restored by selecting row 0 again. The value is not persisted, so
+     * re-entering Settings keeps it (reset_settings_navigation) while a fresh launch
+     * returns to ON.
+     *
+     * This block used to say "exactly two rows" and walk the list as if that were
+     * still true. BL-004 added the third row, and the walk drifted without failing
+     * loudly: the last step asserted a second DOWN landed on ROW_OFF when it lands
+     * on ROW_VOLUME, so the check was reading a two-row list it no longer had. Every
+     * index below is the row the walk actually reaches.
      */
     flow.settings.page = BOUNCE_SETTINGS_PAGE_AUDIO;
     if (bounce_app_flow_settings_list_count(&flow)
             != BOUNCE_SETTINGS_AUDIO_VALUE_COUNT
+        || BOUNCE_SETTINGS_AUDIO_ROW_VOLUME
+            != BOUNCE_SETTINGS_AUDIO_VALUE_COUNT - 1u
         || !bounce_app_flow_settings_audio_enabled(&flow)
-        || bounce_app_flow_settings_selected_index(&flow) != 0u)
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_AUDIO_ROW_ON)
         return -1;
     /* Moving to OFF must not apply anything by itself. */
     if (bounce_app_flow_settings_move(&flow, BOUNCE_MENU_DIRECTION_DOWN) != 0
@@ -21083,7 +21121,57 @@ static int verify_native_extension_ui(void)
         || bounce_app_flow_settings_move(
                &flow, BOUNCE_MENU_DIRECTION_DOWN) != 0
         || bounce_app_flow_settings_selected_index(&flow)
-            != BOUNCE_SETTINGS_AUDIO_ROW_OFF)
+            != BOUNCE_SETTINGS_AUDIO_ROW_VOLUME)
+        return -1;
+    /*
+     * BL-004 -- SELECT ON THE VOLUME ROW CHANGES NOTHING.
+     *
+     * THIS IS THE REGRESSION THIS BLOCK EXISTS FOR. The select path computed
+     * `audio_enabled = (selected_index == BOUNCE_SETTINGS_AUDIO_ROW_ON)` for every
+     * index below the row count, so pressing SELECT on row 2 switched audio OFF --
+     * the exact opposite of what the row is for, and the opposite of what
+     * app_flow.c's Display branch says it mirrors. The walk above is what exposed it.
+     *
+     * The highlight is on VOLUME and audio is ON. A non-default volume is installed
+     * first, so "unchanged" cannot pass merely because the row happened to touch
+     * nothing: a value that is neither the default nor in force is what shows the
+     * select path never writes either field.
+     */
+    if (bounce_app_flow_restore_persisted_volume(&flow, 40u) != 0)
+        return -1;
+    if (bounce_app_flow_settings_select(&flow) != 0
+        || !bounce_app_flow_settings_audio_enabled(&flow)
+        || bounce_app_flow_settings_volume(&flow) != 40u
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_AUDIO_ROW_VOLUME)
+        return -1;
+    /*
+     * AND THE SAME WITH AUDIO OFF, because "a no-op" must not quietly mean "leaves
+     * it ON". Switch audio off through ROW_OFF, come back to VOLUME, and SELECT
+     * again: still off, still at the same volume.
+     */
+    if (bounce_app_flow_settings_move(&flow, BOUNCE_MENU_DIRECTION_UP) != 0
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_AUDIO_ROW_OFF
+        || bounce_app_flow_settings_select(&flow) != 0
+        || bounce_app_flow_settings_audio_enabled(&flow))
+        return -1;
+    if (bounce_app_flow_settings_move(&flow, BOUNCE_MENU_DIRECTION_DOWN) != 0
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_AUDIO_ROW_VOLUME
+        || bounce_app_flow_settings_select(&flow) != 0
+        || bounce_app_flow_settings_audio_enabled(&flow)
+        || bounce_app_flow_settings_volume(&flow) != 40u)
+        return -1;
+    /* ON is still reachable afterwards, and the volume survived all three SELECTs. */
+    if (bounce_app_flow_settings_move(&flow, BOUNCE_MENU_DIRECTION_UP) != 0
+        || bounce_app_flow_settings_move(
+               &flow, BOUNCE_MENU_DIRECTION_UP) != 0
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_AUDIO_ROW_ON
+        || bounce_app_flow_settings_select(&flow) != 0
+        || !bounce_app_flow_settings_audio_enabled(&flow)
+        || bounce_app_flow_settings_volume(&flow) != 40u)
         return -1;
     /* Navigation away and back keeps the session's choice, which is ON here. */
     if (bounce_app_flow_settings_back(&flow) != 0
@@ -21094,10 +21182,13 @@ static int verify_native_extension_ui(void)
         return -1;
     /* And OFF survives navigation too, which is the case that matters most:
      * leaving the page must not quietly turn audio back on. The highlight is on
-     * row 0 at this point, so it must be moved to row 1 before SELECT applies
-     * OFF. */
+     * row 0 at this point, so it must be moved to ROW_OFF -- not merely down once,
+     * which on a three-row list reaches ROW_VOLUME and would pass the assertion
+     * below for the wrong reason. */
     if (bounce_app_flow_settings_move(
             &flow, BOUNCE_MENU_DIRECTION_DOWN) != 0
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_AUDIO_ROW_OFF
         || bounce_app_flow_settings_select(&flow) != 0
         || bounce_app_flow_settings_audio_enabled(&flow))
         return -1;
@@ -21106,11 +21197,18 @@ static int verify_native_extension_ui(void)
     flow.settings.page = BOUNCE_SETTINGS_PAGE_AUDIO;
     if (bounce_app_flow_settings_audio_enabled(&flow))
         return -1;
-    /* Restore ON so the rest of this verification sees the default. */
+    /* Restore ON and the default volume so the rest of this verification sees the
+     * shipped state. The highlight is on ROW_OFF, so one UP is ROW_ON again. */
     if (bounce_app_flow_settings_move(
             &flow, BOUNCE_MENU_DIRECTION_UP) != 0
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_AUDIO_ROW_ON
         || bounce_app_flow_settings_select(&flow) != 0
-        || !bounce_app_flow_settings_audio_enabled(&flow))
+        || !bounce_app_flow_settings_audio_enabled(&flow)
+        || bounce_app_flow_restore_persisted_volume(
+               &flow, BOUNCE_AUDIO_VOLUME_DEFAULT) != 0
+        || bounce_app_flow_settings_volume(&flow)
+            != BOUNCE_AUDIO_VOLUME_DEFAULT)
         return -1;
 
     /*
@@ -30823,6 +30921,7 @@ static int verify_script_glyph_coverage(BounceVisualAssets *assets)
     BounceAppFlow flow;
     unsigned int step;
     unsigned long screens = 0ul;
+    unsigned int languages_with_boxes = 0u;
     int bad = 0;
 
     if (script_coverage_negative_control() != 0) {
@@ -30943,6 +31042,7 @@ static int verify_script_glyph_coverage(BounceVisualAssets *assets)
             fprintf(stderr,
                     "script coverage: language %u painted at least one box\n",
                     (unsigned int)order[step]);
+            ++languages_with_boxes;
             ++bad;
         }
     }
@@ -30952,8 +31052,32 @@ static int verify_script_glyph_coverage(BounceVisualAssets *assets)
     bounce_renderer_destroy(renderer);
     bounce_surface_destroy(surface);
 
-    printf("SCRIPT-COVERAGE languages=5 screens=%lu boxes=0 expected=0 %s\n",
-           screens, bad == 0 ? "PASS" : "FAIL");
+    /*
+     * THE TWO METRICS ARE MEASURED, NOT TYPED INTO THE FORMAT STRING.
+     *
+     * This used to read
+     *
+     *     printf("SCRIPT-COVERAGE languages=5 screens=%lu boxes=0 expected=0 %s\n",
+     *
+     * with `boxes=0` and `expected=0` written as literals and no argument behind
+     * either. That is not cosmetic. A sweep that FAILS printed a summary whose
+     * headline metric read zero, so the very line reporting "FAIL" also reported
+     * "boxes=0" -- the output contradicted itself and was therefore evidence of
+     * nothing. It also hid the shape of this particular failure, where one missing
+     * glyph is reported five times because the format string painting it is
+     * language-independent.
+     *
+     * WHAT `langs_with_boxes` COUNTS, AND WHY IT IS NOT CALLED `boxes`. The
+     * counter the shell exposes is a flag rather than a tally, and the sweep
+     * resets it once per language, so the most the sweep can honestly report is
+     * how many of the five languages painted at least one box. Counting individual
+     * boxes would need a per-box counter the renderer does not keep, and counting
+     * them here would be measuring something other than what was painted. The
+     * per-language stderr line above remains the attribution for which string.
+     */
+    printf("SCRIPT-COVERAGE languages=5 screens=%lu langs_with_boxes=%u"
+           " expected=0 %s\n",
+           screens, languages_with_boxes, bad == 0 ? "PASS" : "FAIL");
     return bad == 0 ? 0 : -1;
 }
 

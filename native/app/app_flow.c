@@ -966,13 +966,25 @@ int bounce_app_flow_settings_select(BounceAppFlow *flow)
     if (flow->settings.page == BOUNCE_SETTINGS_PAGE_AUDIO) {
         /*
          * STEP 34-F-K. The Audio page reuses `selected_index` as its highlight,
-         * exactly as the root list does, because it has only two rows. The
-         * applied value is separate, so moving the highlight does not change
-         * the setting -- SELECT does, which is the "SELECT TO SWITCH"
-         * convention the other settings pages already use.
+         * exactly as the root list does. The applied value is separate, so moving
+         * the highlight does not change the setting -- SELECT does, which is the
+         * "SELECT TO SWITCH" convention the other settings pages already use.
+         *
+         * BL-004 -- VOLUME IS NOT A ROW OF THAT ON/OFF CHOICE. It carries no applied
+         * value and no SELECT action: ui_shell.c adjusts it with LEFT/RIGHT and
+         * deliberately draws no applied marker on it. Folding it into the test
+         * below would have made SELECT on it switch audio OFF, because
+         * ROW_VOLUME is not ROW_ON and the comparison has only one true answer.
+         *
+         * THAT IS NOT A NEW RULE. The Display page's FPS row returns early for
+         * precisely this reason, and its comment below already says it mirrors this
+         * row; the Audio branch was the one that had not caught up. An out-of-range
+         * index is still refused by the guard above, unchanged.
          */
         if (flow->settings.selected_index >= count)
             return -1;
+        if (flow->settings.selected_index == BOUNCE_SETTINGS_AUDIO_ROW_VOLUME)
+            return 0;
         flow->settings.audio_enabled
             = (flow->settings.selected_index == BOUNCE_SETTINGS_AUDIO_ROW_ON);
         return 0;
