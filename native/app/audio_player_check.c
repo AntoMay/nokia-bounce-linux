@@ -438,6 +438,195 @@ static void test_sink_lifecycle(const char *resource_root)
     (void)bounce_audio_player_destroy(player);
 }
 
+/*
+ * BL-004 PARITY FIX -- the volume gain, measured on rendered output.
+ *
+ * WHY THIS NEEDED A NEW OBSERVATION POINT. The gain is applied in audio_player.c to
+ * the rendered block immediately before write_pcm(), and the Null backend discards
+ * that block. Until the backend reported a peak, the volume setting had no runtime
+ * effect a headless test could see at all: setting it to 0 and never setting it
+ * produced identical evidence, because the Null backend is silent either way. So
+ * "the volume is wired up" was not a claim this harness could support, and the
+ * parity gap between the volume row and the audio output went unnoticed.
+ *
+ * WHY IT IS DETERMINISTIC. audio_synth.c documents that its renderer has no random
+ * component and no time dependence (see the note at audio_synth.c:486), so the same
+ * event renders the same samples every run. The comparison below is therefore an
+ * equality of fixed numbers, not a statistical one, and it does not need a seed or
+ * a golden file.
+ *
+ * IT USES THREE SEPARATE PLAYERS, ONE PER VOLUME, rather than changing the volume on
+ * one player between measurements. That keeps each measurement independent of the
+ * queue's history: a single player would carry the first sound's tail into the
+ * second measurement, and the tails are what a gain change is easiest to miss in.
+ */
+static unsigned int peak_for_volume(const char *resource_root,
+                                    unsigned int volume,
+                                    int *out_ok)
+{
+    BounceAudioPlayer *player = make_player(resource_root,
+                                            BOUNCE_AUDIO_PLAYER_BACKEND_NULL,
+                                            BOUNCE_AUDIO_PLAYER_SHUTDOWN_DISCARD,
+                                            0u);
+    BounceAudioPlayerStats stats;
+    unsigned int peak = 0u;
+    unsigned int last_peak = 0u;
+
+    *out_ok = 0;
+    if (player == NULL) {
+        return 0u;
+    }
+    if (bounce_audio_player_set_volume(player, volume) != 0) {
+        (void)bounce_audio_player_destroy(player);
+        return 0u;
+    }
+    if (!bounce_audio_player_attach_sink(player)) {
+        (void)bounce_audio_player_destroy(player);
+        return 0u;
+    }
+    (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_POP);
+    (void)wait_for_played(player, 1ull, 4000u);
+    if (bounce_audio_player_stats(player, &stats) && stats.events_played >= 1ull
+        && bounce_audio_player_null_peak(player, &peak, &last_peak) == 0) {
+        *out_ok = 1;
+    }
+    (void)bounce_audio_player_destroy(player);
+    return peak;
+}
+
+static void test_volume_gain(const char *resource_root)
+{
+    unsigned int peak_full;
+    unsigned int peak_half;
+    unsigned int peak_quarter;
+    unsigned int peak_silent;
+    unsigned int last_peak = 0u;
+    int ok_full = 0;
+    int ok_half = 0;
+    int ok_quarter = 0;
+    int ok_silent = 0;
+    BounceAudioPlayer *player;
+    BounceAudioPlayerStats stats;
+    char description[220];
+
+    (void)printf("  volume -> rendered amplitude at the output boundary\n");
+
+    peak_full = peak_for_volume(resource_root, 100u, &ok_full);
+    peak_half = peak_for_volume(resource_root, 50u, &ok_half);
+    peak_quarter = peak_for_volume(resource_root, 25u, &ok_quarter);
+    peak_silent = peak_for_volume(resource_root, 0u, &ok_silent);
+
+    expect(ok_full && ok_half && ok_quarter && ok_silent,
+           "the same sound was rendered and measured at all four volumes");
+    if (!ok_full || !ok_half || !ok_quarter || !ok_silent) {
+        return;
+    }
+
+    /*
+     * FULL GAIN IS NON-SILENT FIRST. Every later comparison is relative to this
+     * number, and a gain assertion over two silent buffers would pass for the wrong
+     * reason, so full-scale audibility is asserted on its own.
+     */
+    expect(peak_full > 0u, "volume 100 renders audible output");
+    if (peak_full == 0u) {
+        return;
+    }
+
+    /*
+     * VOLUME 0 IS EXACT SILENCE, not merely quiet. This is the value that was
+     * unrepresentable before, and it is asserted as an equality because the gain
+     * multiplies every sample by 0.0 -- there is no rounding path to a tolerance.
+     */
+    expect(peak_silent == 0u,
+           "volume 0 renders exact silence (peak 0, not merely small)");
+
+    /*
+     * AND THE SILENCE IS REAL OUTPUT, NOT ABSENCE OF OUTPUT. This is what
+     * separates "muted" from "the sound never rendered", which were the same
+     * observation before the peak existed.
+     */
+    player = make_player(resource_root,
+                         BOUNCE_AUDIO_PLAYER_BACKEND_NULL,
+                         BOUNCE_AUDIO_PLAYER_SHUTDOWN_DISCARD, 0u);
+    if (player == NULL) {
+        expect(0, "a muted player still rendered and wrote frames");
+    } else {
+        expect(bounce_audio_player_set_volume(player, 0u) == 0
+               && bounce_audio_player_attach_sink(player) != 0,
+               "a muted player still accepts the sink");
+        (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_POP);
+        (void)wait_for_played(player, 1ull, 4000u);
+        expect(bounce_audio_player_stats(player, &stats)
+               && stats.events_played >= 1ull,
+               "a muted player still played the event");
+        expect(bounce_audio_player_null_peak(player, &last_peak, NULL) == 0
+               && last_peak == 0u,
+               "that played event reached the backend as silence");
+        (void)bounce_audio_player_destroy(player);
+    }
+
+    /*
+     * HALVED AND QUARTERED, WITHIN ONE SAMPLE OF THE RATIO.
+     *
+     * The gain is `(int16_t)(sample * volume / 100.0)` clamped to int16 range, so
+     * the result is a truncation of the exact ratio. Truncation toward zero loses at
+     * most one LSB per sample, so the expected peak is within `tolerance` of
+     * peak_full * volume / 100. One LSB is used as that tolerance because the peak
+     * sample is a single sample and cannot accumulate error the way a sum would.
+     */
+    {
+        const unsigned int expected_half = peak_full / 2u;
+        const unsigned int expected_quarter = peak_full / 4u;
+        const unsigned int tolerance = 1u;
+
+        (void)snprintf(description, sizeof(description),
+                       "volume 50 halves the peak: %u vs %u expected (~%u)",
+                       peak_half, peak_full, expected_half);
+        expect(peak_half + tolerance >= expected_half
+               && peak_half <= expected_half + tolerance,
+               description);
+
+        (void)snprintf(description, sizeof(description),
+                       "volume 25 quarters the peak: %u vs %u expected (~%u)",
+                       peak_quarter, peak_full, expected_quarter);
+        expect(peak_quarter + tolerance >= expected_quarter
+               && peak_quarter <= expected_quarter + tolerance,
+               description);
+    }
+
+    /*
+     * AND THE RAMP IS MONOTONIC, so a clamp that pinned 50 and 25 to the same
+     * value could not pass the two ratio assertions above by accident.
+     */
+    expect(peak_silent < peak_quarter && peak_quarter < peak_half
+           && peak_half < peak_full,
+           "peak amplitude rises monotonically with volume");
+
+    /*
+     * CLAMPING, NOT REJECTION, AT THE ENDS -- the contract the setter documents.
+     */
+    expect(bounce_audio_player_set_volume(NULL, 50u) == -1,
+           "set_volume rejects a NULL player");
+    {
+        BounceAudioPlayer *clamp = make_player(resource_root,
+                                               BOUNCE_AUDIO_PLAYER_BACKEND_NULL,
+                                               BOUNCE_AUDIO_PLAYER_SHUTDOWN_DISCARD,
+                                               0u);
+        if (clamp == NULL) {
+            expect(0, "set_volume clamps out-of-range input");
+        } else {
+            expect(bounce_audio_player_set_volume(clamp, 255u) == 0
+                   && bounce_audio_player_get_volume(clamp)
+                       == BOUNCE_AUDIO_VOLUME_MAX,
+                   "set_volume clamps 255 down to 100 rather than rejecting it");
+            expect(bounce_audio_player_set_volume(clamp, 7u) == 0
+                   && bounce_audio_player_get_volume(clamp) == 7u,
+                   "set_volume accepts an arbitrary value in range");
+            (void)bounce_audio_player_destroy(clamp);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *resource_root = (argc > 1) ? argv[1] : "";
@@ -459,6 +648,7 @@ int main(int argc, char **argv)
     test_shutdown_policies(resource_root);
     test_failure_isolation(resource_root);
     test_sink_lifecycle(resource_root);
+    test_volume_gain(resource_root);
 
     if (player_failures != 0) {
         (void)printf("\naudio integration self-test: FAIL (%d failure(s))\n",

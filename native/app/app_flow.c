@@ -71,6 +71,24 @@ static void bounce_app_flow_reset_settings(BounceSettingsState *settings)
     settings->audio_enabled = true;
     /* BL-004. Default 100: matches the reference mod's mVolume = 100. */
     settings->volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
+    /*
+     * BL-005 PARITY FIX. Default 25: matches the reference mod's mFps = 25
+     * (BounceUI.java:89).
+     *
+     * THIS FIELD WAS NEVER INITIALISED HERE, and it was only ever safe by luck.
+     * The live path always called app_restore_persisted_settings(), whose loader
+     * substitutes BOUNCE_FPS_DEFAULT for an absent record, so a launched game got
+     * a legal value; but any flow built without that restore -- every verifier
+     * that memsets a BounceApp and calls this -- was left holding whatever the
+     * memory happened to contain. With the default changed from 60 to 25 that
+     * became observable rather than merely untidy, and verify_fps_range_
+     * normalization() is what caught it.
+     *
+     * It is stated beside the volume default rather than hidden because both are
+     * the same kind of thing: a setting whose shipped default has to exist before
+     * any store is read.
+     */
+    settings->target_fps = BOUNCE_FPS_DEFAULT;
     /* NATIVE ADDITION: the keypad is off until a player asks for it. */
     /*
      * STEP 38-RESET. ON, not off -- the keypad default is a product decision, and

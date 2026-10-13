@@ -574,6 +574,46 @@ unsigned int bounce_audio_player_get_volume(const BounceAudioPlayer *player)
     return player->volume;
 }
 
+int bounce_audio_player_null_peak(const BounceAudioPlayer *player,
+                                  unsigned int *out_peak,
+                                  unsigned int *out_last_peak)
+{
+    if (out_peak != NULL) {
+        *out_peak = 0u;
+    }
+    if (out_last_peak != NULL) {
+        *out_last_peak = 0u;
+    }
+    if (player == NULL || player->null_state == NULL) {
+        return -1;
+    }
+    /*
+     * ATOMIC LOADS, because the audio worker is writing these fields right now.
+     *
+     * player->mutex IS NOT TAKEN, and deliberately: the worker releases it across
+     * render and write, so locking it here would not exclude the writer at all --
+     * the lock protects the queue, not the backend's state. An earlier version of
+     * this function relied on "a 32-bit read cannot tear" instead, which is true on
+     * every target this project builds for and is still a data race by C11. The
+     * fields are _Atomic now, so relaxed loads are well-defined and lock-free; see
+     * the note in audio_backend_null.h.
+     *
+     * Relaxed is the right strength for a measurement read: there is no other
+     * memory being published or consumed, and a caller that needs the value to
+     * correspond to a completed write establishes that itself by having observed
+     * the rendered event count first (as the tests do via wait_for_played()).
+     */
+    if (out_peak != NULL) {
+        *out_peak = atomic_load_explicit(&player->null_state->peak_sample,
+                                         memory_order_relaxed);
+    }
+    if (out_last_peak != NULL) {
+        *out_last_peak = atomic_load_explicit(&player->null_state->last_write_peak,
+                                              memory_order_relaxed);
+    }
+    return 0;
+}
+
 /* Absolute deadline `timeout_ms` from now, for the drain wait. */
 static void bounce_audio_player_deadline(struct timespec *when,
                                          unsigned int timeout_ms)

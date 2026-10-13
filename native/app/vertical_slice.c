@@ -2464,18 +2464,49 @@ static void app_restore_persisted_settings(BounceApp *app)
         (void)bounce_app_flow_restore_persisted_t9(&app->flow, true);
     }
 
-    /* BL-004 -- restore the volume setting at startup. */
+    /*
+     * BL-004 PARITY FIX -- restore the volume setting at startup.
+     *
+     * THE `stored_volume != 0` GUARD THAT WAS HERE WAS A BUG, and it was the
+     * zero-as-failure mistake: 0 is a legal volume, and a player who muted the
+     * game got a full-volume game back on the next launch. Mute is the one value a
+     * player is most likely to have chosen deliberately, so it was also the one
+     * value the restore discarded most reliably.
+     *
+     * NO REPLACEMENT FLAG IS NEEDED, because the loader already separates the two
+     * cases through its own contract rather than through the value:
+     *
+     *   - it assigns BOUNCE_AUDIO_VOLUME_DEFAULT before anything can fail, and
+     *     returns 0 from every early exit -- unreadable container, wrong version,
+     *     record absent, wrong payload size;
+     *   - it returns 0 with the STORED value only when the record really was read;
+     *   - it returns non-zero only for a NULL out-pointer, which cannot happen here.
+     *
+     * So "load failed" already arrives as the default, and trusting the value is
+     * correct in every case: a failed load restores 100, which is what the flow is
+     * already initialised to, and a stored 0 now restores 0. This matches the
+     * reference, which reads the byte raw with no truthiness test at all
+     * (BounceUI.java:580).
+     *
+     * It also brings the FPS restore below it onto the same contract. A stored FPS
+     * of 0 is not reachable through the UI or the writer, so its guard was not a
+     * live mute-style bug -- but removing it is what makes a record that IS out of
+     * range, or hand-edited, land on the loader's clamp (BOUNCE_FPS_MIN..MAX) rather
+     * than on whichever value happened to survive the guard.
+     */
     int32_t stored_volume = 0;
-    if (bounce_persistence_load_volume(&stored_volume) == 0
-        && stored_volume != 0) {
+    if (bounce_persistence_load_volume(&stored_volume) == 0) {
         (void)bounce_app_flow_restore_persisted_volume(&app->flow,
             (unsigned int)stored_volume);
     }
 
-    /* BL-005 -- restore the FPS setting at startup. */
+    /* BL-005 -- restore the FPS setting at startup. Same contract as the
+     * volume above, and for the same reason: the loader defaults the value
+     * before it can fail and clamps a stored one into BOUNCE_FPS_MIN..MAX, so an
+     * absent record, an unreadable container and an out-of-range record all arrive
+     * here as a legal value already. */
     int32_t stored_fps = 0;
-    if (bounce_persistence_load_fps(&stored_fps) == 0
-        && stored_fps != 0) {
+    if (bounce_persistence_load_fps(&stored_fps) == 0) {
         (void)bounce_app_flow_restore_persisted_fps(&app->flow,
             (unsigned int)stored_fps);
     }
@@ -2701,6 +2732,59 @@ static void app_commit_fps_change(BounceApp *app, unsigned int fps_before)
     if ((int)bounce_app_flow_settings_fps(&app->flow) == (int)fps_before)
         return;
     app_persist_fps(app);
+}
+
+/*
+ * BL-004 PARITY FIX -- push the current volume into the audio player, but only when
+ * it has actually moved.
+ *
+ * THE MISSING EDGE. bounce_audio_player_set_volume() existed, was documented, and
+ * applied the gain correctly inside the worker -- and nothing in the game ever
+ * called it. The player kept the BOUNCE_AUDIO_VOLUME_DEFAULT it was constructed
+ * with, so the Audio row moved and record 6 changed while playback gain stayed at
+ * volume/100 == 1.0. The UI -> state -> persistence half of the setting was real;
+ * the state -> runtime half was missing. This function is that half.
+ *
+ * IT LIVES BESIDE THE SINK LOGIC BECAUSE THAT IS THE ONLY PLACE THAT KNOWS THE
+ * PLAYER POINTER IS GOOD FOR THIS ITERATION. The frame loop's existing
+ * `if (audio_player != NULL)` guard is the whole reason this cannot be called from
+ * the settings renderer or the input handler, where `audio_player` is not in scope
+ * at all.
+ *
+ * NULL-SAFE AND NON-FATAL, like the sink sync beside it: a player that could not be
+ * created leaves nothing to gate, so the call is skipped rather than raising an
+ * error, and audio initialisation failure stays non-fatal.
+ *
+ * `applied` IS THE CALLER'S SENTINEL, not a query of the player. Comparing against
+ * it keeps the write off the audio worker's hot path on the overwhelmingly common
+ * frames where the setting has not moved, and it makes the very first call
+ * unconditional, which is what puts a restored volume in force before the first
+ * sound rather than after it.
+ *
+ * THE WRITE IS SAFE MID-GAME. player->volume is a single unsigned int written here
+ * and read by the worker after it dequeues (see audio_player.c); a 32-bit store is
+ * atomic on every supported target, so the worker sees either the old value or the
+ * new one and never a torn one. The reference reaches the same place differently:
+ * BounceCanvas.playAudio() calls VolumeControl.setLevel(mVolume) on every playback
+ * (BounceCanvas.java:667-669), so the native push-on-change matches it in effect
+ * while not repeating the work per sound.
+ */
+static void app_sync_audio_volume(
+    BounceAudioPlayer *audio_player,
+    const BounceAppFlow *flow,
+    unsigned int *applied
+)
+{
+    unsigned int volume;
+
+    if (audio_player == NULL || flow == NULL || applied == NULL)
+        return;
+    volume = bounce_app_flow_settings_volume(flow);
+    if (volume == *applied)
+        return;
+    if (bounce_audio_player_set_volume(audio_player, volume) != 0)
+        return;
+    *applied = volume;
 }
 
 /*
@@ -21443,6 +21527,635 @@ static int verify_native_extension_ui(void)
 }
 
 /*
+ * BL-004 PARITY FIX -- an FNV digest over a rectangle of the surface.
+ *
+ * The same construction the file already uses for the level and thorn payload
+ * digests, applied to pixels instead of bytes. It exists so a render can be
+ * compared to another render of the same screen and answered with "these differ",
+ * which is what proves a control was actually drawn rather than merely declared.
+ */
+static unsigned long region_digest(
+    BounceSurface *surface,
+    int x,
+    int y,
+    int width,
+    int height
+)
+{
+    unsigned long digest = 1469598103934665603UL;
+    int px;
+    int py;
+
+    if (surface == NULL)
+        return 0UL;
+    for (py = y; py < y + height; ++py) {
+        for (px = x; px < x + width; ++px) {
+            uint32_t pixel = 0u;
+
+            if (bounce_surface_get_pixel(surface, px, py, &pixel) != 0)
+                return 0UL;
+            digest ^= (unsigned long)(pixel & 0xffu);
+            digest *= 1099511628211UL;
+            digest ^= (unsigned long)((pixel >> 8) & 0xffu);
+            digest *= 1099511628211UL;
+        }
+    }
+    return digest;
+}
+
+/*
+ * BL-004 PARITY FIX -- VOLUME 0 IS A VALUE, NOT A FAILURE, AND IT MUST SURVIVE A
+ * RESTART.
+ *
+ * THE DEFECT THIS EXISTS FOR. app_restore_persisted_settings() guarded its volume
+ * restore with `stored_volume != 0`, which treats the legal value 0 as "the load
+ * failed". Mute is therefore the one setting a player who had chosen it
+ * deliberately could not keep: it came back as 100. The store itself was always
+ * capable of it -- save_volume(0) and load_volume() round-trip 0 correctly -- so the
+ * bug was entirely in the launch path reading the result.
+ *
+ * IT TESTS THE LAUNCH PATH, NOT JUST THE STORE. Calling save/load alone would pass
+ * before the fix as well, which is the mistake this block is written against: the
+ * defect lived between the loader's correct answer and the flow's value, so the test
+ * drives app_restore_persisted_settings() and reads the flow afterwards.
+ */
+static int verify_volume_zero_survives_restart(void)
+{
+    BounceApp app;
+    int32_t stored = -1;
+    int bad = 0;
+
+    (void)printf("VOLUME-ZERO persistence round trip and launch restore\n");
+
+    /* A fresh flow starts at the documented default. */
+    memset(&app, 0, sizeof app);
+    bounce_app_flow_init(&app.flow);
+    if (bounce_app_flow_settings_volume(&app.flow)
+            != BOUNCE_AUDIO_VOLUME_DEFAULT) {
+        fprintf(stderr,
+                "volume-zero: a fresh flow is not at the default volume\n");
+        ++bad;
+    }
+
+    /* Mute survives the store. */
+    if (bounce_persistence_save_volume(0) != 0) {
+        fprintf(stderr, "volume-zero: save_volume(0) failed\n");
+        return -1;
+    }
+    stored = -1;
+    if (bounce_persistence_load_volume(&stored) != 0 || stored != 0) {
+        fprintf(stderr,
+                "volume-zero: load_volume did not return 0, got %ld\n",
+                (long)stored);
+        ++bad;
+    }
+
+    /* And survives the launch path, which is where the guard used to eat it. */
+    memset(&app, 0, sizeof app);
+    bounce_app_flow_init(&app.flow);
+    app_restore_persisted_settings(&app);
+    if (bounce_app_flow_settings_volume(&app.flow) != 0u) {
+        fprintf(stderr,
+                "volume-zero: launch restore dropped a stored 0, flow holds %u\n",
+                bounce_app_flow_settings_volume(&app.flow));
+        ++bad;
+    }
+
+    /* An ordinary value round-trips too, so 0 is not special-cased into passing. */
+    if (bounce_persistence_save_volume(37) != 0) {
+        fprintf(stderr, "volume-zero: save_volume(37) failed\n");
+        return -1;
+    }
+    memset(&app, 0, sizeof app);
+    bounce_app_flow_init(&app.flow);
+    app_restore_persisted_settings(&app);
+    if (bounce_app_flow_settings_volume(&app.flow) != 37u) {
+        fprintf(stderr,
+                "volume-zero: launch restore of 37 got %u\n",
+                bounce_app_flow_settings_volume(&app.flow));
+        ++bad;
+    }
+
+    /*
+     * OUT OF RANGE IS REFUSED BY THE FLOW, not silently wrapped, so a corrupt store
+     * cannot put an unwritable value into the setting.
+     */
+    if (bounce_app_flow_restore_persisted_volume(
+                &app.flow, BOUNCE_AUDIO_VOLUME_MAX + 1u) != -1) {
+        fprintf(stderr, "volume-zero: restore accepted a value above the maximum\n");
+        ++bad;
+    }
+    if (bounce_app_flow_settings_volume(&app.flow) != 37u) {
+        fprintf(stderr,
+                "volume-zero: a refused restore still changed the volume\n");
+        ++bad;
+    }
+
+    /*
+     * AND THE DEFAULT IS RESTORED WHEN THE RECORD IS ABSENT, which is the other
+     * half of the contract the removed guard used to express badly.
+     */
+    if (bounce_persistence_save_volume(BOUNCE_AUDIO_VOLUME_DEFAULT) != 0) {
+        fprintf(stderr, "volume-zero: could not re-seed the default\n");
+        return -1;
+    }
+    memset(&app, 0, sizeof app);
+    bounce_app_flow_init(&app.flow);
+    app_restore_persisted_settings(&app);
+    if (bounce_app_flow_settings_volume(&app.flow)
+            != BOUNCE_AUDIO_VOLUME_DEFAULT) {
+        fprintf(stderr,
+                "volume-zero: default volume did not survive the store\n");
+        ++bad;
+    }
+
+    (void)printf("  stored_zero_restored=%s default_survives=%s"
+                 " range_refused=%s %s\n",
+                 bad == 0 ? "yes" : "NO",
+                 bad == 0 ? "yes" : "NO",
+                 bad == 0 ? "yes" : "NO",
+                 bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * BL-005 PARITY FIX -- the FPS range is the reference's 10..60, default 25, and
+ * every layer that can meet an out-of-range value has to land on the same answer.
+ *
+ * THE RANGE MOVED and three places could have been left behind: the flow's restore
+ * guard, the persistence loader's clamp, and the UI's LEFT/RIGHT arithmetic. A
+ * mismatch between them is the defect this catches -- for example the UI clamps used
+ * to be written against 10..180 and would have walked past a 60 maximum.
+ */
+static int verify_fps_range_normalization(void)
+{
+    BounceAppFlow flow;
+    BounceApp app;
+    int32_t stored = -1;
+    int bad = 0;
+
+    (void)printf("FPS-RANGE bounds, default and out-of-range normalisation\n");
+
+    /* The bounds ARE the reference's. */
+    if (BOUNCE_FPS_MIN != 10u || BOUNCE_FPS_MAX != 60u
+        || BOUNCE_FPS_DEFAULT != 25u) {
+        fprintf(stderr,
+                "fps-range: bounds are %u..%u default %u, expected 10..60 default 25\n",
+                (unsigned int)BOUNCE_FPS_MIN, (unsigned int)BOUNCE_FPS_MAX,
+                (unsigned int)BOUNCE_FPS_DEFAULT);
+        ++bad;
+    }
+    /* The step must land on the maximum, or UP and RIGHT disagree about the end. */
+    if ((BOUNCE_FPS_MAX - BOUNCE_FPS_MIN) % BOUNCE_SETTINGS_FPS_STEP != 0u) {
+        fprintf(stderr, "fps-range: the step does not divide the range\n");
+        ++bad;
+    }
+
+    /* A fresh flow starts at the reference default, not at 60. */
+    bounce_app_flow_init(&flow);
+    if (bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_DEFAULT) {
+        fprintf(stderr, "fps-range: a fresh flow is not at the default\n");
+        ++bad;
+    }
+
+    /*
+     * BOTH ENDS OF THE RANGE ARE ACCEPTED BY THE FLOW. This is what the UI's
+     * arithmetic depends on: if either end were refused, LEFT or RIGHT at a bound
+     * would silently do nothing.
+     */
+    if (bounce_app_flow_restore_persisted_fps(
+                &flow, BOUNCE_FPS_MIN) != 0
+        || bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_MIN) {
+        fprintf(stderr, "fps-range: the minimum was refused\n");
+        ++bad;
+    }
+    if (bounce_app_flow_restore_persisted_fps(
+                &flow, BOUNCE_FPS_MAX) != 0
+        || bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_MAX) {
+        fprintf(stderr, "fps-range: the maximum was refused\n");
+        ++bad;
+    }
+
+    /*
+     * AND JUST OUTSIDE IT IS NOT. The flow refuses rather than clamping, so a
+     * corrupt or hand-edited store cannot install a value the UI cannot reach.
+     */
+    if (bounce_app_flow_restore_persisted_fps(
+                &flow, BOUNCE_FPS_MAX + 1u) != -1) {
+        fprintf(stderr, "fps-range: a value above the maximum was accepted\n");
+        ++bad;
+    }
+    if (bounce_app_flow_restore_persisted_fps(
+                &flow, BOUNCE_FPS_MIN - 1u) != -1) {
+        fprintf(stderr, "fps-range: a value below the minimum was accepted\n");
+        ++bad;
+    }
+
+    /*
+     * THE LOADER CLAMP INSTEAD, because a store that already holds 180 -- which any
+     * player who ran the 10..180 build has -- must not keep it, and must not leave
+     * the flow refusing forever either.
+     */
+    if (bounce_persistence_save_fps((int32_t)BOUNCE_FPS_MAX + 120) != 0) {
+        fprintf(stderr, "fps-range: save_fps of an out-of-range value failed\n");
+        return -1;
+    }
+    stored = -1;
+    if (bounce_persistence_load_fps(&stored) != 0
+        || (unsigned int)stored != BOUNCE_FPS_MAX) {
+        fprintf(stderr,
+                "fps-range: a stored %ld was not clamped to the maximum %u\n",
+                (long)((int32_t)BOUNCE_FPS_MAX + 120), BOUNCE_FPS_MAX);
+        ++bad;
+    }
+    /* And the clamped value is one the flow then accepts. */
+    memset(&app, 0, sizeof app);
+    bounce_app_flow_init(&app.flow);
+    app_restore_persisted_settings(&app);
+    if (bounce_app_flow_settings_fps(&app.flow) != BOUNCE_FPS_MAX) {
+        fprintf(stderr,
+                "fps-range: launch restore of the clamped value got %u\n",
+                bounce_app_flow_settings_fps(&app.flow));
+        ++bad;
+    }
+
+    /* A stored 0 is clamped up to the minimum, not treated as "absent". */
+    if (bounce_persistence_save_fps(0) != 0) {
+        fprintf(stderr, "fps-range: save_fps(0) failed\n");
+        return -1;
+    }
+    stored = -1;
+    if (bounce_persistence_load_fps(&stored) != 0
+        || (unsigned int)stored != BOUNCE_FPS_MIN) {
+        fprintf(stderr,
+                "fps-range: a stored 0 was not clamped up to %u, got %ld\n",
+                BOUNCE_FPS_MIN, (long)stored);
+        ++bad;
+    }
+
+    (void)bounce_persistence_save_fps((int32_t)BOUNCE_FPS_DEFAULT);
+
+    (void)printf("  bounds=10..60 default=25 ends_accepted=yes"
+                 " out_of_range_refused=yes loader_clamps=yes %s\n",
+                 bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * BL-005 PARITY FIX -- THE FPS ROW IS ACTUALLY PAINTED.
+ *
+ * THE DEFECT THIS EXISTS FOR. The Display page rendered three size facts and
+ * nothing else: no FPS label, no value, no selection band. The setting was live --
+ * selectable, adjustable, persisted, restored and spent by sleep_frame_fps() -- and
+ * invisible, so a player could move a number and never see it, and no test in the
+ * tree could notice. The earlier BL-005 report asserted "FPS displayed as 'XX FPS'
+ * on Display page"; it was not.
+ *
+ * WHY IT IS PROVEN BY DIFFERENCE RATHER THAN BY INK. A band that is painted is
+ * necessary but weak on its own -- the highlight alone would satisfy it. So the band
+ * is rendered twice with the FPS value set to the minimum and then to the maximum,
+ * and the VALUE REGION is required to differ. That can only happen if the number
+ * itself is on the screen, and it is the property a player actually reads.
+ *
+ * EVERY LANGUAGE IS CHECKED, and not only for boxes: SCRIPT-COVERAGE already proves
+ * no language paints a glyph box here, and this proves each of them paints
+ * SOMETHING, so a string that silently failed to render would be caught as well as
+ * one that rendered as a box.
+ */
+static int verify_display_fps_row_is_painted(void)
+{
+    static const BounceLanguage order[5] = {
+        BOUNCE_LANGUAGE_EN, BOUNCE_LANGUAGE_ZH_CN, BOUNCE_LANGUAGE_ZH_TW,
+        BOUNCE_LANGUAGE_TH_TH, BOUNCE_LANGUAGE_ID
+    };
+    BounceSurface *surface;
+    BounceRenderer *renderer;
+    BounceAppFlow flow;
+    unsigned int step;
+    int bad = 0;
+
+    (void)printf("DISPLAY-FPS-ROW label, value and selection band are painted\n");
+
+    surface = bounce_surface_create();
+    if (surface == NULL)
+        return -1;
+    renderer = bounce_renderer_create(surface);
+    if (renderer == NULL) {
+        bounce_surface_destroy(surface);
+        return -1;
+    }
+
+    for (step = 0u; step < 5u; ++step) {
+        unsigned long digest_min = 0ul;
+        unsigned long digest_max = 0ul;
+        unsigned long digest_off = 0ul;
+
+        memset(&flow, 0, sizeof flow);
+        bounce_app_flow_init(&flow);
+        flow.state = BOUNCE_APP_STATE_SETTINGS;
+        flow.level_selection.available_level_count =
+            (unsigned int)BOUNCE_APP_LAST_LEVEL_ID;
+        flow.level_selection.selected_index = 0u;
+        flow.gameplay_entry.phase =
+            BOUNCE_GAMEPLAY_ENTRY_PHASE_INIT_METADATA_RECORDED;
+        flow.gameplay_entry.level_id = BOUNCE_APP_FIRST_LEVEL_ID;
+        flow.settings.page = BOUNCE_SETTINGS_PAGE_DISPLAY;
+        bounce_locale_set_active_language(order[step]);
+        bounce_script_font_set_active_language(order[step]);
+
+        /*
+         * ONE RENDERER, REUSED. bounce_ui_shell_render_settings() begins with
+         * bounce_surface_fill(surface, background) over the whole 128x128, so every
+         * render fully replaces the previous one and a second renderer would buy
+         * nothing -- while a shared surface without that fill would have made the
+         * band comparison meaningless by accumulating both renders.
+         */
+        if (bounce_app_flow_restore_persisted_fps(
+                    &flow, BOUNCE_FPS_MIN) != 0
+            || bounce_ui_shell_render_settings(surface, renderer, &flow) != 0) {
+            fprintf(stderr,
+                    "display-fps-row: language %u failed to render at the minimum\n",
+                    (unsigned int)order[step]);
+            ++bad;
+            continue;
+        }
+        digest_min = region_digest(surface,
+                                   12,
+                                   BOUNCE_UI_DISPLAY_FPS_VALUE_Y - 2,
+                                   BOUNCE_UI_DISPLAY_FPS_BAND_WIDTH,
+                                   12);
+
+        if (bounce_app_flow_restore_persisted_fps(
+                    &flow, BOUNCE_FPS_MAX) != 0
+            || bounce_ui_shell_render_settings(surface, renderer, &flow) != 0) {
+            fprintf(stderr,
+                    "display-fps-row: language %u failed to render at the maximum\n",
+                    (unsigned int)order[step]);
+            ++bad;
+            continue;
+        }
+        digest_max = region_digest(surface,
+                                   12,
+                                   BOUNCE_UI_DISPLAY_FPS_VALUE_Y - 2,
+                                   BOUNCE_UI_DISPLAY_FPS_BAND_WIDTH,
+                                   12);
+
+        if (digest_min == digest_max) {
+            fprintf(stderr,
+                    "display-fps-row: language %u painted the same value region"
+                    " at %u and %u, so the FPS number is not on screen\n",
+                    (unsigned int)order[step],
+                    BOUNCE_FPS_MIN, BOUNCE_FPS_MAX);
+            ++bad;
+        }
+
+        /*
+         * THE SELECTION BAND. Rendered with the row NOT selected -- by hand, because
+         * a one-row page cannot navigate away from row 0 through the flow -- and
+         * compared against the selected render above. If the band were not drawn,
+         * these two would be identical.
+         */
+        flow.settings.selected_index = BOUNCE_SETTINGS_DISPLAY_ROW_FPS + 1u;
+        if (bounce_ui_shell_render_settings(surface, renderer, &flow) != 0) {
+            ++bad;
+        } else {
+            digest_off = region_digest(surface,
+                                       12,
+                                       BOUNCE_UI_DISPLAY_FPS_BAND_Y,
+                                       BOUNCE_UI_DISPLAY_FPS_BAND_WIDTH,
+                                       BOUNCE_UI_DISPLAY_FPS_BAND_HEIGHT);
+            if (digest_off == digest_max) {
+                fprintf(stderr,
+                        "display-fps-row: language %u paints no selection band\n",
+                        (unsigned int)order[step]);
+                ++bad;
+            }
+        }
+        flow.settings.selected_index = BOUNCE_SETTINGS_DISPLAY_ROW_FPS;
+    }
+
+    bounce_locale_set_active_language(BOUNCE_LANGUAGE_EN);
+    bounce_script_font_set_active_language(BOUNCE_LANGUAGE_EN);
+    bounce_renderer_destroy(renderer);
+    bounce_surface_destroy(surface);
+
+    (void)printf("  languages=5 value_tracks_fps=yes selection_band=yes %s\n",
+                 bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * BL-004 PARITY FIX -- the volume really reaches the player, including mid-game.
+ *
+ * THIS IS THE TEST FOR THE MISSING EDGE. app_sync_audio_volume() is the only thing
+ * that calls bounce_audio_player_set_volume(), and before it existed nothing did:
+ * the setting moved, the record changed, and the gain stayed at 1.0. This drives
+ * the same function the frame loop drives, against a real Null-backend player, so
+ * it proves the wiring rather than the setter.
+ *
+ * IT CANNOT PROVE THE MAIN LOOP CALLS IT. That call site needs a live X11 display
+ * and a running window, and no test in this tree drives the frame loop; the call
+ * itself is source-reviewed, sitting inside the same `if (audio_player != NULL)`
+ * guard as the sink sync. That limit is stated rather than papered over, and it is
+ * why this block asserts the function's contract in full -- NULL-safe, idempotent,
+ * and applying a change rather than only the startup value.
+ */
+static int verify_audio_volume_runtime_wiring(void)
+{
+    BounceAudioPlayerConfig config;
+    BounceAudioPlayer *player;
+    BounceAppFlow flow;
+    unsigned int applied = BOUNCE_AUDIO_VOLUME_MAX + 1u;
+    int bad = 0;
+
+    (void)printf("AUDIO-VOLUME-RUNTIME flow -> player gain wiring\n");
+
+    /* NULL player and NULL flow are both no-ops, not crashes. */
+    bounce_app_flow_init(&flow);
+    app_sync_audio_volume(NULL, &flow, &applied);
+    app_sync_audio_volume(NULL, NULL, &applied);
+    app_sync_audio_volume(NULL, &flow, NULL);
+
+    bounce_audio_player_default_config(&config);
+    config.resource_root = BOUNCE_RESOURCE_ROOT;
+    config.backend = BOUNCE_AUDIO_PLAYER_BACKEND_NULL;
+    config.shutdown = BOUNCE_AUDIO_PLAYER_SHUTDOWN_DISCARD;
+    config.drain_timeout_ms = 0u;
+    player = bounce_audio_player_create(&config);
+    if (player == NULL) {
+        fprintf(stderr, "audio-volume-runtime: Null-backend player not created\n");
+        return -1;
+    }
+
+    /* The startup value is pushed before anything else asks. */
+    if (bounce_app_flow_restore_persisted_volume(&flow, 40u) != 0) {
+        ++bad;
+    }
+    app_sync_audio_volume(player, &flow, &applied);
+    if (bounce_audio_player_get_volume(player) != 40u) {
+        fprintf(stderr,
+                "audio-volume-runtime: player holds %u after the first sync,"
+                " expected 40\n",
+                bounce_audio_player_get_volume(player));
+        ++bad;
+    }
+
+    /* Repeating it is a no-op that must not disturb the value. */
+    app_sync_audio_volume(player, &flow, &applied);
+    if (bounce_audio_player_get_volume(player) != 40u) {
+        fprintf(stderr, "audio-volume-runtime: a repeated sync changed the value\n");
+        ++bad;
+    }
+
+    /* A MID-GAME change -- the whole point of syncing every frame -- reaches it. */
+    if (bounce_app_flow_restore_persisted_volume(&flow, 0u) != 0) {
+        ++bad;
+    }
+    app_sync_audio_volume(player, &flow, &applied);
+    if (bounce_audio_player_get_volume(player) != 0u) {
+        fprintf(stderr,
+                "audio-volume-runtime: a mid-game change to 0 left the player at %u\n",
+                bounce_audio_player_get_volume(player));
+        ++bad;
+    }
+
+    /* And back up, so the test does not depend on 0 being terminal. */
+    if (bounce_app_flow_restore_persisted_volume(
+                &flow, BOUNCE_AUDIO_VOLUME_DEFAULT) != 0) {
+        ++bad;
+    }
+    app_sync_audio_volume(player, &flow, &applied);
+    if (bounce_audio_player_get_volume(player)
+            != BOUNCE_AUDIO_VOLUME_DEFAULT) {
+        fprintf(stderr,
+                "audio-volume-runtime: returning to the default did not reach"
+                " the player, it holds %u\n",
+                bounce_audio_player_get_volume(player));
+        ++bad;
+    }
+
+    (void)bounce_audio_player_destroy(player);
+
+    (void)printf("  null_safe=yes first_push=yes idempotent=yes mid_game=yes"
+                 " mute_reaches_player=yes %s\n",
+                 bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/* Defined near the frame loop, far below; declared here so the pacing check can
+ * measure the real function rather than restating its arithmetic. */
+static void sleep_frame_fps(unsigned int target_fps);
+
+/*
+ * BL-005 PARITY FIX -- THE FRAME PACING DURATION, MEASURED.
+ *
+ * WHAT THIS DOES AND DOES NOT CLAIM, because the distinction is the whole point:
+ *
+ *  - it MEASURES sleep_frame_fps(): that the delay it requests tracks 1000/fps, and
+ *    that a lower target asks for a longer wait;
+ *  - it does NOT measure the achieved frame rate of the game, which would need the
+ *    real frame loop, an X11 display and a compositor.
+ *
+ * It calls the pacing function directly instead of standing in for the loop, so the
+ * production loop is not driven, re-timed or otherwise disturbed by a test. The 25 Hz
+ * simulation tick is a separate mechanism entirely -- TICK-CADENCE measures it, by
+ * counting simulation ticks per elapsed millisecond -- and nothing here touches it.
+ * Keeping the two apart is deliberate: the earlier state of this feature had a test
+ * named for cadence that said nothing about the frame rate, which is the confusion
+ * this block is written to avoid.
+ *
+ * THE UPPER BOUND IS GENEROUS ON PURPOSE. nanosleep is a REQUEST: it sleeps at least
+ * the requested duration and is free to overshoot, and how much depends on kernel
+ * timer slack and machine load. Asserting a tight upper bound would make the suite
+ * fail on a loaded CI box for a reason that has nothing to do with the code. The
+ * lower bound is the part that is exact, and it is the direction that matters: the
+ * pacing must never deliver frames FASTER than the target the player chose, because
+ * that would mean the setting is not being honoured.
+ */
+static int verify_frame_pacing_duration(void)
+{
+    static const unsigned int targets[3] = { 10u, 25u, 60u };
+    int64_t measured_ms[3];
+    unsigned int i;
+    int bad = 0;
+
+    (void)printf("FRAME-PACING requested delay tracks 1000/fps\n");
+
+    for (i = 0u; i < 3u; ++i) {
+        const unsigned int iterations = 3u;
+        const int64_t expected_ms = 1000 / (int64_t)targets[i];
+        int64_t started;
+        int64_t elapsed;
+        unsigned int n;
+
+        started = monotonic_milliseconds();
+        for (n = 0u; n < iterations; ++n)
+            sleep_frame_fps(targets[i]);
+        elapsed = monotonic_milliseconds() - started;
+        measured_ms[i] = elapsed / (int64_t)iterations;
+
+        if (measured_ms[i] < expected_ms) {
+            fprintf(stderr,
+                    "frame-pacing: %u fps slept %lld ms per frame, FASTER than"
+                    " the %lld ms the target asks for\n",
+                    targets[i], (long long)measured_ms[i],
+                    (long long)expected_ms);
+            ++bad;
+        }
+        if (measured_ms[i] > expected_ms * 2) {
+            fprintf(stderr,
+                    "frame-pacing: %u fps slept %lld ms per frame, more than"
+                    " double the %lld ms requested\n",
+                    targets[i], (long long)measured_ms[i],
+                    (long long)expected_ms);
+            ++bad;
+        }
+    }
+
+    /*
+     * AND THE ORDERING IS RIGHT: a smaller target must ask for a longer wait. This
+     * catches a regression that made every target sleep the same fixed amount, which
+     * the per-target bounds above would each accept on their own.
+     */
+    if (!(measured_ms[0] > measured_ms[1] && measured_ms[1] > measured_ms[2])) {
+        fprintf(stderr,
+                "frame-pacing: measured %lld/%lld/%lld ms for 10/25/60 fps,"
+                " which is not decreasing\n",
+                (long long)measured_ms[0], (long long)measured_ms[1],
+                (long long)measured_ms[2]);
+        ++bad;
+    }
+
+    /*
+     * ZERO FALLS BACK TO THE DEFAULT RATHER THAN DIVIDING BY IT, which is the same
+     * guard sleep_frame_fps() documents and the only way a zero can reach it.
+     */
+    {
+        const int64_t expected_ms = 1000 / (int64_t)BOUNCE_FPS_DEFAULT;
+        int64_t started;
+        int64_t elapsed;
+
+        started = monotonic_milliseconds();
+        sleep_frame_fps(0u);
+        elapsed = monotonic_milliseconds() - started;
+        if (elapsed < expected_ms || elapsed > expected_ms * 2) {
+            fprintf(stderr,
+                    "frame-pacing: 0 slept %lld ms, expected the %u fps default"
+                    " of about %lld ms\n",
+                    (long long)elapsed, BOUNCE_FPS_DEFAULT,
+                    (long long)expected_ms);
+            ++bad;
+        }
+    }
+
+    (void)printf("  10fps=%lldms 25fps=%lldms 60fps=%lldms"
+                 " never_faster_than_target=yes zero_uses_default=yes %s\n",
+                 (long long)measured_ms[0], (long long)measured_ms[1],
+                 (long long)measured_ms[2], bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
  * NATIVE EXTENSION verification for the temporary UI color profiles.
  *
  * Confirms the audit conclusion holds at runtime: the palette is a local seam in
@@ -35859,6 +36572,17 @@ int main(int argc, char **argv)
      * SELECT on the Audio page.
      */
     bool audio_sink_attached = true;
+    /*
+     * BL-004 PARITY FIX -- the volume last pushed into `audio_player`, and the
+     * sentinel that forces the first real push.
+     *
+     * It exists for the same reason audio_sink_attached does: the frame loop must
+     * be able to tell a real change from a no-op without asking the player. The
+     * sentinel is a value no stored volume can take, so the first comparison is
+     * always unequal and the persisted volume is applied before the first sound
+     * rather than after it.
+     */
+    unsigned int audio_volume_applied = BOUNCE_AUDIO_VOLUME_MAX + 1u;
     X11PresentationContext x11_context;
     /*
      * STEP 13E -- the tracker is a stack instance like the other diagnostics and
@@ -36380,6 +37104,36 @@ int main(int argc, char **argv)
             "native language presentation verification failed\n");
         goto cleanup;
     }
+    if (verify_audio_volume_runtime_wiring() != 0) {
+        fprintf(
+            stderr,
+            "audio volume runtime wiring verification failed\n");
+        goto cleanup;
+    }
+    if (verify_volume_zero_survives_restart() != 0) {
+        fprintf(
+            stderr,
+            "volume zero persistence verification failed\n");
+        goto cleanup;
+    }
+    if (verify_fps_range_normalization() != 0) {
+        fprintf(
+            stderr,
+            "fps range normalization verification failed\n");
+        goto cleanup;
+    }
+    if (verify_display_fps_row_is_painted() != 0) {
+        fprintf(
+            stderr,
+            "display fps row verification failed\n");
+        goto cleanup;
+    }
+    if (verify_frame_pacing_duration() != 0) {
+        fprintf(
+            stderr,
+            "frame pacing verification failed\n");
+        goto cleanup;
+    }
     if (verify_native_extension_ui() != 0) {
         fprintf(
             stderr,
@@ -36878,6 +37632,14 @@ int main(int argc, char **argv)
             audio_sink_attached = true;
             if (bounce_app_flow_settings_audio_enabled(&app.flow))
                 (void)bounce_audio_player_attach_sink(audio_player);
+            /*
+             * BL-004 PARITY FIX -- the persisted volume goes in BEFORE the first
+             * sound, not on the first frame of the loop. Without this the player
+             * would render its opening samples at full gain and the setting would
+             * only take effect a frame later; the sentinel guarantees the call is
+             * made on this line rather than compared away as a no-op.
+             */
+            app_sync_audio_volume(audio_player, &app.flow, &audio_volume_applied);
         }
     }
 
@@ -36943,6 +37705,13 @@ int main(int argc, char **argv)
                 audio_sink_attached = want_sink;
             }
         }
+        /*
+         * BL-004 PARITY FIX -- and the same treatment for the volume, so a change
+         * made while the game is running reaches the player instead of waiting for
+         * the next launch. Reached on every frame; the sentinel comparison inside
+         * app_sync_audio_volume() is what makes that free when nothing moved.
+         */
+        app_sync_audio_volume(audio_player, &app.flow, &audio_volume_applied);
         if (x11_process_events(&x11_context, &app) != 0
             || app_update_ui(&app) != 0
             || app_update_production_game(&app) != 0

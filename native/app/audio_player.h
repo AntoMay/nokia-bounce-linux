@@ -240,6 +240,39 @@ int bounce_audio_player_set_volume(BounceAudioPlayer *player,
 unsigned int bounce_audio_player_get_volume(const BounceAudioPlayer *player);
 
 /*
+ * BL-004 PARITY FIX -- read the loudest |sample| that actually reached the output
+ * boundary, as reported by the Null backend.
+ *
+ * `out_peak` receives the maximum over every write so far and `out_last_peak` the
+ * maximum of the most recent single write. Either pointer may be NULL.
+ *
+ * THIS IS THE ONLY WAY TO SEE THE GAIN. audio_player.c applies volume to the
+ * rendered block immediately before write_pcm() and then hands the buffer away, so
+ * without this the volume setting's whole runtime effect was unobservable in a
+ * headless test: on the Null backend, "volume 0 is silent" and "nothing was
+ * rendered at all" produced identical evidence. It exists so the setting can be
+ * checked against rendered output rather than against the value in the struct.
+ *
+ * IT REPORTS THE NULL BACKEND ONLY, AND SAYS SO. A player built on ALSA has no peak
+ * to report; returning a real number for it would invent a measurement that was
+ * never taken. Those calls write 0 and return 0, and a test must have no
+ * backend-independent meaning to rely on.
+ *
+ * SAFE TO CALL WHILE THE AUDIO WORKER IS RUNNING. The peak fields are _Atomic and are
+ * read with relaxed loads, so this never blocks the worker and never blocks the
+ * caller on player->mutex -- which would not have helped anyway, because the worker
+ * releases that lock across render and write. A returned peak is a real value that
+ * was actually observed; it may predate the call, and a caller needing a figure for
+ * a specific sound should have counted that sound's playback first.
+ *
+ * Returns 0 on success, -1 for a NULL player or a non-Null backend. Both out-params
+ * are written to 0 before anything can fail, so a caller never reads a stale peak.
+ */
+int bounce_audio_player_null_peak(const BounceAudioPlayer *player,
+                                  unsigned int *out_peak,
+                                  unsigned int *out_last_peak);
+
+/*
  * Stop accepting, wake the worker, join it, close the backend, and free
  * everything. After this returns the player pointer is invalid.
  *

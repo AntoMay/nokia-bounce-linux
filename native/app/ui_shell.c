@@ -2228,8 +2228,17 @@ int bounce_ui_shell_handle_press(
         if (input == BOUNCE_UI_INPUT_LEFT
             || input == BOUNCE_UI_INPUT_RIGHT) {
             /*
-             * BL-004 -- LEFT/RIGHT adjusts the volume when the Audio page's
-             * volume row is selected. The step is 10, clamped to 0..100.
+             * BL-004 PARITY FIX -- LEFT/RIGHT moves the volume when the Audio
+             * page's volume row is selected. The step is BOUNCE_AUDIO_VOLUME_STEP,
+             * not the ten it used to be: the reference control is a Gauge
+             * (BounceUI.java:553) that a player slides, and tens could not reach
+             * most of the values it can.
+             *
+             * THE CLAMPS ARE DERIVED FROM THE CONSTANTS, not restated as 90 and
+             * 10, so changing the step or the range cannot leave this arithmetic
+             * quietly reaching past the end. `volume + STEP` is compared rather
+             * than `volume <= MAX - STEP` because MAX is small and this form
+             * cannot wrap on the way to the check.
              */
             if (bounce_app_flow_settings_page(flow)
                     == BOUNCE_SETTINGS_PAGE_AUDIO
@@ -2237,18 +2246,23 @@ int bounce_ui_shell_handle_press(
                     == BOUNCE_SETTINGS_AUDIO_ROW_VOLUME) {
                 unsigned int volume = bounce_app_flow_settings_volume(flow);
                 if (input == BOUNCE_UI_INPUT_LEFT) {
-                    if (volume >= 10u)
-                        volume -= 10u;
+                    if (volume >= BOUNCE_AUDIO_VOLUME_STEP)
+                        volume -= BOUNCE_AUDIO_VOLUME_STEP;
                 } else {
-                    if (volume <= 90u)
-                        volume += 10u;
+                    if (volume + BOUNCE_AUDIO_VOLUME_STEP
+                        <= BOUNCE_AUDIO_VOLUME_MAX)
+                        volume += BOUNCE_AUDIO_VOLUME_STEP;
                 }
                 flow->settings.volume = volume;
                 return 0;
             }
             /*
-             * BL-005 -- LEFT/RIGHT adjusts the FPS when the Display page's
-             * FPS row is selected. The step is 10, clamped to 10..180.
+             * BL-005 -- LEFT/RIGHT moves the FPS when the Display page's FPS row
+             * is selected. The step is BOUNCE_SETTINGS_FPS_STEP and the clamps are
+             * derived from BOUNCE_FPS_MIN / BOUNCE_FPS_MAX, which are now 10 and
+             * 60 to match the reference's clamp. The old literals -- 20 and 170 --
+             * belonged to the 10..180 range and would have walked straight past the
+             * new maximum.
              */
             if (bounce_app_flow_settings_page(flow)
                     == BOUNCE_SETTINGS_PAGE_DISPLAY
@@ -2256,11 +2270,11 @@ int bounce_ui_shell_handle_press(
                     == BOUNCE_SETTINGS_DISPLAY_ROW_FPS) {
                 unsigned int fps = bounce_app_flow_settings_fps(flow);
                 if (input == BOUNCE_UI_INPUT_LEFT) {
-                    if (fps >= 20u)
-                        fps -= 10u;
+                    if (fps >= BOUNCE_FPS_MIN + BOUNCE_SETTINGS_FPS_STEP)
+                        fps -= BOUNCE_SETTINGS_FPS_STEP;
                 } else {
-                    if (fps <= 170u)
-                        fps += 10u;
+                    if (fps + BOUNCE_SETTINGS_FPS_STEP <= BOUNCE_FPS_MAX)
+                        fps += BOUNCE_SETTINGS_FPS_STEP;
                 }
                 flow->settings.target_fps = fps;
                 return 0;
@@ -2914,6 +2928,85 @@ static int draw_native_size(
     return 0;
 }
 
+/*
+ * BL-004 PARITY FIX -- the volume slider, the native stand-in for LKT Pro's Gauge.
+ *
+ * BounceUI.java:553 builds `new Gauge(Local.getText(26), true, 100, this.mVolume)`:
+ * a 0..100 control the player slides along a track. What this build drew instead --
+ * a bare "100%" and LEFT/RIGHT in tens -- showed no position at all and could not
+ * land on most of the values the reference reaches. This draws the three parts a
+ * slider is read by: the track, the filled portion, and the thumb.
+ *
+ * WHY IT SITS UNDER ITS OWN ROW. The three Audio rows are at y = 66, 80 and 94, and
+ * the 5x7 glyph is 7 px tall, so the band below y = 101 is free on this page --
+ * STEP 38-RESET-UI removed the ESC BACK footer that used to occupy it. A track the
+ * width of the label column reads as one control rather than as decoration stuck to
+ * a number.
+ *
+ * TWO INDEPENDENT READINGS, ON PURPOSE. The filled length gives the position, the
+ * thumb gives it precisely, and the number beside the label gives the exact value
+ * without the player having to measure pixels. All three come from the same `volume`
+ * argument, which is the flow's current value, so none of them can disagree with
+ * what the next LEFT/RIGHT will write.
+ */
+#define BOUNCE_UI_VOLUME_SLIDER_X 36
+#define BOUNCE_UI_VOLUME_SLIDER_Y 104
+#define BOUNCE_UI_VOLUME_SLIDER_WIDTH 84
+#define BOUNCE_UI_VOLUME_SLIDER_HEIGHT 3
+#define BOUNCE_UI_VOLUME_THUMB_WIDTH 5
+#define BOUNCE_UI_VOLUME_THUMB_HEIGHT 7
+
+/*
+ * IT CLAMPS RATHER THAN TRUSTING ITS ARGUMENT. The flow already guarantees
+ * 0..BOUNCE_AUDIO_VOLUME_MAX, but this function divides by that maximum, and a
+ * caller handing it an out-of-range value would otherwise paint past the track and
+ * the thumb off the end. Clamping here costs one comparison and makes the widget
+ * impossible to draw wrong.
+ *
+ * THE THUMB TRAVELS THE TRACK'S OWN SPAN, track width minus thumb width, so at 0 it
+ * sits flush with the left edge and at the maximum flush with the right, and cannot
+ * overhang either. It is centred on the track vertically, which is why its height is
+ * larger than the track's.
+ */
+static int draw_volume_slider(
+    BounceRenderer *renderer,
+    int x,
+    int y,
+    unsigned int volume,
+    uint32_t track_color,
+    uint32_t fill_color,
+    uint32_t thumb_color
+)
+{
+    int filled;
+    int thumb_x;
+    int thumb_y;
+
+    if (renderer == NULL)
+        return -1;
+    if (volume > BOUNCE_AUDIO_VOLUME_MAX)
+        volume = BOUNCE_AUDIO_VOLUME_MAX;
+
+    if (bounce_renderer_fill_rect(renderer, x, y,
+            BOUNCE_UI_VOLUME_SLIDER_WIDTH, BOUNCE_UI_VOLUME_SLIDER_HEIGHT,
+            track_color) != 0)
+        return -1;
+    filled = (int)((volume * (unsigned int)BOUNCE_UI_VOLUME_SLIDER_WIDTH)
+        / BOUNCE_AUDIO_VOLUME_MAX);
+    if (filled > 0
+        && bounce_renderer_fill_rect(renderer, x, y, filled,
+                BOUNCE_UI_VOLUME_SLIDER_HEIGHT, fill_color) != 0)
+        return -1;
+    thumb_x = x + (int)((volume * (unsigned int)
+            (BOUNCE_UI_VOLUME_SLIDER_WIDTH - BOUNCE_UI_VOLUME_THUMB_WIDTH))
+        / BOUNCE_AUDIO_VOLUME_MAX);
+    thumb_y = y - (BOUNCE_UI_VOLUME_THUMB_HEIGHT
+        - BOUNCE_UI_VOLUME_SLIDER_HEIGHT) / 2;
+    return bounce_renderer_fill_rect(renderer, thumb_x, thumb_y,
+                                     BOUNCE_UI_VOLUME_THUMB_WIDTH,
+                                     BOUNCE_UI_VOLUME_THUMB_HEIGHT, thumb_color);
+}
+
 int bounce_ui_shell_render_settings(
     BounceSurface *surface,
     BounceRenderer *renderer,
@@ -3039,12 +3132,18 @@ const uint32_t back = ui->accent;
         }
     } else if (bounce_app_flow_settings_page(flow)
                == BOUNCE_SETTINGS_PAGE_DISPLAY) {
+        const uint32_t fps_row_color
+            = (bounce_app_flow_settings_selected_index(flow)
+                   == BOUNCE_SETTINGS_DISPLAY_ROW_FPS)
+                  ? selected_text
+                  : text;
+        char fps_text[8];
         /*
-         * Only the presentation concepts this build actually supports. The
-         * numbers are drawn with the real digit font because the placeholder
-         * letter font has no digit glyphs; embedding them in a string would
-         * render the unknown-glyph box instead.
+         * Only the presentation concepts this build actually supports, drawn with
+         * draw_native_size because it uses the real digit font.
          */
+        (void)snprintf(fps_text, sizeof(fps_text), "%u",
+                       bounce_app_flow_settings_fps(flow));
         if (draw_placeholder_text(
                 renderer, 14, 24, tr(BOUNCE_LOCALE_LOGICAL_RESOLUTION), muted) != 0
             || draw_native_size(renderer, 22, 34, 128, 128, text) != 0
@@ -3054,6 +3153,51 @@ const uint32_t back = ui->accent;
             || draw_placeholder_text(
                 renderer, 14, 76, tr(BOUNCE_LOCALE_UI_HUD_REGION), muted) != 0
             || draw_native_size(renderer, 22, 86, 128, 32, text) != 0)
+            return -1;
+        /*
+         * BL-005 PARITY FIX -- AND THE FPS CONTROL, WHICH WAS ADJUSTABLE AND
+         * COMPLETELY INVISIBLE.
+         *
+         * The row existed: BOUNCE_SETTINGS_DISPLAY_ROW_FPS was selectable, LEFT and
+         * RIGHT moved it, it was persisted as record 7 and restored at launch, and
+         * sleep_frame_fps() spent it every frame. Nothing drew it. The page rendered
+         * three size facts and stopped, so a player could press LEFT/RIGHT on a
+         * screen that did not change and had no way to tell what the value was --
+         * or even that the setting was there. A setting that cannot be seen cannot
+         * be verified, which is why BOUNCE_LOCALE_TARGET_FPS existed in all five
+         * languages and was never painted, and why the glyphs its strings needed
+         * were missing until the font was regenerated.
+         *
+         * THE LABEL IS WRAPPED, NOT CLIPPED. lang.th-TH's string is 14 clusters,
+         * about 154 px at the Thai advance, on a 128 px surface, and it has no
+         * space to break on. draw_centered_placeholder_wrapped() is the helper this
+         * shell already uses for exactly that case: it splits at a cluster boundary
+         * and draws the second line 10 px down, so no language loses characters and
+         * no renderer error is raised. The renderer clips silently, so a plain
+         * draw_placeholder_text() here would have quietly hidden most of the Thai
+         * label rather than failing.
+         *
+         * NO NEW LOCALE STRING. BOUNCE_LOCALE_TARGET_FPS is already carried in all
+         * five languages and already means this row; the value is drawn as bare
+         * digits because the label beside it already names the unit.
+         *
+         * THE BAND IS TALLER THAN A ROW BAND ON PURPOSE. The Audio and Input pages
+         * highlight 13 px because a row is one line of glyphs. This control is a
+         * label plus a value that may occupy two lines in Thai, and a 13 px band
+         * would highlight a fraction of what the player is selecting.
+         */
+        if (bounce_app_flow_settings_selected_index(flow)
+                == BOUNCE_SETTINGS_DISPLAY_ROW_FPS
+            && bounce_renderer_fill_rect(renderer, 12,
+                    BOUNCE_UI_DISPLAY_FPS_BAND_Y,
+                    BOUNCE_UI_DISPLAY_FPS_BAND_WIDTH,
+                    BOUNCE_UI_DISPLAY_FPS_BAND_HEIGHT, highlight) != 0)
+            return -1;
+        if (draw_centered_placeholder_wrapped(renderer,
+                BOUNCE_UI_DISPLAY_FPS_LABEL_Y,
+                tr(BOUNCE_LOCALE_TARGET_FPS), fps_row_color) != 0
+            || draw_centered_placeholder_text(renderer,
+                   BOUNCE_UI_DISPLAY_FPS_VALUE_Y, fps_text, fps_row_color) != 0)
             return -1;
     } else if (bounce_app_flow_settings_page(flow)
                == BOUNCE_SETTINGS_PAGE_INPUT) {
@@ -3133,8 +3277,26 @@ const uint32_t back = ui->accent;
          * with the same primitives; nothing new was introduced.
          *
          * BL-004 -- row 2 is the volume control. It shows the current volume
-         * as a percentage and is adjusted with LEFT/RIGHT arrows. The step
-         * is 10, clamped to 0..100.
+         * as a percentage and is adjusted with LEFT/RIGHT arrows, and it now
+         * draws a track with a thumb under the row rather than a number alone.
+         *
+         * COMMIT SEMANTICS ARE A DOCUMENTED DEVIATION, not parity. The reference
+         * commits the Gauge on OK -- BounceUI.java:308 reads
+         * `this.mVolume = this.mVolumeGauge.getValue()` inside the settings
+         * Form's OK handler and then calls saveSettingsData(), so BACK discards
+         * the edit. This page has no OK button on a control row and no cancel
+         * affordance: LEFT/RIGHT writes through to the flow on the press, the
+         * audio gain follows in the same frame, and app_commit_volume_change()
+         * persists on that edge. Nothing is discarded by leaving the page.
+         *
+         * The reason is the shell's own, not convenience: the Audio and Display
+         * pages are navigated with the arrow keys and applied with SELECT, and
+         * SELECT on these two rows is already a documented no-op (see
+         * bounce_app_flow_settings_select()). Adding a second commit key for one
+         * row would give the page two different meanings for SELECT. A player who
+         * wants to leave a value unchanged leaves it before moving. It is a real
+         * behavioural difference from the reference and is called out as one
+         * rather than papered over.
          *
          * It is deliberately minimal. There is no device row, no mute, no
          * test button, no backend report and no status line: the
@@ -3193,9 +3355,16 @@ const uint32_t back = ui->accent;
                 return -1;
             if (row == BOUNCE_SETTINGS_AUDIO_ROW_VOLUME) {
                 /*
-                 * BL-004 -- the volume row shows the current volume as a
-                 * percentage. The volume is adjusted with LEFT/RIGHT, not
-                 * SELECT, so there is no applied marker.
+                 * BL-004 PARITY FIX -- the number stays, and the slider is added
+                 * under the row. The number is drawn from the same `volume` the
+                 * thumb and the filled track are drawn from, so the exact value and
+                 * the position cannot disagree.
+                 *
+                 * THE MARKER COLUMN STAYS BLANK HERE, as it has since the row was
+                 * added, because this setting has no applied value separate from the
+                 * one on screen: LEFT/RIGHT writes it straight through and
+                 * app_commit_volume_change() persists the same edge. The reference
+                 * commits on OK instead -- see the note on commit semantics below.
                  */
                 char volume_text[8];
                 (void)snprintf(volume_text, sizeof(volume_text), "%u%%",
@@ -3204,7 +3373,15 @@ const uint32_t back = ui->accent;
                     || draw_placeholder_text(
                            renderer, 36, y, tr(value_keys[row]), row_color) != 0
                     || draw_placeholder_text(
-                           renderer, 80, y, volume_text, row_color) != 0)
+                           renderer, 80, y, volume_text, row_color) != 0
+                    || draw_volume_slider(
+                           renderer,
+                           BOUNCE_UI_VOLUME_SLIDER_X,
+                           BOUNCE_UI_VOLUME_SLIDER_Y,
+                           volume,
+                           muted,
+                           row_color,
+                           back) != 0)
                     return -1;
             } else {
                 if (draw_placeholder_text(renderer, 24, y, &marker, mark_color) != 0

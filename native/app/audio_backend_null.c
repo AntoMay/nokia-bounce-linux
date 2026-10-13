@@ -4,6 +4,13 @@
  * No ALSA include. No platform header. No engine header. No allocation. No
  * thread. No queue. Produces no sound.
  *
+ * "No thread" means it does not CREATE one. It is still called FROM a thread --
+ * the audio player's worker -- and since BL-004 PARITY FIX the two amplitude
+ * statistics it keeps are _Atomic, because that worker writes them with the
+ * player's mutex released while a reader may run on the gameplay thread. See the
+ * note on peak_sample in the header for the full argument; the assertion below is
+ * the half of it that can be checked by the compiler.
+ *
  * Every write is accounted for and then discarded, which is the whole point: a
  * caller can verify that the right number of frames reached the output boundary
  * without a device existing.
@@ -13,6 +20,27 @@
 
 #include <stdio.h>
 #include <string.h>
+
+/*
+ * THE PEAK STATISTICS MUST BE LOCK-FREE, AND THIS SAYS SO AT BUILD TIME.
+ *
+ * Everything above argues that atomics are cheaper than a mutex HERE. That argument
+ * is only true while they really are a plain word access: if a target were to
+ * implement atomic_uint with a hidden lock, the audio worker would acquire it once
+ * per rendered block, which is precisely the cost the design set out to avoid and
+ * it would be invisible in review. ATOMIC_INT_LOCK_FREE == 2 is C11's "always
+ * lock-free" value, so this build fails rather than silently paying for a lock.
+ *
+ * The other legitimate value is 1, "sometimes lock-free, never a lock-based
+ * fallback", which is only acceptable when the compiler has told us it will use a
+ * lock-free path on the target we are building for. Both are fine here; 0 and
+ * anything else is not, which is what the assertion rejects.
+ */
+#if defined(ATOMIC_INT_LOCK_FREE) && ATOMIC_INT_LOCK_FREE
+_Static_assert(ATOMIC_INT_LOCK_FREE != 0,
+               "the peak statistics require a lock-free unsigned int;"
+               " a lock-based fallback would put a lock on the audio hot path");
+#endif
 
 /* Copy a bounded string, always NUL terminating. */
 static void bounce_audio_null_copy(char *dst, size_t capacity,
@@ -120,7 +148,59 @@ static BounceAudioBackendStatus bounce_audio_null_write(
     /*
      * Counted, then discarded. The PCM is NOT retained: retaining it would be a
      * queue, which belongs to a later step and not here.
+     *
+     * The peak is the one thing taken from the buffer before it is dropped, and it
+     * is two integers rather than the samples. See the note on peak_sample in the
+     * header for why the volume gain is otherwise unobservable here.
      */
+    {
+        unsigned int peak = 0u;
+        unsigned int observed;
+        size_t i;
+
+        for (i = 0u; i < frames; i++) {
+            /*
+             * Negated in unsigned arithmetic so INT16_MIN -- -32768, whose
+             * magnitude has no int16 counterpart -- cannot overflow into a small
+             * positive number and read as a quiet sample.
+             */
+            const unsigned int magnitude
+                = (samples[i] < 0)
+                      ? (unsigned int)(-(int)samples[i])
+                      : (unsigned int)samples[i];
+
+            if (magnitude > peak)
+                peak = magnitude;
+        }
+        /*
+         * THE PEAK UPDATE IS ATOMIC BECAUSE THE AUDIO WORKER IS ITS WRITER AND IT IS
+         * NOT HOLDING A LOCK HERE. The worker drops player->mutex across render and
+         * write on purpose, so a reader on the gameplay thread can race these two
+         * words. Relaxed ordering is the right strength and no less: there is no other
+         * memory this has to be ordered against, only two counters that must never be
+         * seen half-written.
+         *
+         * THE MAXIMUM IS TAKEN WITH A COMPARE-EXCHANGE LOOP rather than a
+         * load-compare-store. With one writer the simpler form would be fine, but this
+         * is the same code path a second writer would use and the loop is what makes
+         * "highest peak so far" actually mean that when two writers overlap: a plain
+         * load-compare-store can read a stale maximum and write back a smaller one,
+         * silently losing a peak. The exchange refreshes `observed` on failure, which
+         * is what the loop re-tests.
+         */
+        atomic_store_explicit(
+            &state->last_write_peak, peak, memory_order_relaxed);
+        observed = atomic_load_explicit(&state->peak_sample, memory_order_relaxed);
+        while (peak > observed
+            && !atomic_compare_exchange_weak_explicit(
+                   &state->peak_sample,
+                   &observed,
+                   peak,
+                   memory_order_relaxed,
+                   memory_order_relaxed)) {
+            /* `observed` was refreshed by the failed exchange; re-test it. */
+        }
+    }
     state->total_frames += (unsigned long long)frames;
     state->total_bytes += (unsigned long long)frames
                         * (unsigned long long)sizeof(int16_t)
@@ -171,6 +251,16 @@ void bounce_audio_backend_null_reset(BounceAudioNullState *state)
     state->total_frames = 0ull;
     state->total_bytes = 0ull;
     state->write_count = 0ull;
+    /*
+     * The amplitude summaries reset with the counters, atomically like every other
+     * access. atomic_store rather than a plain assignment: this function is public
+     * and is not restricted to the single-threaded start-up case by its signature,
+     * so a caller that reset a live player's backend must not introduce a data race
+     * with the audio worker. Relaxed is sufficient -- a reset is a value, not an
+     * event, and there is nothing for it to be ordered against.
+     */
+    atomic_store_explicit(&state->peak_sample, 0u, memory_order_relaxed);
+    atomic_store_explicit(&state->last_write_peak, 0u, memory_order_relaxed);
     state->drain_count = 0ull;
     state->device[0] = '\0';
     state->error[0] = '\0';

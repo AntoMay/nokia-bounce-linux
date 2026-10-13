@@ -804,6 +804,26 @@ unsigned int bounce_app_flow_level_selection_selected_index(
 #define BOUNCE_AUDIO_VOLUME_DEFAULT 100u
 
 /*
+ * BL-004 PARITY FIX -- how far one LEFT or RIGHT press moves the volume.
+ *
+ * The step used to be 10, which is not what the reference offers: LKT Pro's
+ * control is a Gauge (BounceUI.java:553), a track the player moves along, and a
+ * bare number stepped in tens could not land on 7 or 43 -- a value the reference
+ * reaches by dragging. Five is a choice made here, and it is recorded as one:
+ *
+ *  - MIDP Gauge exposes no step parameter and the decompiled reference never says
+ *    what one press or one notch moves it by, so this number is NOT a recovered
+ *    granularity and must not be described as matching a particular handset;
+ *  - five places a thumb anywhere a player is likely to want (0, 5, 10 ... 100)
+ *    while still letting a keyboard reach either end in twenty presses rather than
+ *    a hundred, which is what a ten-step slider could not do either.
+ *
+ * The value is always a multiple of this step, so the slider thumb lands exactly
+ * on a stop instead of between two.
+ */
+#define BOUNCE_AUDIO_VOLUME_STEP 5u
+
+/*
  * BL-004 -- NATIVE ADDITION. The volume setting, as record 6 of the SAME
  * container.
  *
@@ -820,22 +840,48 @@ unsigned int bounce_app_flow_level_selection_selected_index(
 /*
  * BL-005 -- NATIVE ADDITION. The FPS setting range.
  *
- * The reference mod (BounceUI.java:89, :552) exposes an FPS value 10-60
- * with a default of 25, stored in settings RMS. The native system extends
- * this range to 10-180 for rendering FPS, while keeping the simulation
- * timestep fixed at 40ms (25 Hz) to preserve gameplay behavior.
+ * THE RANGE AND THE DEFAULT ARE NOW THE REFERENCE'S, and the earlier values were
+ * not. They used to read
  *
- * DEFAULT IS 60 FPS for rendering, providing smooth visuals on modern
- * displays while keeping the simulation at the original 25 Hz.
+ *     The native system extends this range to 10-180 for rendering FPS ...
+ *     DEFAULT IS 60 FPS for rendering, providing smooth visuals on modern displays
+ *
+ * which is an assertion about what this project wanted, not about what LKT Pro
+ * does. The reference clamps a typed value to 10..60 and defaults it to 25
+ * (BounceUI.java:296-306, :89), and the 180 upper bound had no source behind it at
+ * all. A parity target is taken from the reference, so 10..60 and 25 are what a
+ * stored or default value now means, and an existing player who somehow has 120
+ * persisted lands on 60 through the loader's clamp rather than keeping a value
+ * outside the contract.
+ *
+ * WHAT IS STILL NATIVE, AND IS NOT PARITY. The reference applies this number as the
+ * period of the one TimerTask whose body both steps the simulation and repaints
+ * (GameTimer.java:16-25 -> TileCanvas.timerTrigger() -> BounceCanvas.run()), with no
+ * delta-time compensation anywhere -- so there, raising the FPS also raises the
+ * game's speed. This build keeps the simulation on its own fixed 40 ms / 25 Hz tick
+ * (BOUNCE_GAME_TIMER_PERIOD_MS) and applies the setting to RENDER PACING ONLY. That
+ * decoupling is a deliberate, documented deviation; see sleep_frame_fps() in
+ * vertical_slice.c. It is why a value in this range cannot be called full parity
+ * with the reference, and why the setting must never be described as one.
+ *
+ * The simulation tick is gameplay and is not changed by that decision.
  */
 #define BOUNCE_FPS_MIN 10u
-#define BOUNCE_FPS_MAX 180u
-#define BOUNCE_FPS_DEFAULT 60u
+#define BOUNCE_FPS_MAX 60u
+#define BOUNCE_FPS_DEFAULT 25u
 
 /*
  * BL-005 -- NATIVE ADDITION. The Display page has one row for the FPS control.
  * SELECT on the FPS row is a no-op; the FPS is adjusted with LEFT/RIGHT.
+ *
+ * BOUNCE_SETTINGS_FPS_STEP divides BOUNCE_FPS_MIN..BOUNCE_FPS_MAX exactly, so the
+ * value is always on a stop: 10, 20, 30, 40, 50, 60. The reference lets the player
+ * TYPE any number (a two-digit numeric TextField, BounceUI.java:552) and clamps
+ * the result to the same 10..60, so the native control offers fewer stops than the
+ * reference does. That is a deliberate consequence of having no text entry on a
+ * keypad-driven shell, not a claim that ten is what the reference produces.
  */
+#define BOUNCE_SETTINGS_FPS_STEP 10u
 #define BOUNCE_SETTINGS_DISPLAY_VALUE_COUNT 1u
 #define BOUNCE_SETTINGS_DISPLAY_ROW_FPS 0u
 
