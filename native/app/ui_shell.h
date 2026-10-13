@@ -91,6 +91,18 @@ const BounceUiPalette *bounce_ui_shell_palette(void);
 int bounce_ui_shell_can_draw_ascii(int codepoint);
 
 /*
+ * BL-004 -- the volume a pointer position on the slider track stands for.
+ *
+ * Maps x across the whole drawn track, so the left edge is 0 and the right edge is
+ * BOUNCE_AUDIO_VOLUME_MAX, and snaps to the nearest BOUNCE_AUDIO_VOLUME_STEP stop.
+ * Positions outside the track clamp to the two ends rather than being rejected,
+ * because a drag that overshoots should pin to the end rather than stop responding.
+ *
+ * Exposed so the click handler and its tests apply the identical rule.
+ */
+unsigned int bounce_ui_shell_volume_from_track_x(int x);
+
+/*
  * BL-005 -- where the FPS control sits on the Display page.
  *
  * THE SIZE FACTS ABOVE IT END AT y = 92 (the last one's digits start at 86 and are
@@ -181,7 +193,30 @@ typedef enum BounceUiInput {
      * the volume by 10. These inputs are ignored on all other pages.
      */
     BOUNCE_UI_INPUT_LEFT = 6,
-    BOUNCE_UI_INPUT_RIGHT = 7
+    BOUNCE_UI_INPUT_RIGHT = 7,
+    /*
+     * BL-005 -- TEXT ENTRY, WHICH LEFT AND RIGHT CANNOT EXPRESS.
+     *
+     * The FPS setting is a two-digit numeric field in the reference
+     * (BounceUI.java:552), so it needs characters, not a step. These ten plus
+     * BACKSPACE are the only new inputs the UI gained; nothing else in the shell
+     * consumes them, and bounce_ui_shell_handle_press() only acts on them while an
+     * edit is actually live -- which is what stops a digit key from being swallowed
+     * by navigation, or reaching the game, on every other screen.
+     *
+     * Appended after LEFT/RIGHT so no existing enumerator value moves.
+     */
+    BOUNCE_UI_INPUT_DIGIT0 = 8,
+    BOUNCE_UI_INPUT_DIGIT1 = 9,
+    BOUNCE_UI_INPUT_DIGIT2 = 10,
+    BOUNCE_UI_INPUT_DIGIT3 = 11,
+    BOUNCE_UI_INPUT_DIGIT4 = 12,
+    BOUNCE_UI_INPUT_DIGIT5 = 13,
+    BOUNCE_UI_INPUT_DIGIT6 = 14,
+    BOUNCE_UI_INPUT_DIGIT7 = 15,
+    BOUNCE_UI_INPUT_DIGIT8 = 16,
+    BOUNCE_UI_INPUT_DIGIT9 = 17,
+    BOUNCE_UI_INPUT_BACKSPACE = 18
 } BounceUiInput;
 
 /*

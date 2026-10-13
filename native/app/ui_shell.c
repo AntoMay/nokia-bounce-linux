@@ -1777,6 +1777,86 @@ static bool ui_point_in_row(int y, int row_y, int row_h)
  * produced and handing it to the ordinary handler. Returns 1 when an edge was
  * produced, 0 when the click was outside every interactive element.
  */
+/*
+ * BL-004 -- the volume slider's geometry.
+ *
+ * THE REFERENCE USES A GAUGE, and this is the native stand-in for one.
+ * BounceUI.java:553 builds `new Gauge(Local.getText(26), true, 100, mVolume)`:
+ * a 0..100 control the player drags along a track. A bare number with LEFT/RIGHT
+ * in tens was not that -- it hid the position, and it could not land on 7 or 43,
+ * which the reference can.
+ *
+ * WHY IT SITS UNDER ITS OWN ROW. The three Audio rows are at y = 66, 80 and 94, and
+ * the 5x7 glyph is 7 px tall, so the band below y = 101 is free on this page --
+ * STEP 38-RESET-UI removed the ESC BACK footer that used to occupy it. A track the
+ * width of the label column reads as one control rather than as decoration attached
+ * to a number.
+ *
+ * THESE LIVE HERE, ABOVE BOTH USES, NOT NEXT TO THE RENDERER. The pointer mapping
+ * bounce_ui_shell_volume_from_track_x() and the drawing routine both need them, and
+ * when the constants sat beside draw_volume_slider() the pointer code could not see
+ * them at all.
+ */
+#define BOUNCE_UI_VOLUME_SLIDER_X 36
+#define BOUNCE_UI_VOLUME_SLIDER_Y 104
+#define BOUNCE_UI_VOLUME_SLIDER_WIDTH 84
+#define BOUNCE_UI_VOLUME_SLIDER_HEIGHT 3
+#define BOUNCE_UI_VOLUME_THUMB_WIDTH 5
+#define BOUNCE_UI_VOLUME_THUMB_HEIGHT 7
+
+/*
+ * BL-004 -- MAP A POINTER POSITION ON THE VOLUME SLIDER TO A VOLUME.
+ *
+ * WHY A FUNCTION RATHER THAN ARITHMETIC IN THE CLICK HANDLER. The snap-to-step rule
+ * and the clamping at both ends are the whole correctness of a draggable slider, and
+ * a pointer is the input most likely to land between two stops. Keeping it here
+ * means the click handler and its tests apply the identical rule, so a test cannot
+ * pass against a slightly different one.
+ *
+ * THE FULL TRACK WIDTH IS THE RANGE. The thumb is inset by its own width so it never
+ * overhangs, but the VALUE maps across all BOUNCE_UI_VOLUME_SLIDER_WIDTH pixels, so
+ * the left edge of the track is 0 and the right edge is BOUNCE_AUDIO_VOLUME_MAX.
+ * Mapping across the thumb-travel span instead would make the two ends unreachable.
+ *
+ * THE SNAP IS TO THE NEAREST STEP, not the nearest step below: rounding rather than
+ * flooring means clicking two thirds along a step-5 track gives the stop the user
+ * aimed at. The +STEP/2 term is integer division, so there is no rounding mode to
+ * reason about and no floating point on a UI path.
+ */
+unsigned int bounce_ui_shell_volume_from_track_x(int x)
+{
+    int offset = x - BOUNCE_UI_VOLUME_SLIDER_X;
+    int value;
+
+    if (offset < 0)
+        offset = 0;
+    if (offset > BOUNCE_UI_VOLUME_SLIDER_WIDTH - 1)
+        offset = BOUNCE_UI_VOLUME_SLIDER_WIDTH - 1;
+    value = (offset * (int)BOUNCE_AUDIO_VOLUME_MAX)
+        / (BOUNCE_UI_VOLUME_SLIDER_WIDTH - 1);
+    value = ((value + (int)(BOUNCE_AUDIO_VOLUME_STEP / 2u))
+             / (int)BOUNCE_AUDIO_VOLUME_STEP)
+        * (int)BOUNCE_AUDIO_VOLUME_STEP;
+    if (value > (int)BOUNCE_AUDIO_VOLUME_MAX)
+        value = (int)BOUNCE_AUDIO_VOLUME_MAX;
+    return (unsigned int)value;
+}
+
+/*
+ * THE HIT BAND AROUND THE SLIDER. The drawn track is three pixels tall and the thumb
+ * seven, so the band is deliberately taller than either: a pointer user aiming at a
+ * five-pixel thumb should not have to hit three pixels of track to move it. It sits
+ * below the Audio rows (y = 66, 80, 94) and overlaps nothing, so a click on the volume
+ * row's own text cannot be mistaken for a drag on the slider.
+ */
+static int ui_point_in_volume_slider(int x, int y)
+{
+    return x >= BOUNCE_UI_VOLUME_SLIDER_X - 2
+        && x <= BOUNCE_UI_VOLUME_SLIDER_X + BOUNCE_UI_VOLUME_SLIDER_WIDTH + 1
+        && y >= BOUNCE_UI_VOLUME_SLIDER_Y - 5
+        && y <= BOUNCE_UI_VOLUME_SLIDER_Y + BOUNCE_UI_VOLUME_SLIDER_HEIGHT + 4;
+}
+
 int bounce_ui_shell_handle_click(
     BounceAppFlow *flow,
     int x,
@@ -1885,6 +1965,28 @@ int bounce_ui_shell_handle_click(
     }
 
     if (flow->state == BOUNCE_APP_STATE_SETTINGS) {
+        /*
+         * BL-004 -- THE VOLUME SLIDER IS TESTED BEFORE THE x RANGE GUARD, because the
+         * guard is the wrong width for it.
+         *
+         * The rows below are drawn inside x 12..115, and this function refuses a click
+         * outside that. The slider, though, is drawn from x = 36 for
+         * BOUNCE_UI_VOLUME_SLIDER_WIDTH pixels and reaches x = 119 -- past 115. Testing
+         * it after the guard made the right-hand quarter of the track, including the
+         * maximum, permanently unclickable, which is the same class of dead control
+         * this whole change exists to remove.
+         *
+         * The guard is left alone for every other page and for the row loops: those
+         * really are all inside 12..115, and widening it would change what a click on
+         * the card's margin means on five pages to fix one control on the sixth.
+         */
+        if (bounce_app_flow_settings_page(flow) == BOUNCE_SETTINGS_PAGE_AUDIO
+            && bounce_app_flow_settings_selected_index(flow)
+                == BOUNCE_SETTINGS_AUDIO_ROW_VOLUME
+            && ui_point_in_volume_slider(x, y)) {
+            flow->settings.volume = bounce_ui_shell_volume_from_track_x(x);
+            return 1;
+        }
         if (x < 12 || x >= 116)
             return 0;
         if (bounce_app_flow_settings_page(flow) == BOUNCE_SETTINGS_PAGE_ROOT) {
@@ -1951,6 +2053,88 @@ int bounce_ui_shell_handle_click(
                     input = BOUNCE_UI_INPUT_SELECT;
                 } else {
                     flow->settings.theme_index = index;
+                    return 1;
+                }
+                return bounce_ui_shell_handle_press(flow, input) == 0 ? 1 : 0;
+            }
+            return 0;
+        }
+        /*
+         * BL-004 -- AND NOW THE AUDIO PAGE TAKES THE POINTER TOO.
+         *
+         * THE AUDIO, DISPLAY AND INPUT PAGES WERE THE ONLY SETTINGS PAGES A POINTER
+         * COULD NOT USE. The loop below covers ROOT, LANGUAGE and THEME, and RESET
+         * was added later; everything else fell through to `return 0`. So the volume
+         * row could not be focused with a mouse and the slider, which is drawn on
+         * every frame, could not be touched -- a control that was visible and
+         * unreachable. A Gauge in the reference is dragged (BounceUI.java:553), so
+         * this is parity for a pointer as well as a convenience.
+         *
+         * THE SLIDER IS TESTED BEFORE THE ROWS because its band is below them. A
+         * click inside it SETS the volume and returns, so it never falls through to
+         * the row loop and re-selects a row as a side effect.
+         *
+         * A click on a row still follows the shell's existing two-step convention:
+         * moving the highlight if the row is not selected, and only activating a row
+         * that is ALREADY selected. That is the same rule as the root list and Level
+         * Select, and it is what stops a stray click from applying a setting.
+         */
+        if (bounce_app_flow_settings_page(flow) == BOUNCE_SETTINGS_PAGE_AUDIO) {
+            const unsigned int count = bounce_app_flow_settings_list_count(flow);
+
+            for (index = 0u; index < count; ++index) {
+                const int row_y = 66 + (int)index * 14;
+
+                if (!ui_point_in_row(y, row_y, BOUNCE_UI_SETTINGS_ROOT_ROW_HIT_H))
+                    continue;
+                if (bounce_app_flow_settings_selected_index(flow) == index) {
+                    input = BOUNCE_UI_INPUT_SELECT;
+                } else {
+                    flow->settings.selected_index = index;
+                    return 1;
+                }
+                return bounce_ui_shell_handle_press(flow, input) == 0 ? 1 : 0;
+            }
+            return 0;
+        }
+        /*
+         * BL-005 -- AND THE DISPLAY PAGE TO FOCUS ITS FPS FIELD.
+         *
+         * Clicking the value focuses it, and clicking it AGAIN commits the edit that
+         * the keyboard already offers, so a pointer user gets both halves of the
+         * field without inventing a separate confirm convention for the mouse.
+         */
+        if (bounce_app_flow_settings_page(flow) == BOUNCE_SETTINGS_PAGE_DISPLAY) {
+            if (x >= 12 && x < 116
+                && y >= BOUNCE_UI_DISPLAY_FPS_LABEL_Y - 2
+                && y <= BOUNCE_UI_DISPLAY_FPS_VALUE_Y + 7) {
+                if (bounce_app_flow_settings_fps_edit_active(flow)) {
+                    return bounce_ui_shell_handle_press(
+                               flow, BOUNCE_UI_INPUT_SELECT) == 0
+                        ? 1
+                        : 0;
+                }
+                return bounce_ui_shell_handle_press(
+                           flow, BOUNCE_UI_INPUT_SELECT) == 0
+                    ? 1
+                    : 0;
+            }
+            return 0;
+        }
+        /*
+         * BL-004 -- AND THE INPUT PAGE, whose keypad row was equally unreachable.
+         * Same two-step rule as every other settings list, and no more than that.
+         */
+        if (bounce_app_flow_settings_page(flow) == BOUNCE_SETTINGS_PAGE_INPUT) {
+            const unsigned int count = bounce_app_flow_settings_list_count(flow);
+
+            for (index = 0u; index < count; ++index) {
+                if (!ui_point_in_row(y, 90 + (int)index * 12, 12))
+                    continue;
+                if (bounce_app_flow_settings_selected_index(flow) == index) {
+                    input = BOUNCE_UI_INPUT_SELECT;
+                } else {
+                    flow->settings.selected_index = index;
                     return 1;
                 }
                 return bounce_ui_shell_handle_press(flow, input) == 0 ? 1 : 0;
@@ -2224,6 +2408,51 @@ int bounce_ui_shell_handle_press(
         return 0;
     }
     if (flow->state == BOUNCE_APP_STATE_SETTINGS) {
+        /*
+         * BL-005 -- THE FPS EDIT OWNS THE KEYBOARD WHILE IT IS LIVE.
+         *
+         * THIS IS FIRST, BEFORE EVERY OTHER SETTINGS BRANCH, and that ordering is
+         * the whole requirement. A digit key arriving during an edit must reach the
+         * field and nothing else: if the generic UP/DOWN/SELECT/BACK handling ran
+         * first, a digit would fall through it as BOUNCE_UI_INPUT_OTHER, and --
+         * worse -- a press that the field does not want would still be consumed
+         * here and so could never reach the game either. Digits are only a text-entry
+         * input while an edit is live; on every other screen they stay BOUNCE_UI_INPUT_OTHER
+         * and are routed exactly as before, so nothing about global navigation or the
+         * keypad game controls changes.
+         */
+        if (bounce_app_flow_settings_fps_edit_active(flow)) {
+            if (input >= BOUNCE_UI_INPUT_DIGIT0
+                && input <= BOUNCE_UI_INPUT_DIGIT9) {
+                (void)bounce_app_flow_settings_fps_edit_digit(
+                    flow, (unsigned int)(input - BOUNCE_UI_INPUT_DIGIT0));
+                return 0;
+            }
+            if (input == BOUNCE_UI_INPUT_BACKSPACE) {
+                (void)bounce_app_flow_settings_fps_edit_backspace(flow);
+                return 0;
+            }
+            if (input == BOUNCE_UI_INPUT_SELECT) {
+                /*
+                 * COMMIT, AND LEAVE THE FIELD ON SUCCESS. A rejected entry -- empty,
+                 * or out of range -- leaves the field open with the typed text still
+                 * in it, so the player can correct it rather than losing what they
+                 * typed to a one-line refusal.
+                 */
+                if (bounce_app_flow_settings_fps_edit_commit(flow) == 0
+                    && !bounce_app_flow_settings_fps_edit_active(flow)) {
+                    return 0;
+                }
+                return 0;
+            }
+            if (input == BOUNCE_UI_INPUT_BACK
+                || input == BOUNCE_UI_INPUT_EXIT) {
+                (void)bounce_app_flow_settings_fps_edit_cancel(flow);
+                return 0;
+            }
+            /* LEFT/RIGHT and UP/DOWN are not part of a text field; ignore them. */
+            return 0;
+        }
         /* NATIVE EXTENSION destination. */
         if (input == BOUNCE_UI_INPUT_LEFT
             || input == BOUNCE_UI_INPUT_RIGHT) {
@@ -2257,33 +2486,38 @@ int bounce_ui_shell_handle_press(
                 return 0;
             }
             /*
-             * BL-005 -- LEFT/RIGHT moves the FPS when the Display page's FPS row
-             * is selected. The step is BOUNCE_SETTINGS_FPS_STEP and the clamps are
-             * derived from BOUNCE_FPS_MIN / BOUNCE_FPS_MAX, which are now 10 and
-             * 60 to match the reference's clamp. The old literals -- 20 and 170 --
-             * belonged to the 10..180 range and would have walked straight past the
-             * new maximum.
+             * BL-005 -- AND LEFT/RIGHT NO LONGER STEP THE FPS.
+             *
+             * They used to, by BOUNCE_SETTINGS_FPS_STEP, which offered exactly six
+             * values -- 10, 20, 30, 40, 50, 60 -- and no other FPS could ever be
+             * reached. The reference has the player TYPE the number into a two-digit
+             * numeric TextField (BounceUI.java:552); the step was never a reference
+             * behaviour, it was a stand-in for one, and a stand-in that silently
+             * excluded 37 is the thing this change removes.
+             *
+             * LEFT/RIGHT are still live keys -- they drive the volume slider on the
+             * Audio page above -- so they are simply not bound here. The absence is
+             * deliberate rather than an oversight, and it is why BOUNCE_SETTINGS_FPS_STEP
+             * is no longer used by any UI code path.
              */
-            if (bounce_app_flow_settings_page(flow)
-                    == BOUNCE_SETTINGS_PAGE_DISPLAY
-                && bounce_app_flow_settings_selected_index(flow)
-                    == BOUNCE_SETTINGS_DISPLAY_ROW_FPS) {
-                unsigned int fps = bounce_app_flow_settings_fps(flow);
-                if (input == BOUNCE_UI_INPUT_LEFT) {
-                    if (fps >= BOUNCE_FPS_MIN + BOUNCE_SETTINGS_FPS_STEP)
-                        fps -= BOUNCE_SETTINGS_FPS_STEP;
-                } else {
-                    if (fps + BOUNCE_SETTINGS_FPS_STEP <= BOUNCE_FPS_MAX)
-                        fps += BOUNCE_SETTINGS_FPS_STEP;
-                }
-                flow->settings.target_fps = fps;
-                return 0;
-            }
             return 0;
         }
         if (input == BOUNCE_UI_INPUT_UP
             || input == BOUNCE_UI_INPUT_DOWN
             || input == BOUNCE_UI_INPUT_SELECT) {
+            /*
+             * BL-005 -- SELECT ON THE DISPLAY ROW OPENS THE FIELD.
+             *
+             * It is handled here rather than in the flow's select function because
+             * entering an edit is a UI concern, not a change to the setting:
+             * bounce_app_flow_settings_select() deliberately does nothing on the
+             * Display page, and widening it to write target_fps would put a value
+             * change in the flow on a path every settings caller shares.
+             */
+            if (input == BOUNCE_UI_INPUT_SELECT
+                && bounce_app_flow_settings_page(flow)
+                    == BOUNCE_SETTINGS_PAGE_DISPLAY)
+                return bounce_app_flow_settings_fps_edit_begin(flow);
             /*
              * Display, Input, and Audio are deliberately read-only fact pages and
              * report no navigable list. A press there is a legal no-op, not a
@@ -2929,34 +3163,6 @@ static int draw_native_size(
 }
 
 /*
- * BL-004 PARITY FIX -- the volume slider, the native stand-in for LKT Pro's Gauge.
- *
- * BounceUI.java:553 builds `new Gauge(Local.getText(26), true, 100, this.mVolume)`:
- * a 0..100 control the player slides along a track. What this build drew instead --
- * a bare "100%" and LEFT/RIGHT in tens -- showed no position at all and could not
- * land on most of the values the reference reaches. This draws the three parts a
- * slider is read by: the track, the filled portion, and the thumb.
- *
- * WHY IT SITS UNDER ITS OWN ROW. The three Audio rows are at y = 66, 80 and 94, and
- * the 5x7 glyph is 7 px tall, so the band below y = 101 is free on this page --
- * STEP 38-RESET-UI removed the ESC BACK footer that used to occupy it. A track the
- * width of the label column reads as one control rather than as decoration stuck to
- * a number.
- *
- * TWO INDEPENDENT READINGS, ON PURPOSE. The filled length gives the position, the
- * thumb gives it precisely, and the number beside the label gives the exact value
- * without the player having to measure pixels. All three come from the same `volume`
- * argument, which is the flow's current value, so none of them can disagree with
- * what the next LEFT/RIGHT will write.
- */
-#define BOUNCE_UI_VOLUME_SLIDER_X 36
-#define BOUNCE_UI_VOLUME_SLIDER_Y 104
-#define BOUNCE_UI_VOLUME_SLIDER_WIDTH 84
-#define BOUNCE_UI_VOLUME_SLIDER_HEIGHT 3
-#define BOUNCE_UI_VOLUME_THUMB_WIDTH 5
-#define BOUNCE_UI_VOLUME_THUMB_HEIGHT 7
-
-/*
  * IT CLAMPS RATHER THAN TRUSTING ITS ARGUMENT. The flow already guarantees
  * 0..BOUNCE_AUDIO_VOLUME_MAX, but this function divides by that maximum, and a
  * caller handing it an out-of-range value would otherwise paint past the track and
@@ -3199,6 +3405,36 @@ const uint32_t back = ui->accent;
             || draw_centered_placeholder_text(renderer,
                    BOUNCE_UI_DISPLAY_FPS_VALUE_Y, fps_text, fps_row_color) != 0)
             return -1;
+        /*
+         * BL-005 -- THE FIELD SHOWS WHAT IS TYPED, NOT WHAT IS APPLIED, WHILE AN EDIT
+         * IS LIVE, AND SAYS WHICH IS WHICH.
+         *
+         * Drawing the applied value during an edit would be a lie: the player is
+         * looking at a half-typed "3" and the screen would read "25", so they would
+         * have no way of knowing what had been accepted. The typed buffer replaces
+         * the value, and the caret underneath marks it as the line being written.
+         *
+         * THE CARET IS A LINE BECAUSE THE FONT HAS NO BLINKING CURSOR. Drawing one
+         * unconditionally would be indistinguishable from a character; drawing it
+         * only while editing is what makes the two states readable at a glance, and
+         * it costs one fill_rect. There is no blink because nothing in this shell
+         * animates the UI, and adding an animation to make a cursor cursor would be
+         * a larger change than the field itself.
+         */
+        if (bounce_app_flow_settings_fps_edit_active(flow)) {
+            char edit_text[4];
+
+            (void)snprintf(edit_text, sizeof edit_text, "%s",
+                           bounce_app_flow_settings_fps_edit_text(flow));
+            if (draw_centered_placeholder_text(renderer,
+                    BOUNCE_UI_DISPLAY_FPS_VALUE_Y, edit_text,
+                    selected_text) != 0)
+                return -1;
+            if (bounce_renderer_fill_rect(renderer, 60,
+                    BOUNCE_UI_DISPLAY_FPS_VALUE_Y + 8,
+                    8, 1, back) != 0)
+                return -1;
+        }
     } else if (bounce_app_flow_settings_page(flow)
                == BOUNCE_SETTINGS_PAGE_INPUT) {
         /*
@@ -3255,7 +3491,19 @@ const uint32_t back = ui->accent;
                 = (row == selected) ? selected_text : text;
             const uint32_t mark_color
                 = (row == applied) ? back : muted;
-            const char marker = (row == applied) ? '*' : ' ';
+            /*
+             * A POINTER TO A STRING LITERAL, NOT A SINGLE `char`.
+             *
+             * This was `const char marker = ...` passed as `&marker`, which is a
+             * `const char *` to a ONE-BYTE object with no NUL terminator of its own.
+             * draw_placeholder_text() walks until '\0', so it read whatever stack byte
+             * happened to follow -- undefined behaviour that was invisible until an
+             * unrelated change shifted the frame layout and left non-zero bytes there,
+             * at which point the applied marker painted the unknown-glyph box on every
+             * language and failed SCRIPT-COVERAGE. A string literal is NUL-terminated
+             * by construction, so this cannot recur.
+             */
+            const char *marker = (row == applied) ? "*" : " ";
 
             y = 90 + (int)row * 12;
             if (row == selected
@@ -3265,7 +3513,7 @@ const uint32_t back = ui->accent;
             if (draw_placeholder_text(
                        renderer, 24, y, tr(value_keys[row]), row_color) != 0
                 || draw_placeholder_text(
-                       renderer, 104, y, &marker, mark_color) != 0)
+                       renderer, 104, y, marker, mark_color) != 0)
                 return -1;
         }
     } else if (bounce_app_flow_settings_page(flow)
@@ -3346,7 +3594,19 @@ const uint32_t back = ui->accent;
                 = (row == selected) ? selected_text : text;
             const uint32_t mark_color
                 = (row == applied) ? back : muted;
-            const char marker = (row == applied) ? '*' : ' ';
+            /*
+             * A POINTER TO A STRING LITERAL, NOT A SINGLE `char`.
+             *
+             * This was `const char marker = ...` passed as `&marker`, which is a
+             * `const char *` to a ONE-BYTE object with no NUL terminator of its own.
+             * draw_placeholder_text() walks until '\0', so it read whatever stack byte
+             * happened to follow -- undefined behaviour that was invisible until an
+             * unrelated change shifted the frame layout and left non-zero bytes there,
+             * at which point the applied marker painted the unknown-glyph box on every
+             * language and failed SCRIPT-COVERAGE. A string literal is NUL-terminated
+             * by construction, so this cannot recur.
+             */
+            const char *marker = (row == applied) ? "*" : " ";
 
             y = 66 + (int)row * 14;
             if (row == selected
@@ -3384,7 +3644,7 @@ const uint32_t back = ui->accent;
                            back) != 0)
                     return -1;
             } else {
-                if (draw_placeholder_text(renderer, 24, y, &marker, mark_color) != 0
+                if (draw_placeholder_text(renderer, 24, y, marker, mark_color) != 0
                     || draw_placeholder_text(
                            renderer, 36, y, tr(value_keys[row]), row_color) != 0)
                     return -1;

@@ -15195,6 +15195,22 @@ static bool x11_keysym_to_source(
         case XK_Escape:
             *source_out = BOUNCE_INPUT_SOURCE_ESCAPE;
             return true;
+        /*
+         * BL-005 -- BACKSPACE, FOR THE FPS FIELD.
+         *
+         * XK_BackSpace is the standard X11 keysym for the key. It was mapped to
+         * nothing before, so the FPS field had no way to delete a mistyped digit --
+         * the only edits available were appending more digits and committing, which
+         * is not an editable field in any useful sense.
+         *
+         * It is deliberately NOT XK_Delete and not an alias of Escape. Back is
+         * BOUNCE_UI_INPUT_BACK and already means "leave this page" everywhere in
+         * the shell; folding Backspace into it would mean a player who reached for
+         * the usual delete key cancelled their whole edit instead.
+         */
+        case XK_BackSpace:
+            *source_out = BOUNCE_INPUT_SOURCE_BACKSPACE;
+            return true;
         case XK_q:
         case XK_Q:
             *source_out = BOUNCE_INPUT_SOURCE_QUIT;
@@ -15339,6 +15355,30 @@ static bool expect_x11_source(
 static BounceUiInput app_ui_input_from_source(BounceInputSource source)
 {
     switch (source) {
+        /*
+         * BL-004/BL-005 -- LEFT AND RIGHT WERE FALLING THROUGH TO `default`.
+         *
+         * THIS IS THE WHOLE REASON THE VOLUME AND FPS CONTROLS WERE DEAD. The four
+         * sources below were already produced -- x11_keysym_to_source() has mapped
+         * XK_Left, XK_a, XK_Right and XK_d to them since STEP 34-F-K -- and
+         * bounce_ui_shell_handle_press() has handled BOUNCE_UI_INPUT_LEFT and
+         * BOUNCE_UI_INPUT_RIGHT on the Audio and Display pages since the controls
+         * were added. Nothing joined the two ends: every press fell to `default`
+         * and became BOUNCE_UI_INPUT_OTHER, so the handlers ran for nobody and the
+         * setting could only be changed by a pointer path that did not exist yet
+         * either.
+         *
+         * No verifier caught it because every test of this feature drove
+         * bounce_ui_shell_handle_press() directly with a BounceUiInput, which
+         * skipped the very mapping that was missing. The tests below now go
+         * through app_ui_input_from_source() so this cannot regress silently.
+         */
+        case BOUNCE_INPUT_SOURCE_LEFT_ARROW:
+        case BOUNCE_INPUT_SOURCE_LEFT_A:
+            return BOUNCE_UI_INPUT_LEFT;
+        case BOUNCE_INPUT_SOURCE_RIGHT_ARROW:
+        case BOUNCE_INPUT_SOURCE_RIGHT_D:
+            return BOUNCE_UI_INPUT_RIGHT;
         case BOUNCE_INPUT_SOURCE_UP_ARROW:
         case BOUNCE_INPUT_SOURCE_UP_W:
             return BOUNCE_UI_INPUT_UP;
@@ -15354,6 +15394,43 @@ static BounceUiInput app_ui_input_from_source(BounceInputSource source)
         /* X11-only test alias; physical Nokia Back mapping remains UNKNOWN. */
         case BOUNCE_INPUT_SOURCE_ESCAPE:
             return BOUNCE_UI_INPUT_BACK;
+        /*
+         * BL-005 -- DIGITS AND BACKSPACE REACH THE SHELL ONLY AS TEXT ENTRY.
+         *
+         * They are mapped here, unconditionally, and bounce_ui_shell_handle_press()
+         * acts on them only while an FPS edit is live. That is the whole reason a
+         * digit key cannot be swallowed by navigation while the field is open: the
+         * digit never has to travel through the navigation branches at all.
+         *
+         * Outside an edit these are still consumed here rather than reported as
+         * BOUNCE_UI_INPUT_OTHER, which changes nothing observable -- every handler
+         * ignores an input it has no case for, and the keypad game controls read
+         * BounceInputState, not this mapping. What it buys is that the field's input
+         * contract is a property of this one function, so a test can assert the
+         * whole digit range without driving the X11 loop.
+         */
+        case BOUNCE_INPUT_SOURCE_NUM0:
+            return BOUNCE_UI_INPUT_DIGIT0;
+        case BOUNCE_INPUT_SOURCE_NUM1:
+            return BOUNCE_UI_INPUT_DIGIT1;
+        case BOUNCE_INPUT_SOURCE_NUM2:
+            return BOUNCE_UI_INPUT_DIGIT2;
+        case BOUNCE_INPUT_SOURCE_NUM3:
+            return BOUNCE_UI_INPUT_DIGIT3;
+        case BOUNCE_INPUT_SOURCE_NUM4:
+            return BOUNCE_UI_INPUT_DIGIT4;
+        case BOUNCE_INPUT_SOURCE_NUM5:
+            return BOUNCE_UI_INPUT_DIGIT5;
+        case BOUNCE_INPUT_SOURCE_NUM6:
+            return BOUNCE_UI_INPUT_DIGIT6;
+        case BOUNCE_INPUT_SOURCE_NUM7:
+            return BOUNCE_UI_INPUT_DIGIT7;
+        case BOUNCE_INPUT_SOURCE_NUM8:
+            return BOUNCE_UI_INPUT_DIGIT8;
+        case BOUNCE_INPUT_SOURCE_NUM9:
+            return BOUNCE_UI_INPUT_DIGIT9;
+        case BOUNCE_INPUT_SOURCE_BACKSPACE:
+            return BOUNCE_UI_INPUT_BACKSPACE;
         default:
             return BOUNCE_UI_INPUT_OTHER;
     }
@@ -22038,6 +22115,757 @@ static int verify_audio_volume_runtime_wiring(void)
 
     (void)printf("  null_safe=yes first_push=yes idempotent=yes mid_game=yes"
                  " mute_reaches_player=yes %s\n",
+                 bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * BL-004 -- wait until the audio worker has played `target` events, or the budget
+ * expires.
+ *
+ * A LOCAL COPY, NOT THE ONE IN audio_player_check.c. That file is a separate program
+ * with its own main(); nothing in it is linkable from here, and duplicating twelve
+ * lines of polling is a far smaller cost than pulling a second entry point into the
+ * game binary for the sake of one verifier.
+ *
+ * IT POLLS A REAL COUNTER rather than sleeping a fixed time, so it never asserts on a
+ * race: the assertion that follows is about a measurement the worker has already
+ * finished making, not about how long this function waited.
+ */
+static int app_wait_for_played(
+    BounceAudioPlayer *player,
+    unsigned long long target,
+    unsigned int budget_ms
+)
+{
+    unsigned int waited = 0u;
+
+    for (;;) {
+        BounceAudioPlayerStats stats;
+        struct timespec nap;
+
+        if (bounce_audio_player_stats(player, &stats)
+            && stats.events_played >= target) {
+            return 1;
+        }
+        if (waited >= budget_ms) {
+            return 0;
+        }
+        nap.tv_sec = 0;
+        nap.tv_nsec = 2000000L; /* 2 ms */
+        (void)nanosleep(&nap, NULL);
+        waited += 2u;
+    }
+}
+
+/*
+ * BL-004 -- THE VOLUME CONTROL, DRIVEN THE WAY A PLAYER DRIVES IT.
+ *
+ * WHY THIS BLOCK EXISTS AT ALL, AND WHY IT IS BUILT DIFFERENTLY FROM THE EARLIER
+ * AUDIO TESTS. verify_audio_volume_runtime_wiring() and the gain test both call the
+ * flow and the player directly. That is the right level for "does the value reach the
+ * gain", and it is exactly why the control could be completely dead for as long as it
+ * was: every one of those tests injected a BounceUiInput that no key ever produced.
+ * app_ui_input_from_source() sat between the keyboard and the handler with four
+ * sources falling into `default`, and nothing looked there.
+ *
+ * SO EVERY KEYBOARD ASSERTION BELOW GOES THROUGH app_ui_input_from_source() FIRST.
+ * The chain under test is the whole one -- keysym source to BounceUiInput to handler
+ * to flow -- not the last hop of it. A mapping regression now fails here.
+ */
+static int verify_volume_control_input(void)
+{
+    BounceAppFlow flow;
+    int bad = 0;
+
+    (void)printf("VOLUME-INPUT source -> UI input -> flow, plus bounds\n");
+
+    /* THE MAPPING THAT WAS MISSING. Asserted first, on its own, because it is the
+     * exact defect: four sources that produced BOUNCE_UI_INPUT_OTHER. */
+    if (app_ui_input_from_source(BOUNCE_INPUT_SOURCE_LEFT_ARROW)
+            != BOUNCE_UI_INPUT_LEFT
+        || app_ui_input_from_source(BOUNCE_INPUT_SOURCE_LEFT_A)
+            != BOUNCE_UI_INPUT_LEFT
+        || app_ui_input_from_source(BOUNCE_INPUT_SOURCE_RIGHT_ARROW)
+            != BOUNCE_UI_INPUT_RIGHT
+        || app_ui_input_from_source(BOUNCE_INPUT_SOURCE_RIGHT_D)
+            != BOUNCE_UI_INPUT_RIGHT) {
+        fprintf(stderr,
+                "volume-input: a LEFT/RIGHT source still does not map to a"
+                " LEFT/RIGHT UI input\n");
+        ++bad;
+    }
+
+    bounce_app_flow_init(&flow);
+    flow.state = BOUNCE_APP_STATE_SETTINGS;
+    flow.settings.page = BOUNCE_SETTINGS_PAGE_AUDIO;
+    flow.settings.selected_index = BOUNCE_SETTINGS_AUDIO_ROW_VOLUME;
+
+    if (bounce_app_flow_settings_volume(&flow) != BOUNCE_AUDIO_VOLUME_DEFAULT) {
+        fprintf(stderr, "volume-input: not starting at the default volume\n");
+        ++bad;
+    }
+
+    /*
+     * BOTH DIRECTIONS, FROM THE MIDDLE OF THE RANGE. The first version of this block
+     * started at the default of 100 and asserted that RIGHT moved it -- which cannot
+     * happen, because 100 is the maximum and RIGHT is clamped there. The assertion
+     * was wrong, not the control, and it failed in the way a wrong assertion should.
+     */
+    if (bounce_app_flow_restore_persisted_volume(&flow, 50u) != 0) {
+        ++bad;
+    }
+    if (bounce_ui_shell_handle_press(&flow,
+                app_ui_input_from_source(BOUNCE_INPUT_SOURCE_RIGHT_ARROW)) != 0
+        || bounce_app_flow_settings_volume(&flow)
+            != 50u + BOUNCE_AUDIO_VOLUME_STEP) {
+        fprintf(stderr,
+                "volume-input: RIGHT did not step up from 50, flow holds %u\n",
+                bounce_app_flow_settings_volume(&flow));
+        ++bad;
+    }
+    if (bounce_ui_shell_handle_press(&flow,
+                app_ui_input_from_source(BOUNCE_INPUT_SOURCE_LEFT_ARROW)) != 0
+        || bounce_app_flow_settings_volume(&flow) != 50u) {
+        fprintf(stderr,
+                "volume-input: LEFT did not step back down to 50, flow holds %u\n",
+                bounce_app_flow_settings_volume(&flow));
+        ++bad;
+    }
+
+    /* THE ALIASES AGREE, so A/D work wherever the arrows do. */
+    if (bounce_ui_shell_handle_press(&flow,
+                app_ui_input_from_source(BOUNCE_INPUT_SOURCE_RIGHT_D)) != 0
+        || bounce_app_flow_settings_volume(&flow)
+            != 50u + BOUNCE_AUDIO_VOLUME_STEP) {
+        fprintf(stderr, "volume-input: the RIGHT_D alias did not step up\n");
+        ++bad;
+    }
+    if (bounce_ui_shell_handle_press(&flow,
+                app_ui_input_from_source(BOUNCE_INPUT_SOURCE_LEFT_A)) != 0
+        || bounce_app_flow_settings_volume(&flow) != 50u) {
+        fprintf(stderr, "volume-input: the LEFT_A alias did not step down\n");
+        ++bad;
+    }
+
+    /* THE UPPER BOUND CLAMPS AND STOPS, and does not wrap. */
+    if (bounce_app_flow_restore_persisted_volume(
+                &flow, BOUNCE_AUDIO_VOLUME_MAX) != 0) {
+        ++bad;
+    }
+    (void)bounce_ui_shell_handle_press(
+        &flow, app_ui_input_from_source(BOUNCE_INPUT_SOURCE_RIGHT_ARROW));
+    if (bounce_app_flow_settings_volume(&flow) != BOUNCE_AUDIO_VOLUME_MAX) {
+        fprintf(stderr,
+                "volume-input: RIGHT past the maximum gave %u, expected %u\n",
+                bounce_app_flow_settings_volume(&flow),
+                BOUNCE_AUDIO_VOLUME_MAX);
+        ++bad;
+    }
+
+    /* THE LOWER BOUND REACHES 0 -- MUTE IS A REACHABLE VALUE. */
+    if (bounce_app_flow_restore_persisted_volume(&flow, 0u) != 0) {
+        ++bad;
+    }
+    (void)bounce_ui_shell_handle_press(
+        &flow, app_ui_input_from_source(BOUNCE_INPUT_SOURCE_LEFT_ARROW));
+    if (bounce_app_flow_settings_volume(&flow) != 0u) {
+        fprintf(stderr,
+                "volume-input: LEFT at zero gave %u, expected 0\n",
+                bounce_app_flow_settings_volume(&flow));
+        ++bad;
+    }
+
+    /* AND IT SAT THERE: the range is clamped, not wrapped. */
+    (void)bounce_ui_shell_handle_press(
+        &flow, app_ui_input_from_source(BOUNCE_INPUT_SOURCE_LEFT_ARROW));
+    if (bounce_app_flow_settings_volume(&flow) != 0u) {
+        fprintf(stderr,
+                "volume-input: LEFT below zero wrapped to %u\n",
+                bounce_app_flow_settings_volume(&flow));
+        ++bad;
+    }
+
+    /* LEFT/RIGHT ARE INERT ON A PAGE THAT DOES NOT USE THEM. */
+    if (bounce_app_flow_restore_persisted_volume(&flow, 50u) != 0) {
+        ++bad;
+    }
+    flow.settings.page = BOUNCE_SETTINGS_PAGE_LANGUAGE;
+    if (bounce_ui_shell_handle_press(&flow,
+                app_ui_input_from_source(BOUNCE_INPUT_SOURCE_LEFT_ARROW)) != 0
+        || bounce_app_flow_settings_volume(&flow) != 50u) {
+        fprintf(stderr,
+                "volume-input: LEFT changed the volume on the Language page\n");
+        ++bad;
+    }
+
+    (void)printf("  sources_mapped=yes step_up=yes step_down=yes aliases=yes"
+                 " clamps_at_both_ends=yes no_wrap=yes inert_elsewhere=yes %s\n",
+                 bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * BL-004 -- THE SLIDER IS A CONTROL, NOT A PICTURE.
+ *
+ * A track with a thumb is drawn on every frame whether or not anything can move it.
+ * That is the state the slider was in: visible, and unreachable, because
+ * bounce_ui_shell_handle_click() handled ROOT, LANGUAGE and THEME and fell through to
+ * `return 0` for the Audio page -- so the row could not be focused by pointer and
+ * the track could not be dragged.
+ *
+ * THE POINTER MAPPING IS CHECKED AT ITS ENDS AND ITS MIDPOINT, because a slider whose
+ * two ends are right and whose middle is not still looks correct in a screenshot.
+ */
+static int verify_volume_slider_pointer(void)
+{
+    BounceAppFlow flow;
+    const int track_left = 36; /* BOUNCE_UI_VOLUME_SLIDER_X */
+    const int track_right = 36 + 84 - 1;
+    int bad = 0;
+
+    (void)printf("VOLUME-SLIDER pointer position -> volume, and click wiring\n");
+
+    /* THE ENDS MAP TO THE ENDS, INCLUDING A POSITION PAST EACH EDGE. */
+    if (bounce_ui_shell_volume_from_track_x(track_left) != 0u) {
+        fprintf(stderr,
+                "volume-slider: the left end of the track gave %u, expected 0\n",
+                bounce_ui_shell_volume_from_track_x(track_left));
+        ++bad;
+    }
+    if (bounce_ui_shell_volume_from_track_x(track_right)
+            != BOUNCE_AUDIO_VOLUME_MAX) {
+        fprintf(stderr,
+                "volume-slider: the right end of the track gave %u, expected %u\n",
+                bounce_ui_shell_volume_from_track_x(track_right),
+                BOUNCE_AUDIO_VOLUME_MAX);
+        ++bad;
+    }
+    /* Overshoot clamps rather than being refused: a drag that runs off the end of
+     * a small screen should pin to the end, not stop responding. */
+    if (bounce_ui_shell_volume_from_track_x(track_left - 50) != 0u
+        || bounce_ui_shell_volume_from_track_x(track_right + 50)
+            != BOUNCE_AUDIO_VOLUME_MAX) {
+        fprintf(stderr, "volume-slider: a position past the track did not clamp\n");
+        ++bad;
+    }
+
+    /* THE MIDPOINT IS THE MIDDLE OF THE RANGE, within one step of slop. */
+    {
+        const int middle_x = track_left + (track_right - track_left) / 2;
+        const unsigned int middle
+            = bounce_ui_shell_volume_from_track_x(middle_x);
+
+        if (middle + BOUNCE_AUDIO_VOLUME_STEP
+            < BOUNCE_AUDIO_VOLUME_MAX / 2u
+            || middle > BOUNCE_AUDIO_VOLUME_MAX / 2u + BOUNCE_AUDIO_VOLUME_STEP) {
+            fprintf(stderr,
+                    "volume-slider: the middle of the track gave %u, expected"
+                    " about %u\n",
+                    middle, BOUNCE_AUDIO_VOLUME_MAX / 2u);
+            ++bad;
+        }
+    }
+
+    /* EVERY REACHABLE VALUE IS ON A STEP, and NONE IS OUT OF RANGE. */
+    {
+        int x;
+
+        for (x = track_left - 2; x <= track_right + 2; x++) {
+            const unsigned int v = bounce_ui_shell_volume_from_track_x(x);
+
+            if (v > BOUNCE_AUDIO_VOLUME_MAX) {
+                fprintf(stderr,
+                        "volume-slider: x=%d produced %u, above the maximum\n",
+                        x, v);
+                ++bad;
+                break;
+            }
+            if (v % BOUNCE_AUDIO_VOLUME_STEP != 0u) {
+                fprintf(stderr,
+                        "volume-slider: x=%d produced %u, not on a step\n",
+                        x, v);
+                ++bad;
+                break;
+            }
+        }
+    }
+
+    /* THE CLICK ACTUALLY MOVES THE VALUE, THROUGH THE SHELL'S CLICK SEAM. */
+    bounce_app_flow_init(&flow);
+    flow.state = BOUNCE_APP_STATE_SETTINGS;
+    flow.settings.page = BOUNCE_SETTINGS_PAGE_AUDIO;
+    flow.settings.selected_index = BOUNCE_SETTINGS_AUDIO_ROW_VOLUME;
+    if (bounce_ui_shell_handle_click(&flow, track_left + 1, 104) != 1
+        || bounce_app_flow_settings_volume(&flow) != 0u) {
+        fprintf(stderr,
+                "volume-slider: clicking the left of the track gave %u,"
+                " expected 0\n",
+                bounce_app_flow_settings_volume(&flow));
+        ++bad;
+    }
+    if (bounce_ui_shell_handle_click(&flow, track_right, 104) != 1
+        || bounce_app_flow_settings_volume(&flow)
+            != BOUNCE_AUDIO_VOLUME_MAX) {
+        fprintf(stderr,
+                "volume-slider: clicking the right of the track gave %u,"
+                " expected %u\n",
+                bounce_app_flow_settings_volume(&flow),
+                BOUNCE_AUDIO_VOLUME_MAX);
+        ++bad;
+    }
+
+    /* AND A CLICK ON A ROW STILL ONLY MOVES THE HIGHLIGHT, never applies. */
+    if (bounce_ui_shell_handle_click(&flow, track_left + 20, 66) != 1
+        || bounce_app_flow_settings_selected_index(&flow)
+            != BOUNCE_SETTINGS_AUDIO_ROW_ON) {
+        fprintf(stderr,
+                "volume-slider: clicking the ON row did not move the highlight\n");
+        ++bad;
+    }
+
+    (void)printf("  ends_map=yes overshoot_clamps=yes midpoint_mid=yes"
+                 " all_values_on_step=yes click_moves_value=yes"
+                 " row_click_selects_only=yes %s\n",
+                 bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * BL-005 -- THE FPS FIELD, TYPED INTO THE WAY A PLAYER TYPES.
+ *
+ * The stepper could only ever reach 10, 20, 30, 40, 50 and 60. This drives the
+ * replacement end to end: SELECT to open, digits, Backspace, SELECT to commit, and
+ * the rejection of everything that is not a legal FPS.
+ *
+ * AS WITH THE VOLUME, THE KEYBOARD IS ENTERED THROUGH app_ui_input_from_source().
+ * Asserting handle_press() with a hand-built BounceUiInput would pass against a
+ * keyboard that delivered nothing, which is the mistake that let the original control
+ * stay dead.
+ */
+static int verify_fps_field_editing(void)
+{
+    BounceAppFlow flow;
+    unsigned int digit;
+    int bad = 0;
+
+    (void)printf("FPS-FIELD open, type, backspace, commit, cancel, reject\n");
+
+    /* EVERY DIGIT REACHES THE FIELD AS A DISTINCT INPUT. */
+    for (digit = 0u; digit <= 9u; digit++) {
+        const BounceUiInput mapped
+            = app_ui_input_from_source(
+                (BounceInputSource)(BOUNCE_INPUT_SOURCE_NUM0 + (int)digit));
+
+        if (mapped != (BounceUiInput)(BOUNCE_UI_INPUT_DIGIT0 + (int)digit)) {
+            fprintf(stderr,
+                    "fps-field: digit %u maps to %d, expected %d\n",
+                    digit, (int)mapped,
+                    (int)(BOUNCE_UI_INPUT_DIGIT0 + (int)digit));
+            ++bad;
+        }
+    }
+    if (app_ui_input_from_source(BOUNCE_INPUT_SOURCE_BACKSPACE)
+            != BOUNCE_UI_INPUT_BACKSPACE) {
+        fprintf(stderr, "fps-field: Backspace does not map to a text input\n");
+        ++bad;
+    }
+
+    /* SELECT OPENS THE FIELD, SEEDED WITH THE CURRENT VALUE. */
+    bounce_app_flow_init(&flow);
+    flow.state = BOUNCE_APP_STATE_SETTINGS;
+    flow.settings.page = BOUNCE_SETTINGS_PAGE_DISPLAY;
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || !bounce_app_flow_settings_fps_edit_active(&flow)) {
+        fprintf(stderr, "fps-field: SELECT did not open the editor\n");
+        ++bad;
+    } else if (strcmp(bounce_app_flow_settings_fps_edit_text(&flow),
+                      "25") != 0) {
+        fprintf(stderr,
+                "fps-field: the field opened as \"%s\", expected the current 25\n",
+                bounce_app_flow_settings_fps_edit_text(&flow));
+        ++bad;
+    }
+
+    /* BACKSPACE TWICE AND TYPE 37: THE HEADLINE CASE FROM THE BRIEF. */
+    if (bounce_ui_shell_handle_press(
+            &flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(
+            &flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || strcmp(bounce_app_flow_settings_fps_edit_text(&flow), "") != 0) {
+        fprintf(stderr, "fps-field: two backspaces did not empty the field\n");
+        ++bad;
+    }
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT3) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT7) != 0
+        || strcmp(bounce_app_flow_settings_fps_edit_text(&flow), "37") != 0) {
+        fprintf(stderr,
+                "fps-field: typing 37 produced \"%s\"\n",
+                bounce_app_flow_settings_fps_edit_text(&flow));
+        ++bad;
+    }
+    /* THE APPLIED VALUE IS UNTOUCHED WHILE THE EDIT IS LIVE. */
+    if (bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_DEFAULT) {
+        fprintf(stderr,
+                "fps-field: the applied value changed mid-edit to %u\n",
+                bounce_app_flow_settings_fps(&flow));
+        ++bad;
+    }
+    /* COMMIT. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_app_flow_settings_fps_edit_active(&flow)
+        || bounce_app_flow_settings_fps(&flow) != 37u) {
+        fprintf(stderr,
+                "fps-field: committing 37 left the flow at %u\n",
+                bounce_app_flow_settings_fps(&flow));
+        ++bad;
+    }
+
+    /* CANCEL LEAVES THE VALUE ALONE.
+     *
+     * The pending edit below is a value that WOULD have committed -- "45" -- because
+     * an earlier version of this block typed a single 9, making "259", and then
+     * asserted that SELECT closed the field. SELECT correctly REFUSED it as out of
+     * range and left the field open, so the assertion was describing a rejection as
+     * a commit. Cancel is now tested on a pending edit that is actually valid, which
+     * is the case that distinguishes "cancel discards" from "cancel did nothing". */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || !bounce_app_flow_settings_fps_edit_active(&flow)
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT4) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT5) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK) != 0
+        || bounce_app_flow_settings_fps_edit_active(&flow)
+        || bounce_app_flow_settings_fps(&flow) != 37u) {
+        fprintf(stderr, "fps-field: cancel did not discard the edit\n");
+        ++bad;
+    }
+
+    /* BACK CANCELS TOO, WITHOUT LEAVING THE PAGE. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT1) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT2) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK) != 0
+        || bounce_app_flow_settings_fps_edit_active(&flow)
+        || bounce_app_flow_settings_fps(&flow) != 37u
+        || bounce_app_flow_settings_page(&flow)
+            != BOUNCE_SETTINGS_PAGE_DISPLAY) {
+        fprintf(stderr,
+                "fps-field: Back did not cancel the edit in place\n");
+        ++bad;
+    }
+
+    /* BOTH ENDS OF THE RANGE ARE ACCEPTED. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT1) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT0) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_MIN) {
+        fprintf(stderr,
+                "fps-field: 10 did not commit, flow holds %u\n",
+                bounce_app_flow_settings_fps(&flow));
+        ++bad;
+    }
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT6) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT0) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_MAX) {
+        fprintf(stderr,
+                "fps-field: 60 did not commit, flow holds %u\n",
+                bounce_app_flow_settings_fps(&flow));
+        ++bad;
+    }
+
+    /* OUT OF RANGE IS REFUSED, AND THE PREVIOUS VALUE SURVIVES. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT9) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT9) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT9) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0) {
+        fprintf(stderr, "fps-field: could not build the 999 case\n");
+        ++bad;
+    }
+    /* A refused entry KEEPS THE FIELD OPEN, with the text still in it. */
+    if (!bounce_app_flow_settings_fps_edit_active(&flow)) {
+        fprintf(stderr,
+                "fps-field: a refused value closed the field instead of"
+                " keeping it open\n");
+        ++bad;
+    }
+    if (bounce_app_flow_settings_fps(&flow) != BOUNCE_FPS_MAX) {
+        fprintf(stderr,
+                "fps-field: 999 was accepted, flow holds %u\n",
+                bounce_app_flow_settings_fps(&flow));
+        ++bad;
+    }
+    /* Backspacing out of it and committing 45 recovers. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT4) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT5) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_app_flow_settings_fps(&flow) != 45u) {
+        fprintf(stderr,
+                "fps-field: could not recover from the rejected entry\n");
+        ++bad;
+    }
+
+    /* A SINGLE DIGIT IS NOT A LEGAL FPS AND IS REFUSED THE SAME WAY. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT5) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_app_flow_settings_fps(&flow) != 45u) {
+        fprintf(stderr,
+                "fps-field: a single digit was committed as %u\n",
+                bounce_app_flow_settings_fps(&flow));
+        ++bad;
+    }
+    (void)bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK);
+
+    /* A FOURTH DIGIT IS REFUSED RATHER THAN SILENTLY DROPPED. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT1) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT2) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT3) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT4) != 0
+        || strcmp(bounce_app_flow_settings_fps_edit_text(&flow), "123") != 0) {
+        fprintf(stderr,
+                "fps-field: a fourth digit was accepted, buffer is \"%s\"\n",
+                bounce_app_flow_settings_fps_edit_text(&flow));
+        ++bad;
+    }
+    (void)bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK);
+
+    /* AN EMPTY FIELD IS NEITHER AN ERROR NOR A VALUE: it stays open. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || !bounce_app_flow_settings_fps_edit_active(&flow)) {
+        fprintf(stderr,
+                "fps-field: committing an empty field closed the editor\n");
+        ++bad;
+    }
+    (void)bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK);
+
+    /* DIGITS ARE INERT WITH NO EDIT LIVE, SO NAVIGATION IS UNCHANGED ELSEWHERE. */
+    flow.settings.page = BOUNCE_SETTINGS_PAGE_AUDIO;
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT5) != 0
+        || bounce_app_flow_settings_fps_edit_active(&flow)
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_app_flow_settings_fps_edit_active(&flow)) {
+        fprintf(stderr,
+                "fps-field: a digit or SELECT opened the editor on the Audio"
+                " page\n");
+        ++bad;
+    }
+    /* LEFT/RIGHT no longer step the FPS at all. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_LEFT) != 0) {
+        ++bad;
+    }
+
+    (void)printf("  all_digits_mapped=yes opens_seeded=yes backspace=yes"
+                 " commit=yes cancel=yes both_bounds=yes out_of_range_refused=yes"
+                 " empty_stays_open=yes inert_without_edit=yes no_stepping=%s %s\n",
+                 bad == 0 ? "yes" : "NO", bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * BL-005 -- A COMMITTED FPS REACHES THE STORE AND COMES BACK AFTER A RESTART.
+ *
+ * Split out from verify_fps_range_normalization() because that block is about the
+ * RANGE, and this is about the new editable field: nothing until now could produce a
+ * value that was not a multiple of ten, so "restore an arbitrary valid FPS" was not
+ * reachable from the UI and could not be claimed.
+ */
+static int verify_fps_field_persistence(void)
+{
+    BounceAppFlow flow;
+    BounceApp app;
+    int bad = 0;
+
+    (void)printf("FPS-FIELD-PERSISTENCE a typed value survives a restart\n");
+
+    bounce_app_flow_init(&flow);
+    flow.state = BOUNCE_APP_STATE_SETTINGS;
+    flow.settings.page = BOUNCE_SETTINGS_PAGE_DISPLAY;
+
+    /* TYPE 37 AND COMMIT, EXACTLY AS A PLAYER WOULD. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACKSPACE) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT3) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_DIGIT7) != 0
+        || bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || bounce_app_flow_settings_fps(&flow) != 37u) {
+        fprintf(stderr, "fps-field-persistence: could not commit 37\n");
+        return -1;
+    }
+
+    if (bounce_persistence_save_fps(37) != 0) {
+        fprintf(stderr, "fps-field-persistence: save_fps(37) failed\n");
+        return -1;
+    }
+
+    /* A RESTART: a fresh app, restored the way launch does it. */
+    memset(&app, 0, sizeof app);
+    bounce_app_flow_init(&app.flow);
+    app_restore_persisted_settings(&app);
+    if (bounce_app_flow_settings_fps(&app.flow) != 37u) {
+        fprintf(stderr,
+                "fps-field-persistence: restart restored %u, expected 37\n",
+                bounce_app_flow_settings_fps(&app.flow));
+        ++bad;
+    }
+
+    /* AND THE RESTORED VALUE IS EDITABLE AGAIN, SEEDED FROM ITSELF. */
+    if (bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_SELECT) != 0
+        || !bounce_app_flow_settings_fps_edit_active(&flow)
+        || strcmp(bounce_app_flow_settings_fps_edit_text(&flow), "37") != 0) {
+        fprintf(stderr,
+                "fps-field-persistence: the field did not reopen seeded from"
+                " the restored value\n");
+        ++bad;
+    }
+    (void)bounce_ui_shell_handle_press(&flow, BOUNCE_UI_INPUT_BACK);
+
+    (void)bounce_persistence_save_fps((int32_t)BOUNCE_FPS_DEFAULT);
+
+    (void)printf("  typed_37=yes saved=yes restored=yes reopen_seeded=%s %s\n",
+                 bad == 0 ? "yes" : "NO", bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * BL-004 -- THE PEAK COUNTERS RESET CLEANLY, SO A MEASUREMENT IS ABOUT ONE CASE.
+ *
+ * The peak statistics are _Atomic because the audio worker writes them with the
+ * player's mutex released. Relaxed atomics make the access well-defined; they do not
+ * make the RESET ordered against a worker that is mid-write, and this block asserts
+ * the property that actually matters for the tests that read them: after a reset with
+ * no playback in flight, both counters read exactly zero and a subsequent write is
+ * measured from zero rather than continuing from the previous case.
+ *
+ * It is a determinism test, not a concurrency test. Nothing here pretends to prove
+ * the absence of a race; that is the compiler's memory model, and ThreadSanitizer is
+ * the tool for it.
+ */
+static int verify_audio_peak_reset_determinism(void)
+{
+    BounceAudioPlayerConfig config;
+    BounceAudioPlayer *player;
+    unsigned int peak = 1u;
+    unsigned int last_peak = 1u;
+    int bad = 0;
+    unsigned int round;
+
+    (void)printf("AUDIO-PEAK-RESET counters zero, then measure one case at a time\n");
+
+    bounce_audio_player_default_config(&config);
+    config.resource_root = BOUNCE_RESOURCE_ROOT;
+    config.backend = BOUNCE_AUDIO_PLAYER_BACKEND_NULL;
+    config.shutdown = BOUNCE_AUDIO_PLAYER_SHUTDOWN_DISCARD;
+    config.drain_timeout_ms = 0u;
+    player = bounce_audio_player_create(&config);
+    if (player == NULL) {
+        fprintf(stderr, "audio-peak-reset: Null-backend player not created\n");
+        return -1;
+    }
+    if (bounce_audio_player_attach_sink(player) == 0) {
+        fprintf(stderr, "audio-peak-reset: could not attach the sink\n");
+        (void)bounce_audio_player_destroy(player);
+        return -1;
+    }
+
+    /*
+     * THREE ROUNDS, EACH FROM A RESET. The same sound at the same volume must give
+     * the same peak every time -- that is what makes the gain assertions in
+     * audio_player_check usable as exact numbers rather than tolerances. If a reset
+     * did not clear the running maximum, round 2 would inherit round 1's peak and
+     * the second measurement would be silently wrong.
+     */
+    for (round = 0u; round < 3u; round++) {
+        bounce_audio_player_null_reset_peak(player);
+        if (bounce_audio_player_null_peak(player, &peak, &last_peak) != 0
+            || peak != 0u || last_peak != 0u) {
+            fprintf(stderr,
+                    "audio-peak-reset: round %u did not read back zero after a"
+                    " reset (peak=%u last=%u)\n",
+                    round, peak, last_peak);
+            ++bad;
+            break;
+        }
+        (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_POP);
+        /*
+         * THE TARGET GROWS WITH THE ROUND. events_played is a CUMULATIVE counter, so
+         * waiting for "1" would return instantly from the second round onwards and
+         * the test would read a peak from the PREVIOUS round -- which is exactly the
+         * mistake this block exists to rule out, and it passed round 0 while failing
+         * round 1 when the wait was left at a constant.
+         */
+        if (!app_wait_for_played(player, (unsigned long long)round + 1ull, 4000u)) {
+            fprintf(stderr,
+                    "audio-peak-reset: round %u timed out waiting for its event\n",
+                    round);
+            ++bad;
+            break;
+        }
+        if (bounce_audio_player_null_peak(player, &peak, &last_peak) != 0
+            || peak == 0u) {
+            fprintf(stderr,
+                    "audio-peak-reset: round %u measured no output after the"
+                    " reset (peak=%u)\n",
+                    round, peak);
+            ++bad;
+            break;
+        }
+        if (round > 0u && peak != last_peak) {
+            fprintf(stderr,
+                    "audio-peak-reset: round %u measured peak=%u against a"
+                    " running peak that had not been cleared\n",
+                    round, peak);
+            ++bad;
+            break;
+        }
+    }
+
+    /* A MUTED PLAYER STILL MEASURES ZERO AFTER A RESET: silence is the point. */
+    (void)bounce_audio_player_set_volume(player, 0u);
+    if (bounce_audio_player_null_reset_peak(player) != 0) {
+        ++bad;
+    }
+    (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_POP);
+    if (!app_wait_for_played(player, 4ull, 4000u)) {
+        fprintf(stderr, "audio-peak-reset: the muted event never played\n");
+        ++bad;
+    }
+    if (bounce_audio_player_null_peak(player, &peak, &last_peak) != 0
+        || peak != 0u || last_peak != 0u) {
+        fprintf(stderr,
+                "audio-peak-reset: a muted player measured peak=%u last=%u,"
+                " expected both zero\n",
+                peak, last_peak);
+        ++bad;
+    }
+
+    (void)bounce_audio_player_destroy(player);
+
+    (void)printf("  reset_reads_zero=yes three_rounds_identical=yes"
+                 " muted_reads_zero=yes %s\n",
                  bad == 0 ? "PASS" : "FAIL");
     return bad == 0 ? 0 : -1;
 }
@@ -37132,6 +37960,36 @@ int main(int argc, char **argv)
         fprintf(
             stderr,
             "frame pacing verification failed\n");
+        goto cleanup;
+    }
+    if (verify_audio_peak_reset_determinism() != 0) {
+        fprintf(
+            stderr,
+            "audio peak reset determinism verification failed\n");
+        goto cleanup;
+    }
+    if (verify_volume_control_input() != 0) {
+        fprintf(
+            stderr,
+            "volume control input verification failed\n");
+        goto cleanup;
+    }
+    if (verify_volume_slider_pointer() != 0) {
+        fprintf(
+            stderr,
+            "volume slider pointer verification failed\n");
+        goto cleanup;
+    }
+    if (verify_fps_field_editing() != 0) {
+        fprintf(
+            stderr,
+            "fps field editing verification failed\n");
+        goto cleanup;
+    }
+    if (verify_fps_field_persistence() != 0) {
+        fprintf(
+            stderr,
+            "fps field persistence verification failed\n");
         goto cleanup;
     }
     if (verify_native_extension_ui() != 0) {

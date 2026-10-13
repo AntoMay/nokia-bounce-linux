@@ -408,6 +408,35 @@ typedef struct BounceSettingsState {
      */
     unsigned int target_fps;
     /*
+     * ===================================================================
+     * BL-005 -- THE EDIT BUFFER BEHIND THE FPS FIELD.
+     * ===================================================================
+     *
+     * THIS IS WHAT MAKES THE FIELD EDITABLE RATHER THAN STEPPABLE. LEFT and RIGHT
+     * moved the value in tens and stopped there: 10, 20, 30, 40, 50, 60, and no
+     * other value could ever be reached. The reference lets the player TYPE an FPS
+     * into a two-digit numeric TextField (BounceUI.java:552), which is the whole
+     * reason the reference's clamp is written as "if it parses, keep it between 10
+     * and 60" (:296-303) rather than as a step. An editable field needs somewhere to
+     * hold what has been typed before it is a legal value, and that cannot be
+     * target_fps: half-typed input like "1" is not a legal FPS and must not be
+     * written to the setting, or leaving the field would commit a broken value.
+     *
+     * So the buffer is separate, and target_fps only ever changes on COMMIT. That is
+     * also what makes Backspace meaningful and cancel safe: the applied value is
+     * untouched until the edit is accepted.
+     *
+     * fps_edit_digits holds ASCII digits with an explicit length rather than being
+     * NUL-terminated mid-edit, so an empty field is representable and a partially
+     * filled one never has to be padded. It is three bytes because the reference
+     * field is two digits (maxSize=2) and 100 would overflow the range anyway; the
+     * third byte leaves room to type a third digit and then reject it on commit
+     * rather than silently ignoring the keystroke.
+     */
+    bool fps_edit_active;
+    unsigned int fps_edit_len;
+    char fps_edit_digits[4];
+    /*
      * BL-005 -- NATIVE ADDITION. The reset-to-default flag.
      *
      * WHY IT LIVES HERE AND NOT IN THE RESULT. bounce_app_flow_settings_select() only
@@ -1022,6 +1051,52 @@ int bounce_app_flow_restore_persisted_volume(
 unsigned int bounce_app_flow_settings_fps(
     const BounceAppFlow *flow
 );
+
+/*
+ * ===================================================================
+ * BL-005 -- EDITING THE FPS FIELD, WHICH IS A TEXT ENTRY AND NOT A STEPPER.
+ * ===================================================================
+ *
+ * The five verbs below are the whole interface. SELECT on the Display row starts an
+ * edit; digits and Backspace change it; SELECT again commits; BACK cancels. Nothing
+ * writes target_fps except commit, which is what makes cancel correct.
+ *
+ * NO VALID VALUE IS GUESSED. An empty field, a field that does not parse, and a value
+ * outside BOUNCE_FPS_MIN..BOUNCE_FPS_MAX are all refused by commit, which leaves the
+ * previous value in place and reports failure -- it never clamps a rejected entry into
+ * the setting. That differs from the reference, which clamps a parsed value into
+ * range (BounceUI.java:297-302); here the clamp lives on the value the field SEEDED,
+ * so a player who types 999 is told it is wrong rather than silently given 60. The
+ * seed itself is already in range by construction, because it starts from the
+ * current target_fps.
+ *
+ * digit is 0..9 and is REFUSED otherwise, so a caller that forwards an arbitrary
+ * input value cannot write a non-digit into the buffer.
+ */
+bool bounce_app_flow_settings_fps_edit_active(const BounceAppFlow *flow);
+
+/* Start editing, seeding the buffer with the current FPS as decimal digits. */
+int bounce_app_flow_settings_fps_edit_begin(BounceAppFlow *flow);
+
+/* Append one decimal digit. Refuses a digit above 9, and refuses to grow past 3. */
+int bounce_app_flow_settings_fps_edit_digit(BounceAppFlow *flow, unsigned int digit);
+
+/* Delete the last typed digit. Succeeds on an already-empty buffer (a no-op). */
+int bounce_app_flow_settings_fps_edit_backspace(BounceAppFlow *flow);
+
+/* Commit: parse, range-check, write target_fps, and leave edit mode. */
+int bounce_app_flow_settings_fps_edit_commit(BounceAppFlow *flow);
+
+/* Abandon the edit. target_fps is not touched. Always succeeds on a live edit. */
+int bounce_app_flow_settings_fps_edit_cancel(BounceAppFlow *flow);
+
+/*
+ * What the field should display while editing: the digits typed so far, or the empty
+ * string when nothing has been typed. Never NULL. Only meaningful while
+ * bounce_app_flow_settings_fps_edit_active() is true; otherwise the applied value is
+ * what is shown.
+ */
+const char *bounce_app_flow_settings_fps_edit_text(const BounceAppFlow *flow);
 
 /*
  * BL-005 -- apply a persisted FPS setting at launch.

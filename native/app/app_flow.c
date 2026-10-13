@@ -2,6 +2,7 @@
 #include "locale.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
 static void bounce_app_flow_reset_menu(BounceMenuState *menu)
 {
@@ -89,6 +90,23 @@ static void bounce_app_flow_reset_settings(BounceSettingsState *settings)
      * any store is read.
      */
     settings->target_fps = BOUNCE_FPS_DEFAULT;
+    /*
+     * BL-005 -- AND THE EDIT BUFFER STARTS INACTIVE AND EMPTY.
+     *
+     * This is the same omission as target_fps above, and it was found the same way:
+     * the field-editing tests build a BounceAppFlow on the stack and initialise only
+     * through this function, so `fps_edit_active` held whatever was on the stack. When
+     * it happened to read as true, the very first branch of
+     * bounce_ui_shell_handle_press() took the editing path and SWALLOWED LEFT and
+     * RIGHT, which looked exactly like the volume control being dead again -- on a
+     * page that has nothing to do with the FPS field.
+     *
+     * An edit is a mode, and a mode must be entered deliberately. It is initialised
+     * here for the same reason `page` and `selected_index` are.
+     */
+    settings->fps_edit_active = false;
+    settings->fps_edit_len = 0u;
+    settings->fps_edit_digits[0] = '\0';
     /* NATIVE ADDITION: the keypad is off until a player asks for it. */
     /*
      * STEP 38-RESET. ON, not off -- the keypad default is a product decision, and
@@ -756,6 +774,169 @@ unsigned int bounce_app_flow_settings_fps(
     if (flow == NULL)
         return BOUNCE_FPS_DEFAULT;
     return flow->settings.target_fps;
+}
+
+/*
+ * BL-005 -- THE FPS TEXT ENTRY. See the block on these functions in app_flow.h for
+ * why the buffer is separate from target_fps and why commit refuses rather than
+ * clamps.
+ */
+
+/* The buffer is three ASCII digits plus a NUL; see the field's comment. */
+enum { BOUNCE_FPS_EDIT_MAX_DIGITS = 3 };
+
+static void fps_edit_clear(BounceAppFlow *flow)
+{
+    flow->settings.fps_edit_len = 0u;
+    flow->settings.fps_edit_digits[0] = '\0';
+}
+
+bool bounce_app_flow_settings_fps_edit_active(const BounceAppFlow *flow)
+{
+    if (flow == NULL)
+        return false;
+    return flow->settings.fps_edit_active;
+}
+
+int bounce_app_flow_settings_fps_edit_begin(BounceAppFlow *flow)
+{
+    unsigned int value;
+    unsigned int length = 0u;
+
+    if (flow == NULL)
+        return -1;
+    /*
+     * SEEDED FROM THE APPLIED VALUE, so the field is never born empty and never
+     * born out of range. The player edits an existing number rather than typing a
+     * new one from nothing, which is also what the reference does: its TextField is
+     * constructed with String.valueOf(this.mFps) (BounceUI.java:552).
+     */
+    value = flow->settings.target_fps;
+    if (value < BOUNCE_FPS_MIN)
+        value = BOUNCE_FPS_MIN;
+    if (value > BOUNCE_FPS_MAX)
+        value = BOUNCE_FPS_MAX;
+    {
+        char digits[12];
+        int written = snprintf(digits, sizeof digits, "%u", value);
+
+        if (written <= 0 || (unsigned int)written >= sizeof digits)
+            return -1;
+        while (length < (unsigned int)written
+            && length < BOUNCE_FPS_EDIT_MAX_DIGITS) {
+            flow->settings.fps_edit_digits[length]
+                = digits[length];
+            length++;
+        }
+    }
+    flow->settings.fps_edit_len = length;
+    flow->settings.fps_edit_digits[flow->settings.fps_edit_len] = '\0';
+    flow->settings.fps_edit_active = true;
+    return 0;
+}
+
+int bounce_app_flow_settings_fps_edit_digit(
+    BounceAppFlow *flow,
+    unsigned int digit
+)
+{
+    if (flow == NULL)
+        return -1;
+    /*
+     * REFUSED UNLESS AN EDIT IS LIVE, so digits typed on some other Settings page --
+     * or while gameplay has focus -- cannot open a field behind the player's back.
+     * The same guard is what keeps digit keys from being swallowed by navigation:
+     * this is only reachable because the caller already established focus.
+     */
+    if (!flow->settings.fps_edit_active)
+        return -1;
+    if (digit > 9u)
+        return -1;
+    /*
+     * A THIRD DIGIT IS REFUSED, NOT SILENTLY SWALLOWED. Two digits are the whole
+     * legal range (10..60), so a third cannot produce a legal value; refusing it
+     * keeps the buffer honest instead of letting it hold something that will only be
+     * rejected at commit with a message about a number the player cannot see.
+     */
+    if (flow->settings.fps_edit_len >= BOUNCE_FPS_EDIT_MAX_DIGITS)
+        return -1;
+    flow->settings.fps_edit_digits[flow->settings.fps_edit_len]
+        = (char)('0' + (int)digit);
+    flow->settings.fps_edit_len++;
+    flow->settings.fps_edit_digits[flow->settings.fps_edit_len] = '\0';
+    return 0;
+}
+
+int bounce_app_flow_settings_fps_edit_backspace(BounceAppFlow *flow)
+{
+    if (flow == NULL)
+        return -1;
+    if (!flow->settings.fps_edit_active)
+        return -1;
+    if (flow->settings.fps_edit_len == 0u)
+        return 0; /* Nothing to delete; not an error, and not a state change. */
+    flow->settings.fps_edit_len--;
+    flow->settings.fps_edit_digits[flow->settings.fps_edit_len] = '\0';
+    return 0;
+}
+
+int bounce_app_flow_settings_fps_edit_commit(BounceAppFlow *flow)
+{
+    unsigned int value = 0u;
+    unsigned int i;
+
+    if (flow == NULL)
+        return -1;
+    if (!flow->settings.fps_edit_active)
+        return -1;
+    /*
+     * AN EMPTY FIELD COMMITS NOTHING AND IS NOT AN ERROR. The player has simply not
+     * finished typing. Leaving target_fps alone and staying in the field is the
+     * honest answer; the alternative -- committing the previous value and closing --
+     * would look like the field had accepted what was typed.
+     */
+    if (flow->settings.fps_edit_len == 0u)
+        return 0;
+    for (i = 0u; i < flow->settings.fps_edit_len; ++i) {
+        const char c = flow->settings.fps_edit_digits[i];
+
+        /*
+         * EVERY CHARACTER IS CHECKED, not just the first. The buffer is only ever
+         * written through bounce_app_flow_settings_fps_edit_digit(), which refuses
+         * anything above 9, but a parse that did not re-check would turn a corrupted
+         * buffer into a silently wrong FPS rather than a refusal.
+         */
+        if (c < '0' || c > '9')
+            return -1;
+        value = value * 10u + (unsigned int)(c - '0');
+        /* Saturate rather than wrap: 999 digits must not roll over to a legal value. */
+        if (value > BOUNCE_FPS_MAX * 10u)
+            return -1;
+    }
+    if (value < BOUNCE_FPS_MIN || value > BOUNCE_FPS_MAX)
+        return -1;
+    flow->settings.target_fps = value;
+    flow->settings.fps_edit_active = false;
+    fps_edit_clear(flow);
+    return 0;
+}
+
+int bounce_app_flow_settings_fps_edit_cancel(BounceAppFlow *flow)
+{
+    if (flow == NULL)
+        return -1;
+    if (!flow->settings.fps_edit_active)
+        return 0;
+    flow->settings.fps_edit_active = false;
+    fps_edit_clear(flow);
+    return 0;
+}
+
+const char *bounce_app_flow_settings_fps_edit_text(const BounceAppFlow *flow)
+{
+    if (flow == NULL)
+        return "";
+    return flow->settings.fps_edit_digits;
 }
 
 /*

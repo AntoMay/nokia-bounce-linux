@@ -273,6 +273,22 @@ int bounce_audio_player_null_peak(const BounceAudioPlayer *player,
                                   unsigned int *out_last_peak);
 
 /*
+ * BL-004 -- zero both peak counters on a Null-backend player.
+ *
+ * EXISTS SO A MEASUREMENT IS ABOUT ONE CASE. bounce_audio_player_null_peak()
+ * reports the maximum since the last reset, so without this a second measurement in
+ * the same process inherits the first one's peak and the second number is silently
+ * wrong -- it looks like a plausible measurement and is not one.
+ *
+ * It is atomic and relaxed, like every other access to those fields, so it is safe to
+ * call while the worker runs; see the note on peak_sample in audio_backend_null.h.
+ * It does not stop the player, drain the queue, or otherwise change what will be
+ * played -- it only forgets what has been measured. Returns 0 on success and -1 for
+ * a NULL player or a non-Null backend.
+ */
+int bounce_audio_player_null_reset_peak(BounceAudioPlayer *player);
+
+/*
  * Stop accepting, wake the worker, join it, close the backend, and free
  * everything. After this returns the player pointer is invalid.
  *

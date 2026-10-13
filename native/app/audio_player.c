@@ -614,6 +614,31 @@ int bounce_audio_player_null_peak(const BounceAudioPlayer *player,
     return 0;
 }
 
+int bounce_audio_player_null_reset_peak(BounceAudioPlayer *player)
+{
+    if (player == NULL || player->null_state == NULL) {
+        return -1;
+    }
+    /*
+     * THE COUNTERS ONLY -- NOT bounce_audio_backend_null_reset().
+     *
+     * That was the first version, and it was wrong in a way that made the CALLER
+     * look broken rather than the callee: the backend reset sets `open = 0`, so the
+     * very next write from the audio worker was refused with "write before open"
+     * and the peak stayed at zero for the rest of the process. A function documented
+     * as "only forgets what has been measured" must not stop the device from being
+     * measured.
+     *
+     * The stores are atomic and relaxed, matching every other access to these two
+     * fields, so this is well defined against a worker that is mid-write.
+     */
+    atomic_store_explicit(&player->null_state->peak_sample, 0u,
+                          memory_order_relaxed);
+    atomic_store_explicit(&player->null_state->last_write_peak, 0u,
+                          memory_order_relaxed);
+    return 0;
+}
+
 /* Absolute deadline `timeout_ms` from now, for the drain wait. */
 static void bounce_audio_player_deadline(struct timespec *when,
                                          unsigned int timeout_ms)
