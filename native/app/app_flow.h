@@ -1309,6 +1309,24 @@ int bounce_app_flow_restore_persisted_theme(
 );
 
 /*
+ * G4 -- adopt the persisted language index at startup, exactly as the theme
+ * restore above adopts the persisted profile. The bound is
+ * BOUNCE_LANGUAGE_COUNT, the same constant the language resource page is built
+ * from, so a value the Settings screen could never have produced is also a
+ * value this refuses. The value is IGNORED rather than rejected, for the same
+ * reason as the theme: a saved setting must never be able to leave the
+ * application with no usable language, so an out-of-range file falls back to
+ * the default English exactly as an absent one does.
+ *
+ * This sets both the applied index and the highlight, like the theme restore,
+ * so the Settings page shows the language that is actually in force.
+ */
+int bounce_app_flow_restore_persisted_language(
+    BounceAppFlow *flow,
+    int language_index
+);
+
+/*
  * STEP 37 PERSIST -- adopt values read from the native store at startup.
  * Neither validates ranges: persistence.c already does that on load, and a
  * caller-supplied value here is a test or restore path. Returns -1 for NULL.

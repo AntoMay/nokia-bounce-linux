@@ -332,6 +332,38 @@ bool bounce_locale_is_recovered_resource(BounceLanguage language);
 void bounce_locale_set_active_language(BounceLanguage language);
 BounceLanguage bounce_locale_active_language(void);
 
+/*
+ * G4 -- boot language detection, the native analogue of the J2ME
+ * microedition.locale property that Translation.java:39 reads to choose
+ * /lang.<locale> with the /lang.xx (English) fallback at :57-59.
+ *
+ * bounce_locale_language_from_string() maps ONE locale string to a language:
+ *   - the codeset (".UTF-8") and the modifier ("@euro") are stripped;
+ *   - "_" is treated as "-" and matching is case-insensitive;
+ *   - exact (normalized) matches: "zh-CN", "zh-TW", "th-TH", "id-ID", and any
+ *     "en" form ("en", "en-US", ...);
+ *   - bare two-letter codes map to their primary form: "zh" -> zh-CN,
+ *     "th" -> th-TH, "id" -> ID. This is a NATIVE CONVENIENCE beyond Java's
+ *     exact resource-name rule (a bare "zh" has no /lang.zh resource and would
+ *     fall back to English there), because POSIX environment variables
+ *     commonly omit the region;
+ *   - anything else -> bounce_locale_default_language(), exactly as a missing
+ *     /lang.<locale> resource falls back to /lang.xx.
+ *
+ * bounce_locale_detect_language() reads the POSIX locale chain LC_ALL,
+ * LC_MESSAGES, LANG in that precedence and maps the FIRST non-empty value.
+ * Java has a single property and no precedence to model; the chain is the
+ * standard POSIX reading of "the system locale" and is a documented native
+ * choice. An absent or unparseable environment yields the default language,
+ * which is what a fresh launch did before G4 existed.
+ *
+ * Neither function touches the active language; the boot restore in
+ * app_restore_persisted_settings() applies the result through the flow, and
+ * the persisted setting (records.bin record 7) beats detection.
+ */
+BounceLanguage bounce_locale_language_from_string(const char *locale);
+BounceLanguage bounce_locale_detect_language(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -92,7 +92,11 @@
  * the ids it wants, so the ceiling is the only thing that has to move; nothing
  * about the framing, the ordering or the reader changes.
  */
-#define BOUNCE_PERSISTENCE_V2_MAX_RECORDS 7u
+/*
+ * G4 -- raised to 8. Record 7 is the UI-language setting, described at
+ * persistence.h. The ceiling bounds the directory walk, not the format.
+ */
+#define BOUNCE_PERSISTENCE_V2_MAX_RECORDS 8u
 
 /* Largest container this module will write or accept. */
 #define BOUNCE_PERSISTENCE_MAX_FILE_SIZE (1u << 20)
@@ -757,7 +761,8 @@ static int write_container(const BouncePersistenceRecords *records12,
     const BouncePersistenceRecord3 *record3, bool have_record3,
     int32_t theme, bool have_theme,
     int32_t t9, bool have_t9,
-    int32_t volume, bool have_volume)
+    int32_t volume, bool have_volume,
+    int32_t language, bool have_language)
 {
     static unsigned char payload[BOUNCE_PERSISTENCE_MAX_FILE_SIZE];
     static unsigned char container[BOUNCE_PERSISTENCE_MAX_FILE_SIZE];
@@ -872,9 +877,27 @@ static int write_container(const BouncePersistenceRecords *records12,
         used += 4u;
     }
 
+    if (have_language) {
+        /*
+         * G4 -- record 7, the UI-language setting. One u32, the BounceLanguage
+         * index; same negative-refusal as every other scalar record, and the
+         * upper bound is the caller's, documented at persistence.h.
+         */
+        if (language < 0)
+            return -1;
+        if (used + 4u > (uint32_t)sizeof payload)
+            return -1;
+        put_u32(payload + used, (uint32_t)language);
+        ids[count] = BOUNCE_PERSISTENCE_RECORD_LANGUAGE;
+        offsets[count] = used;
+        lengths[count] = 4u;
+        ++count;
+        used += 4u;
+    }
+
 
     /*
-     * Insertion sort the directory by ascending record id. At most seven entries,
+     * Insertion sort the directory by ascending record id. At most eight entries,
      * so this is not a performance question; it is a guarantee that the on-disk
      * order matches the format's own wording no matter what order the records
      * above happened to be staged in. Duplicated ids cannot occur -- each record
@@ -1067,8 +1090,16 @@ int bounce_persistence_save_t9_enabled(int32_t enabled)
     (void)bounce_persistence_load_record3(&record3, &have_record3);
     if (bounce_persistence_load_theme_index(&theme) != 0)
         theme = 0;
+    /* G4 -- also read and preserve the language setting (record 7). */
+    int32_t language = 0;
+    bool have_language = false;
+    if (bounce_persistence_load_language(&language, &have_language) != 0) {
+        language = 0;
+        have_language = false;
+    }
     ok = write_container(
-        &records12, &record3, have_record3, theme, true, ok_value, true, 0, false) == 0;
+        &records12, &record3, have_record3, theme, true, ok_value, true, 0, false,
+        language, have_language) == 0;
     return ok ? 0 : -1;
 }
 
@@ -1161,8 +1192,114 @@ int bounce_persistence_save_volume(int32_t volume)
         theme = 0;
     if (bounce_persistence_load_t9_enabled(&t9) != 0)
         t9 = 0;
+    /* G4 -- also read and preserve the language setting (record 7). */
+    int32_t language = 0;
+    bool have_language = false;
+    if (bounce_persistence_load_language(&language, &have_language) != 0) {
+        language = 0;
+        have_language = false;
+    }
     ok = write_container(
-        &records12, &record3, have_record3, theme, true, t9, true, volume, true) == 0;
+        &records12, &record3, have_record3, theme, true, t9, true, volume, true,
+        language, have_language) == 0;
+    return ok ? 0 : -1;
+}
+
+
+/*
+ * G4 -- NATIVE ADDITION. Read the UI-language setting as record 7.
+ *
+ * The presence flag is what separates "the record is absent" (the caller then
+ * detects from the environment) from "the player stored index 0, English" --
+ * the theme loader's absent-as-default contract cannot express that split,
+ * because 0 is a legal stored language. *out_present is assigned FALSE before
+ * anything can fail, so a NULL-checked caller always has a defined answer.
+ *
+ * A negative value cannot come from the value this module writes and reads as
+ * absent, symmetric with the writers' refusal to stage one. The upper bound is
+ * the caller's: the flow's restore refuses an out-of-range index exactly as it
+ * does for the theme (app_flow.c, bounce_app_flow_restore_persisted_language).
+ */
+int bounce_persistence_load_language(int32_t *out_index, bool *out_present)
+{
+    static unsigned char bytes[BOUNCE_PERSISTENCE_MAX_FILE_SIZE];
+    const unsigned char *payload = NULL;
+    uint32_t payload_size = 0u;
+    uint32_t size = 0u;
+    uint32_t version = 0u;
+
+    if (out_index == NULL || out_present == NULL)
+        return -1;
+
+    /* Defaults, applied before anything can fail. */
+    *out_index = 0;
+    *out_present = false;
+
+    if (read_container(bytes, (uint32_t)sizeof bytes, &size, &version) != 0)
+        return 0;
+    if (version == BOUNCE_PERSISTENCE_VERSION)
+        return 0; /* A version-1 file has no record 7, correctly absent. */
+    if (version != BOUNCE_PERSISTENCE_VERSION2)
+        return 0; /* Forward rejection. */
+    if (!container_find_record(
+            bytes,
+            size,
+            BOUNCE_PERSISTENCE_RECORD_LANGUAGE,
+            &payload,
+            &payload_size))
+        return 0;
+    /* Four bytes, like every other scalar record. */
+    if (payload_size != 4u)
+        return 0;
+    if (get_u32(payload) > (uint32_t)INT32_MAX)
+        return 0;
+    *out_index = (int32_t)get_u32(payload);
+    *out_present = true;
+    return 0;
+}
+
+/*
+ * G4 -- NATIVE ADDITION. Write the language setting as record 7, preserving
+ * records 1..6. Every writer in this module owns one record and must leave the
+ * others alone, so a language change cannot reset the theme, the keypad
+ * setting, the volume or the snapshot -- the same read-modify-write obligation
+ * the theme, keypad and volume writers carry.
+ *
+ * A negative index is refused here rather than written, for the same reason
+ * every other scalar writer refuses one; the upper bound is the caller's and
+ * is documented at persistence.h.
+ *
+ * A failure here is never fatal, exactly as for every other write in this
+ * module: Java's WriteToStore() swallows its IOException
+ * (BounceGame.java:413-414).
+ */
+int bounce_persistence_save_language(int32_t index)
+{
+    BouncePersistenceRecords records12;
+    BouncePersistenceRecord3 record3;
+    bool have_record3 = false;
+    int32_t theme = 0;
+    int32_t t9 = 0;
+    int32_t volume = 0;
+    bool ok;
+
+    if (index < 0)
+        return -1;
+
+    if (bounce_persistence_load(&records12) != 0) {
+        records12.max_levels = 0;
+        records12.high_score = 0;
+    }
+    (void)bounce_persistence_load_record3(&record3, &have_record3);
+    if (bounce_persistence_load_theme_index(&theme) != 0)
+        theme = 0;
+    if (bounce_persistence_load_t9_enabled(&t9) != 0)
+        t9 = 0;
+    if (bounce_persistence_load_volume(&volume) != 0)
+        volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
+    ok = write_container(
+        &records12, &record3, have_record3, theme, true, t9, true, volume, true,
+        index, true) == 0;
     return ok ? 0 : -1;
 }
 
@@ -1200,8 +1337,16 @@ int bounce_persistence_save_theme_index(int32_t index)
         t9 = 0;
     if (bounce_persistence_load_volume(&volume) != 0)
         volume = BOUNCE_AUDIO_VOLUME_DEFAULT;
+    /* G4 -- also read and preserve the language setting (record 7). */
+    int32_t language = 0;
+    bool have_language = false;
+    if (bounce_persistence_load_language(&language, &have_language) != 0) {
+        language = 0;
+        have_language = false;
+    }
     ok = write_container(
-        &records12, &record3, have_record3, index, true, t9, true, volume, true) == 0;
+        &records12, &record3, have_record3, index, true, t9, true, volume, true,
+        language, have_language) == 0;
     return ok ? 0 : -1;
 }
 
@@ -1246,8 +1391,16 @@ int bounce_persistence_save_record3(const BouncePersistenceRecord3 *in)
     bool have_volume = bounce_persistence_load_volume(&volume) == 0 && volume != 0;
     if (!have_volume)
         volume = 0;
+    /* G4 -- also read and preserve the language setting (record 7). */
+    int32_t language = 0;
+    bool have_language = false;
+    if (bounce_persistence_load_language(&language, &have_language) != 0) {
+        language = 0;
+        have_language = false;
+    }
     return write_container(
-        &records12, in, true, theme, true, t9, have_t9, volume, have_volume);
+        &records12, in, true, theme, true, t9, have_t9, volume, have_volume,
+        language, have_language);
 }
 
 /*
@@ -1299,9 +1452,17 @@ int bounce_persistence_delete_record3(void)
     have_volume = bounce_persistence_load_volume(&volume) == 0 && volume != 0;
     if (!have_volume)
         volume = 0;
+    /* G4 -- also read and preserve the language setting (record 7). */
+    int32_t language = 0;
+    bool have_language = false;
+    if (bounce_persistence_load_language(&language, &have_language) != 0) {
+        language = 0;
+        have_language = false;
+    }
     /* have_record3 == false: the record is omitted from the directory entirely. */
     return write_container(
-        &records12, NULL, false, theme, true, t9, have_t9, volume, have_volume);
+        &records12, NULL, false, theme, true, t9, have_t9, volume, have_volume,
+        language, have_language);
 }
 
 int bounce_persistence_save_records_12_preserving_record3(
@@ -1353,8 +1514,16 @@ int bounce_persistence_save_records_12_preserving_record3(
     bool have_volume = bounce_persistence_load_volume(&volume) == 0 && volume != 0;
     if (!have_volume)
         volume = 0;
+    /* G4 -- record 7 (language) rides along too. */
+    int32_t language = 0;
+    bool have_language = false;
+    if (bounce_persistence_load_language(&language, &have_language) != 0) {
+        language = 0;
+        have_language = false;
+    }
     return write_container(
-        in, &existing, present, theme, have_theme, t9, have_t9, volume, have_volume);
+        in, &existing, present, theme, have_theme, t9, have_t9, volume, have_volume,
+        language, have_language);
 }
 
 int bounce_persistence_save(const BouncePersistenceRecords *in)

@@ -1,6 +1,8 @@
 #include "locale.h"
 
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 /*
  * The complete user-facing string set of the native UI, in two languages.
@@ -718,6 +720,74 @@ static BounceLanguage active_language = BOUNCE_LANGUAGE_EN;
 BounceLanguage bounce_locale_default_language(void)
 {
     return BOUNCE_LANGUAGE_EN;
+}
+
+/*
+ * G4 -- see locale.h for the full contract. The normalization is done by hand
+ * rather than through a locale library: the mapping table is five entries, the
+ * input is at most a few dozen bytes from an environment variable, and the
+ * rules (strip codeset/modifier, '_'->'-', case-insensitive) are stated in the
+ * header rather than delegated to setlocale() state that the rest of the
+ * process does not otherwise use.
+ */
+BounceLanguage bounce_locale_language_from_string(const char *locale)
+{
+    char normalized[32];
+    size_t limit = (sizeof normalized) - 1u;
+    size_t i;
+    size_t n;
+
+    if (locale == NULL)
+        return bounce_locale_default_language();
+
+    n = strlen(locale);
+    if (n > limit)
+        n = limit;
+    for (i = 0u; i < n; ++i) {
+        char c = locale[i];
+        /* The codeset and the modifier end the language-region tag. */
+        if (c == '.' || c == '@')
+            break;
+        if (c == '_')
+            c = '-';
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c - 'A' + 'a');
+        normalized[i] = c;
+    }
+    normalized[i] = '\0';
+
+    if (strcmp(normalized, "zh-cn") == 0)
+        return BOUNCE_LANGUAGE_ZH_CN;
+    if (strcmp(normalized, "zh-tw") == 0)
+        return BOUNCE_LANGUAGE_ZH_TW;
+    if (strcmp(normalized, "th-th") == 0)
+        return BOUNCE_LANGUAGE_TH_TH;
+    if (strcmp(normalized, "id-id") == 0 || strcmp(normalized, "id") == 0)
+        return BOUNCE_LANGUAGE_ID;
+    /* Native convenience: bare codes, documented at locale.h. */
+    if (strcmp(normalized, "zh") == 0)
+        return BOUNCE_LANGUAGE_ZH_CN;
+    if (strcmp(normalized, "th") == 0)
+        return BOUNCE_LANGUAGE_TH_TH;
+    /* Any "en" form, mirroring the /lang.xx English default of the source. */
+    if (strncmp(normalized, "en", 2u) == 0
+        && (normalized[2] == '\0' || normalized[2] == '-'))
+        return BOUNCE_LANGUAGE_EN;
+    /* Unmatched, as a missing /lang.<locale> resource falls back to xx. */
+    return bounce_locale_default_language();
+}
+
+BounceLanguage bounce_locale_detect_language(void)
+{
+    static const char *const vars[3] = { "LC_ALL", "LC_MESSAGES", "LANG" };
+    size_t i;
+
+    for (i = 0u; i < sizeof vars / sizeof vars[0]; ++i) {
+        const char *value = getenv(vars[i]);
+        if (value != NULL && value[0] != '\0')
+            return bounce_locale_language_from_string(value);
+    }
+    return bounce_locale_default_language();
 }
 
 const char *bounce_locale_text(BounceLanguage language, BounceLocaleKey key)

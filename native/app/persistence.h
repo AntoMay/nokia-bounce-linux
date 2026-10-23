@@ -156,6 +156,25 @@ typedef struct BouncePersistenceRecords {
 
 
 /*
+ * G4 -- NATIVE ADDITION. The UI-language setting, as record 7 of the SAME
+ * container.
+ *
+ * Java chooses its language from the microedition.locale system property at
+ * runtime (Translation.java:39) and has no persisted language at all; the
+ * persisted record exists so the native Settings language choice (itself a
+ * native feature) survives a restart. The payload is a single u32, the
+ * BounceLanguage index 0..4.
+ *
+ * ABSENT MEANS "DETECT FROM THE ENVIRONMENT", NOT "ENGLISH": the loader
+ * reports presence separately, because index 0 (English) is a legal STORED
+ * value -- a player whose system locale is Chinese who deliberately picks EN
+ * must get EN back, not a re-detection. This is why the loader does not share
+ * the theme loader's "absent arrives as the default" contract.
+ */
+#define BOUNCE_PERSISTENCE_RECORD_LANGUAGE 7u
+
+
+/*
  * G-R3-P1 -- the fixed prefix of Java's Record 3, in bytes.
  *
  * BounceGame.java:360-379 writes, in order: a long timestamp, five bytes
@@ -424,6 +443,28 @@ int bounce_persistence_load_volume(int32_t *out_volume);
  * keypad setting.
  */
 int bounce_persistence_save_volume(int32_t volume);
+
+/*
+ * G4 -- NATIVE ADDITION. Read the UI-language setting (BounceLanguage index).
+ *
+ * Unlike the theme/T9/volume loaders, THIS ONE REPORTS PRESENCE: record 7
+ * absent means "detect from the environment at boot", and stored 0 means
+ * "the player chose English" -- the two must not collapse into one answer,
+ * and index 0 is a legal stored value. A negative or otherwise unreadable
+ * payload reads as absent. The upper bound is the caller's (the flow's
+ * restore refuses an out-of-range index exactly as it does for the theme).
+ *
+ * Returns -1 only for a NULL argument.
+ */
+int bounce_persistence_load_language(int32_t *out_index, bool *out_present);
+
+/*
+ * G4 -- NATIVE ADDITION. Write the language setting as record 7, preserving
+ * records 1..6. Every writer in this module owns one record and must leave the
+ * others alone, so a language change cannot reset the theme, keypad setting,
+ * volume or snapshot.
+ */
+int bounce_persistence_save_language(int32_t index);
 
 
 /*

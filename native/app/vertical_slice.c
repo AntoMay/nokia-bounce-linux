@@ -2512,6 +2512,37 @@ static void app_restore_persisted_settings(BounceApp *app)
         (void)bounce_app_flow_restore_persisted_theme(&app->flow, (int)theme);
 
     /*
+     * G4 -- the UI language, at the same moment and for the same reason as the
+     * theme: applied before app_update_ui() first mirrors the applied index
+     * into bounce_locale_set_active_language(), so the very first frame is
+     * already drawn in the chosen language.
+     *
+     * PRECEDENCE, in one place: a persisted choice (records.bin record 7)
+     * beats environment detection, and detection beats the flow's default
+     * English. The two halves mirror Java's two inputs: Translation.java:39
+     * reads microedition.locale at runtime (the environment detection below)
+     * and never persists anything, while the persisted record is the native
+     * Settings choice surviving a restart -- a player who deliberately picks
+     * EN on a Chinese system gets EN, not a re-detection.
+     *
+     * Absent means "detect", and the present flag is what makes that
+     * distinguishable from a stored index 0 (see persistence.h, record 7).
+     */
+    {
+        int32_t language = 0;
+        bool language_present = false;
+
+        if (bounce_persistence_load_language(&language, &language_present) == 0
+            && language_present) {
+            (void)bounce_app_flow_restore_persisted_language(
+                &app->flow, (int)language);
+        } else {
+            (void)bounce_app_flow_restore_persisted_language(
+                &app->flow, (int)bounce_locale_detect_language());
+        }
+    }
+
+    /*
      * NATIVE ADDITION -- and so is the numeric-keypad setting, for the same
      * reason and at the same moment: applied before app_update_ui() first runs,
      * so the very first frame already has the control mode the player chose.
@@ -2708,6 +2739,10 @@ static void app_apply_reset_to_default(BounceApp *app)
     (void)bounce_persistence_save(&records);
     (void)bounce_persistence_save_theme_index(0);
     (void)bounce_persistence_save_t9_enabled(1);
+    /* G4 -- the language returns to the default English, store-side. The flow
+     * half is bounce_app_flow_reset_to_default(), which already resets
+     * applied_language_index to BOUNCE_DEFAULT_LANGUAGE_INDEX. */
+    (void)bounce_persistence_save_language(0);
     (void)bounce_persistence_delete_record3();
     /*
      * LAST, and deliberately after the deletions: this is the copy that would be
@@ -2839,6 +2874,38 @@ static void app_commit_theme_change(BounceApp *app, unsigned int applied_before)
         == applied_before)
         return;
     app_persist_theme(app);
+}
+
+/*
+ * G4 -- persist the applied language (records.bin record 7).
+ *
+ * Same rationale as app_persist_theme(): the write belongs in this layer
+ * because app_flow.c does no I/O anywhere, and it belongs on the edge rather
+ * than at shutdown so a crash or a kill cannot lose the choice.
+ */
+static void app_persist_language(BounceApp *app)
+{
+    if (app == NULL)
+        return;
+    (void)bounce_persistence_save_language(
+        (int32_t)bounce_app_flow_settings_applied_language_index(&app->flow));
+}
+
+/*
+ * G4 -- commit the language if, and only if, this input changed it.
+ *
+ * The same rationale as app_commit_theme_change(): `language_before` is
+ * sampled before the press, and comparing keeps ordinary navigation (moving
+ * the highlight without SELECTing a row) off the file entirely.
+ */
+static void app_commit_language_change(BounceApp *app, unsigned int language_before)
+{
+    if (app == NULL)
+        return;
+    if (bounce_app_flow_settings_applied_language_index(&app->flow)
+        == language_before)
+        return;
+    app_persist_language(app);
 }
 
 static void app_persist_records(BounceApp *app)
@@ -5568,8 +5635,11 @@ static int app_update_ui(BounceApp *app)
 
     /*
      * Mirror the flow's applied language into the one runtime value the label
-     * and render helpers read. The flow stays the owner; nothing is persisted,
-     * so a fresh launch always starts on index 0, the default English resource.
+     * and render helpers read. The flow stays the owner. Since G4 the applied
+     * index no longer starts at 0 for every launch: app_restore_persisted_settings()
+     * seeds it from records.bin record 7 when present, else from the
+     * environment detection (bounce_locale_detect_language()), else this
+     * default English.
      */
     bounce_locale_set_active_language(
         (BounceLanguage)bounce_app_flow_settings_applied_language_index(
@@ -21111,7 +21181,12 @@ static int verify_native_language_presentation(void)
             != (unsigned int)BOUNCE_LANGUAGE_ID)
         return -1;
 
-    /* A fresh flow is English again: nothing is persisted. */
+    /*
+     * A fresh FLOW is English again -- flow init reads no store. The launch
+     * path is a separate step (G4): app_restore_persisted_settings() then
+     * applies the persisted record 7 or the environment detection, verified by
+     * verify_language_boot_restore().
+     */
     bounce_locale_set_active_language(bounce_locale_default_language());
     memset(&flow, 0, sizeof flow);
     bounce_app_flow_init(&flow);
@@ -22679,7 +22754,9 @@ static int verify_audio_peak_reset_determinism(void)
  *   - switching is repeatable in the order EN -> CN -> TW -> TH -> ID -> EN
  *   - every implemented page renders in every language without failing
  *   - the script font has a set for CN, TW and TH and none for EN or ID
- *   - nothing is persisted: a fresh flow is always EN
+ *   - a fresh FLOW is always EN (flow init reads no store; the G4 boot
+ *     restore of record 7 / environment detection is the separate step
+ *     verified by verify_language_boot_restore)
  *
  * The Chinese and Thai strings are TEMPORARY TEST STRINGS, not decoded
  * resources.
@@ -22958,6 +23035,308 @@ fail:
     bounce_renderer_destroy(renderer);
     bounce_surface_destroy(surface);
     return -1;
+}
+
+/*
+ * G4 -- boot language detection: the parser (locale string -> language) and
+ * the POSIX environment chain (LC_ALL > LC_MESSAGES > LANG, first non-empty
+ * wins). Expected values are derived from the contract at locale.h, not
+ * recorded from a run: exact normalized matches for zh-CN / zh-TW / th-TH /
+ * id-ID and any "en" form, bare-code convenience for zh / th / id, and the
+ * default English for everything else -- the same fallback as the source's
+ * missing /lang.<locale> resource (Translation.java:57-59).
+ */
+static int verify_language_env_detection(void)
+{
+    static const struct {
+        const char *input;
+        BounceLanguage expected;
+    } cases[] = {
+        { "zh_CN.UTF-8", BOUNCE_LANGUAGE_ZH_CN },
+        { "zh_TW", BOUNCE_LANGUAGE_ZH_TW },
+        { "th_TH.UTF-8", BOUNCE_LANGUAGE_TH_TH },
+        { "th-TH@euro", BOUNCE_LANGUAGE_TH_TH },
+        { "id_ID.UTF-8", BOUNCE_LANGUAGE_ID },
+        { "en_US.UTF-8", BOUNCE_LANGUAGE_EN },
+        { "en", BOUNCE_LANGUAGE_EN },
+        { "ZH_cn", BOUNCE_LANGUAGE_ZH_CN },
+        { "zh", BOUNCE_LANGUAGE_ZH_CN },
+        { "th", BOUNCE_LANGUAGE_TH_TH },
+        { "id", BOUNCE_LANGUAGE_ID },
+        { "fr_FR.UTF-8", BOUNCE_LANGUAGE_EN },
+        { "", BOUNCE_LANGUAGE_EN },
+        { NULL, BOUNCE_LANGUAGE_EN }
+    };
+    const char *old_lc_all = getenv("LC_ALL");
+    const char *old_lc_messages = getenv("LC_MESSAGES");
+    const char *old_lang = getenv("LANG");
+    char copy_all[128];
+    char copy_messages[128];
+    char copy_lang[128];
+    bool had_all = old_lc_all != NULL;
+    bool had_messages = old_lc_messages != NULL;
+    bool had_lang = old_lang != NULL;
+    unsigned int i;
+    int result = -1;
+
+    if (had_all)
+        (void)snprintf(copy_all, sizeof copy_all, "%s", old_lc_all);
+    if (had_messages)
+        (void)snprintf(copy_messages, sizeof copy_messages, "%s", old_lc_messages);
+    if (had_lang)
+        (void)snprintf(copy_lang, sizeof copy_lang, "%s", old_lang);
+
+    for (i = 0u; i < sizeof cases / sizeof cases[0]; ++i) {
+        if (bounce_locale_language_from_string(cases[i].input)
+            != cases[i].expected)
+            goto out;
+    }
+
+    /* LC_ALL wins over LANG. */
+    if (setenv("LC_ALL", "th_TH.UTF-8", 1) != 0
+        || setenv("LANG", "zh_CN.UTF-8", 1) != 0
+        || unsetenv("LC_MESSAGES") != 0
+        || bounce_locale_detect_language() != BOUNCE_LANGUAGE_TH_TH)
+        goto out;
+    /* Without LC_ALL, LANG applies. */
+    if (unsetenv("LC_ALL") != 0
+        || bounce_locale_detect_language() != BOUNCE_LANGUAGE_ZH_CN)
+        goto out;
+    /* LC_MESSAGES sits between the two. */
+    if (setenv("LC_MESSAGES", "zh_TW", 1) != 0
+        || bounce_locale_detect_language() != BOUNCE_LANGUAGE_ZH_TW)
+        goto out;
+    /*
+     * The first NON-EMPTY value wins wholly: an unparseable LC_ALL falls back
+     * to the default language rather than continuing down the chain, which is
+     * the documented native reading of one authoritative locale.
+     */
+    if (setenv("LC_ALL", "fr_FR.UTF-8", 1) != 0
+        || bounce_locale_detect_language() != BOUNCE_LANGUAGE_EN)
+        goto out;
+    /* Absent everywhere -> default English. */
+    if (unsetenv("LC_ALL") != 0
+        || unsetenv("LC_MESSAGES") != 0
+        || unsetenv("LANG") != 0
+        || bounce_locale_detect_language() != BOUNCE_LANGUAGE_EN)
+        goto out;
+
+    result = 0;
+out:
+    if (had_all)
+        (void)setenv("LC_ALL", copy_all, 1);
+    else
+        (void)unsetenv("LC_ALL");
+    if (had_messages)
+        (void)setenv("LC_MESSAGES", copy_messages, 1);
+    else
+        (void)unsetenv("LC_MESSAGES");
+    if (had_lang)
+        (void)setenv("LANG", copy_lang, 1);
+    else
+        (void)unsetenv("LANG");
+    if (result == 0)
+        printf("LANG-DETECT parser-cases=%zu exact=zh-CN,zh-TW,th-TH,id-ID,en"
+               " bare=zh,th,id env=LC_ALL>LC_MESSAGES>LANG"
+               " unparseable=first-wins-absent=EN PASS\n",
+               sizeof cases / sizeof cases[0]);
+    return result;
+}
+
+/*
+ * G4 -- persistence record 7: the round trip (including the stored-zero case
+ * the present flag exists for) and the mutual-erasure contract every writer in
+ * persistence.c carries -- other writers must not cost the language its
+ * record, and the language writer must not cost them theirs.
+ *
+ * Runs in the suite's BOUNCE_SAVE_DIR sandbox like every persistence verify,
+ * and snapshots the four settings records it moves so the store is left as it
+ * was found (record 7 cannot be un-written, so an originally-absent record
+ * stays present with its snapshot value restored).
+ */
+static int verify_language_persistence(void)
+{
+    int32_t theme_before = 0;
+    int32_t t9_before = 0;
+    int32_t volume_before = 0;
+    int32_t language_before = 0;
+    bool language_present_before = false;
+    int32_t loaded = 0;
+    bool present = false;
+    int result = -1;
+
+    if (bounce_persistence_load_theme_index(&theme_before) != 0)
+        theme_before = 0;
+    if (bounce_persistence_load_t9_enabled(&t9_before) != 0)
+        t9_before = 0;
+    if (bounce_persistence_load_volume(&volume_before) != 0)
+        volume_before = 100;
+    (void)bounce_persistence_load_language(&language_before,
+                                           &language_present_before);
+
+    /* Round trip, and stored 0 reads as PRESENT English, never as absent. */
+    if (bounce_persistence_save_language(3) != 0
+        || bounce_persistence_load_language(&loaded, &present) != 0
+        || !present
+        || loaded != 3
+        || bounce_persistence_save_language(0) != 0
+        || bounce_persistence_load_language(&loaded, &present) != 0
+        || !present
+        || loaded != 0)
+        goto out;
+
+    /* A negative index is refused rather than written. */
+    if (bounce_persistence_save_language(-1) == 0)
+        goto out;
+
+    /*
+     * Mutual erasure, both directions. Theme, keypad and volume writers must
+     * carry the language along; the language writer must carry them along.
+     */
+    if (bounce_persistence_save_language(2) != 0
+        || bounce_persistence_save_theme_index(3) != 0
+        || bounce_persistence_load_language(&loaded, &present) != 0
+        || !present
+        || loaded != 2
+        || bounce_persistence_save_t9_enabled(1) != 0
+        || bounce_persistence_load_language(&loaded, &present) != 0
+        || !present
+        || loaded != 2
+        || bounce_persistence_save_volume(50) != 0
+        || bounce_persistence_load_language(&loaded, &present) != 0
+        || !present
+        || loaded != 2
+        || bounce_persistence_save_language(1) != 0
+        || bounce_persistence_load_theme_index(&loaded) != 0
+        || loaded != 3
+        || bounce_persistence_load_t9_enabled(&loaded) != 0
+        || loaded != 1
+        || bounce_persistence_load_volume(&loaded) != 0
+        || loaded != 50)
+        goto out;
+
+    result = 0;
+out:
+    (void)bounce_persistence_save_theme_index(theme_before);
+    (void)bounce_persistence_save_t9_enabled(t9_before);
+    (void)bounce_persistence_save_volume(volume_before);
+    (void)bounce_persistence_save_language(language_present_before
+                                               ? language_before
+                                               : 0);
+    if (result == 0)
+        printf("LANG-PERSIST record=7 roundtrip=yes stored-zero=present"
+               " negative=refused"
+               " mutual-erasure=theme,t9,volume,language PASS\n");
+    return result;
+}
+
+/*
+ * G4 -- boot precedence through the production restore path
+ * (app_restore_persisted_settings): persisted record 7 beats environment
+ * detection, detection applies when the record is absent, and absent-plus-
+ * empty-environment lands on the default English -- the three launches a
+ * player can actually have. The BOUNCE_SAVE_DIR override isolates the absent
+ * case from the suite's sandbox store, and every environment variable this
+ * test touches is restored on every path.
+ */
+static int verify_language_boot_restore(void)
+{
+    BounceApp app;
+    const char *old_save_dir = getenv("BOUNCE_SAVE_DIR");
+    const char *old_lc_all = getenv("LC_ALL");
+    const char *old_lc_messages = getenv("LC_MESSAGES");
+    const char *old_lang = getenv("LANG");
+    char copy_save[256];
+    char copy_all[128];
+    char copy_messages[128];
+    char copy_lang[128];
+    bool had_save = old_save_dir != NULL;
+    bool had_all = old_lc_all != NULL;
+    bool had_messages = old_lc_messages != NULL;
+    bool had_lang = old_lang != NULL;
+    int32_t language_before = 0;
+    bool language_present_before = false;
+    int result = -1;
+
+    if (had_save)
+        (void)snprintf(copy_save, sizeof copy_save, "%s", old_save_dir);
+    if (had_all)
+        (void)snprintf(copy_all, sizeof copy_all, "%s", old_lc_all);
+    if (had_messages)
+        (void)snprintf(copy_messages, sizeof copy_messages, "%s", old_lc_messages);
+    if (had_lang)
+        (void)snprintf(copy_lang, sizeof copy_lang, "%s", old_lang);
+    (void)bounce_persistence_load_language(&language_before,
+                                           &language_present_before);
+
+    if (unsetenv("LC_ALL") != 0
+        || unsetenv("LC_MESSAGES") != 0
+        || setenv("LANG", "th_TH.UTF-8", 1) != 0)
+        goto out;
+
+    /* Case 1: a persisted choice beats the environment. */
+    if (bounce_persistence_save_language(2) != 0)
+        goto out;
+    memset(&app, 0, sizeof app);
+    bounce_app_flow_init(&app.flow);
+    app_restore_persisted_settings(&app);
+    if (bounce_app_flow_settings_applied_language_index(&app.flow)
+        != (unsigned int)BOUNCE_LANGUAGE_ZH_TW)
+        goto out;
+
+    /*
+     * Case 2: no record -> the environment decides. The root is a fresh
+     * mkdtemp directory so a store left by an earlier run cannot leak in and
+     * be mistaken for a record the player never wrote.
+     */
+    {
+        char absent_root[] = "/tmp/bounce-g4lang-XXXXXX";
+
+        if (mkdtemp(absent_root) == NULL
+            || setenv("BOUNCE_SAVE_DIR", absent_root, 1) != 0)
+            goto out;
+    }
+    memset(&app, 0, sizeof app);
+    bounce_app_flow_init(&app.flow);
+    app_restore_persisted_settings(&app);
+    if (bounce_app_flow_settings_applied_language_index(&app.flow)
+        != (unsigned int)BOUNCE_LANGUAGE_TH_TH)
+        goto out;
+
+    /* Case 3: no record and no environment -> the default English. */
+    if (unsetenv("LANG") != 0)
+        goto out;
+    memset(&app, 0, sizeof app);
+    bounce_app_flow_init(&app.flow);
+    app_restore_persisted_settings(&app);
+    if (bounce_app_flow_settings_applied_language_index(&app.flow) != 0u)
+        goto out;
+
+    result = 0;
+out:
+    if (had_save)
+        (void)setenv("BOUNCE_SAVE_DIR", copy_save, 1);
+    else
+        (void)unsetenv("BOUNCE_SAVE_DIR");
+    if (had_all)
+        (void)setenv("LC_ALL", copy_all, 1);
+    else
+        (void)unsetenv("LC_ALL");
+    if (had_messages)
+        (void)setenv("LC_MESSAGES", copy_messages, 1);
+    else
+        (void)unsetenv("LC_MESSAGES");
+    if (had_lang)
+        (void)setenv("LANG", copy_lang, 1);
+    else
+        (void)unsetenv("LANG");
+    (void)bounce_persistence_save_language(language_present_before
+                                               ? language_before
+                                               : 0);
+    if (result == 0)
+        printf("LANG-BOOT persisted>env>default absent-root=mkdtemp"
+               " env-restored=yes PASS\n");
+    return result;
 }
 
 static int verify_ui_color_profiles(void)
@@ -27811,6 +28190,8 @@ static int x11_dispatch_event(
         bool was_terminal_screen;
         /* TUGAS 2b: sampled before the UI press, to detect a theme change. */
         unsigned int theme_before;
+        /* G4: the same sample for the language setting. */
+        unsigned int language_before;
         /* NATIVE ADDITION: the same sample for the keypad setting. */
         bool t9_before;
         /* BL-004: sampled before the UI press, to detect a volume change. */
@@ -28335,6 +28716,14 @@ static int x11_dispatch_event(
                 theme_before = bounce_app_flow_settings_applied_theme_index(
                     &app->flow);
                 /*
+                 * G4 -- and the language, sampled at the same point for the
+                 * same reason: only a real change commits, and presses that
+                 * merely move a highlight write nothing.
+                 */
+                language_before =
+                    bounce_app_flow_settings_applied_language_index(
+                        &app->flow);
+                /*
                  * NATIVE ADDITION -- and the keypad setting, sampled at the same
                  * point for the same reason: so that only a real change commits,
                  * and arrow presses that merely move the highlight write nothing.
@@ -28369,6 +28758,11 @@ static int x11_dispatch_event(
                  * for why this is a function.
                  */
                 app_commit_theme_change(app, theme_before);
+                /*
+                 * G4 -- and so is the language, committed on the same edge for
+                 * the same reason.
+                 */
+                app_commit_language_change(app, language_before);
                 /*
                  * NATIVE ADDITION -- and so is the keypad setting, committed on
                  * the same edge for the same reason.
@@ -37546,6 +37940,23 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     /*
+     * G4 -- boot language detection, record 7 persistence and the boot
+     * precedence, in that order: parser first, then the store the boot reads,
+     * then the boot path that composes the two.
+     */
+    if (verify_language_env_detection() != 0) {
+        fprintf(stderr, "language environment detection verification failed\n");
+        goto cleanup;
+    }
+    if (verify_language_persistence() != 0) {
+        fprintf(stderr, "language persistence verification failed\n");
+        goto cleanup;
+    }
+    if (verify_language_boot_restore() != 0) {
+        fprintf(stderr, "language boot restore verification failed\n");
+        goto cleanup;
+    }
+    /*
      * V-2. Registered directly after the five-language switching check it
      * extends: that check proves each language selects and renders; this one
      * proves what it rendered contains no unknown-glyph box. It reads the same
@@ -38077,7 +38488,7 @@ int main(int argc, char **argv)
             }
         }
         printf(
-            "check ok: assets=%zu levels=11 flow=verified ui_shell=verified entry=verified level-load=verified player-init=verified runtime-init=verified camera-init=verified activation=verified timer-init=verified tick-entry=verified tick-dispatch=verified tick-body-entry=verified physics-continuation=verified render-handoff=verified dyn-thorn-tick=verified production-loop=verified native-ui=verified language=verified five-language=verified color-profile=verified pointer=verified input=verified movement=verified vertical=verified action=verified collision=%s dyn-thorn=verified response=verified non-wall=verified visual=verified camera=verified state=%s level_id=%d level=%s tiles=%ux%u runtime-copy=verified player=(%d,%d) spawn=(%d,%d) ballSize=%d p=%d lives=%d hoops=%d surface=%ux%u\n",
+            "check ok: assets=%zu levels=11 flow=verified ui_shell=verified entry=verified level-load=verified player-init=verified runtime-init=verified camera-init=verified activation=verified timer-init=verified tick-entry=verified tick-dispatch=verified tick-body-entry=verified physics-continuation=verified render-handoff=verified dyn-thorn-tick=verified production-loop=verified native-ui=verified language=verified five-language=verified lang-detect=verified lang-persist=verified lang-boot=verified color-profile=verified pointer=verified input=verified movement=verified vertical=verified action=verified collision=%s dyn-thorn=verified response=verified non-wall=verified visual=verified camera=verified state=%s level_id=%d level=%s tiles=%ux%u runtime-copy=verified player=(%d,%d) spawn=(%d,%d) ballSize=%d p=%d lives=%d hoops=%d surface=%ux%u\n",
             asset_count,
             collision_status,
             bounce_game_state_name(app.state),

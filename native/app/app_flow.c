@@ -88,9 +88,12 @@ static void bounce_app_flow_reset_settings(BounceSettingsState *settings)
  *
  * Returning to MAIN_MENU, or re-entering Settings, must not silently undo a
  * language or color-profile selection made in this session, so those entry
- * points use this. Neither selection is still persisted:
- * bounce_app_flow_init() performs the full reset, so a fresh application launch
- * always starts on the default English resource.
+ * points use this. The color profile is still not persisted across launches;
+ * since G4 the LANGUAGE IS (records.bin record 7), restored at boot by
+ * app_restore_persisted_settings() in the vertical slice, so a fresh
+ * application launch starts on the persisted choice, else the detected one,
+ * else the default English resource -- bounce_app_flow_init() alone starts
+ * from that default, which is what this reset preserves.
  *
  * STEP 34-F-K: the Audio ON/OFF choice is preserved here for the same reason
  * and on the same terms -- it survives navigating away from the Audio page
@@ -1958,6 +1961,26 @@ int bounce_app_flow_restore_persisted_theme(
         return 0;
     flow->settings.applied_theme_index = (unsigned int)theme_index;
     flow->settings.theme_index = (unsigned int)theme_index;
+    return 0;
+}
+
+/*
+ * G4 -- see app_flow.h for the full contract. Mirrors
+ * bounce_app_flow_restore_persisted_theme() field for field: bound-check,
+ * ignore rather than reject, write both the applied index and the highlight.
+ */
+int bounce_app_flow_restore_persisted_language(
+    BounceAppFlow *flow,
+    int language_index
+)
+{
+    if (flow == NULL)
+        return -1;
+    if (language_index < 0
+        || (unsigned int)language_index >= (unsigned int)BOUNCE_LANGUAGE_COUNT)
+        return 0;
+    flow->settings.applied_language_index = (unsigned int)language_index;
+    flow->settings.language_index = (unsigned int)language_index;
     return 0;
 }
 

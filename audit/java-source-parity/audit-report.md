@@ -57,7 +57,7 @@ are **stale** — the code has since gained them (score wiring, boost bar, GodMo
 | G1 | **`K==1` live-session Continue** — Java Continue restarts the in-progress level when a live session exists; native only continues from persisted snapshot | NOT IMPLEMENTED | `BounceGame.java:116,223-224`; structural note `vertical_slice.c:8949-9015` |
 | G2 | ~~Second splash `nokiagames.png` never rendered~~ — **no effective gap**: the source is single-stage. The `e` constructor sets `SplashId = 1` (e.java:72), so only `bouncesplash.png` ever displays for 31 ticks (`splashTimer > 30`, e.java:231) and any key skips (e.java:331-332); the `case 0` stage at e.java:235-243 is **dead code** (no assignment of `SplashId = 0` anywhere in the tree). Native matches exactly (single stage, `>30` timing verified, key-skip). Drawing nokiagames would DEVIATE; the asset stays inventory-verified only, mirroring Java never loading SPLASHES[0] at runtime | RESOLVED (analysis; dead code deliberately not implemented) | `e.java:59,72,227-253,331-332`; `app_flow.c:355-366`, `ui_shell.c:2510-2536`, verify timing `vertical_slice.c:9983-9988` |
 | G3 | **Missing post-ball front-tile pass** — Java repaints tiles 13–28 (`d.b` rims) *after* the ball; native render order grid→door→thorns→ball→HUD → ball paints over near hoop rim | **RESOLVED** (`1ccd833`) | `e.java:172` → `b.java:577-600`; `vertical_slice.c:7299+` (`draw_hoop_rims_over_ball`), `visual_assets.c:1106+` |
-| G4 | **No locale autodetect / language never persisted** — Java reads `microedition.locale` each launch; native always boots English | NOT IMPLEMENTED | `Translation.java:39,55,57`; `locale.c:716`, `app_flow.h:313-318` |
+| G4 | ~~No locale autodetect / language never persisted~~ — **RESOLVED** (owner decision: detect + persist). Boot now composes: persisted `records.bin` record 7 (present-flag loader, so stored EN is distinguishable from absent) > environment detection `LC_ALL`→`LC_MESSAGES`→`LANG` (`bounce_locale_language_from_string`: exact normalized zh-CN/zh-TW/th-TH/id-ID/en, bare-code convenience, `/lang.xx`-style EN fallback) > default EN. A Settings language change commits on the same press edge as theme/T9/volume (`app_commit_language_change`); reset-to-defaults writes 0; every other record writer preserves record 7. Java parity note: the detection half mirrors the per-launch `microedition.locale` derivation; the persisted record is a native extension, since Java never persists a language | IMPLEMENTED | `Translation.java:39,55,57`; `locale.c` (detect), `persistence.c` record 7, `app_flow.c restore_persisted_language`, `vs app_restore_persisted_settings`; verifies `LANG-DETECT/PERSIST/BOOT` |
 | G5 | **Cheat keys `1`/`3` (prev/next level)** — unconditional in Java (`d=true` even without af); entire arm af-gated in native → inert without af | DEVIATES | `e.java:339-348`; `vertical_slice.c:27764-27807` |
 | G6 | **Fresh-install unlock count** — native defaults to 2 unlocked levels; Java starts `MaxLevels=0` (Continue hidden, no level select until first win) | DEVIATES — **accepted** (keep 2; owner decision 2026-10-23) | `BounceGame.java:270-286`; `app_flow.h:295`, `app_flow.c:235` |
 | G7 | **Mouse-slider volume edits not persisted** — slider click writes `flow->settings.volume` with no commit; `q`, window-close, `app_persist_records` also omit record 6. Only keyboard LEFT/RIGHT commits | **RESOLVED** (`f895aaf`) | `ui_shell.c:1983-1989`; commit edges `x11_dispatch_event` (Button1, `XK_q`, ClientMessage), `verify_volume_slider_pointer` store assertions |
@@ -175,14 +175,17 @@ record-3 resume snapshot incl. tile deltas `persistence.h:172-176` and dyn-thorn
 `:183-188`; `b1` encoding matches Java `K`); save on death (`vs:2920`), exit/W1
 (`:3627, :6932`), shutdown; continue J==1 live / J==2 record (`app_flow.c:1404/1379`).
 Volume record 6 persisted (`persistence.c:1082,1140`) — **keyboard, pointer-slider, `q` and window-close edges (G7 resolved, `f895aaf`)**.
-**Language never persisted + no autodetect (G4)**. FPS setting: cancelled, absent (correct).
+Language persisted (record 7) + autodetect (**G4 resolved**). FPS setting: cancelled, absent (correct).
 
 ### 2.5 Localization
 
 Java: derives `microedition.locale` each launch, `lang.<locale>` → `lang.xx` fallback
-(`Translation.java:39,55,57`). Native: fixed default EN (`locale.c:716`), table-fallback only —
-**G4**. Native adds 5 languages (EN, zh-CN, zh-TW, th-TH, ID) + runtime switch
-(`app_flow.c:884-906`) = DIFFERENT; placeholder substitution implemented (`ui_shell.c:1196,4051`).
+(`Translation.java:39,55,57`). Native (since **G4 resolved**): boot detection from the POSIX
+locale chain (`LC_ALL`→`LC_MESSAGES`→`LANG`, `bounce_locale_language_from_string`) mirrors the
+per-launch derivation, and a persisted choice (`records.bin` record 7) overrides it — the
+persistence is a native extension, since Java never persists a language. Native adds 5
+languages (EN, zh-CN, zh-TW, th-TH, ID) + runtime switch (`app_flow.c:884-906`) = DIFFERENT;
+placeholder substitution implemented (`ui_shell.c:1196,4051`).
 
 ### 2.6 Input & cheats
 
@@ -200,7 +203,7 @@ Escape/menu with persist superset (`vs:28299-28498`). QWERTY/mouse/digits/`q` = 
 
 ### Top flow gaps
 
-**G1** K==1 Continue · **G4** locale autodetect + language persistence · **G5** `1`/`3` cheat gating · (G6 decided: keep 2 · extensions: extra menu rows/settings/about — not gaps)
+**G1** K==1 Continue · **G5** `1`/`3` cheat gating · (G4 resolved: detect + persist · G6 decided: keep 2 · extensions: extra menu rows/settings/about — not gaps)
 
 ---
 
@@ -258,7 +261,7 @@ Extensions: mouse UI, `Escape`, `q`, T9 controller mode.
 |---|---|---|---|
 | 2 | G2 | ~~Render `nokiagames.png` splash as first stage~~ — **no effective gap**: source is single-stage (`SplashId = 1`, case-0 dead code); closed by analysis, anti-regression comment added | done (analysis) |
 | 2 | G1 | `K==1` live-session Continue route | Medium |
-| 2 | G4 | Locale autodetect (+ optional language persistence) | Small |
+| 2 | G4 | ~~Locale autodetect (+ optional language persistence)~~ — **done**: detect + persist (owner decision 2026-10-23), record 7 + boot precedence + `LANG-DETECT/PERSIST/BOOT` verifies | done |
 | 3 | G5 | Un-gate `1`/`3` keys to match Java (`d=true` unconditional) | Small |
 | 3 | G6 | ~~Fresh-install unlock count 2 → 0~~ — **decided: keep 2** (accepted deviation) | done (decision) |
 | 3 | G8 | Settle-walk side effects — runtime walks done (STEP 38-S: state-write tiles 38/47-54 reported → shared producer helpers; verify added); constructor form at level start still inert (needs entry-chain move) | done (runtime) / open (constructor) |
