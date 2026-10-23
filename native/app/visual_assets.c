@@ -1078,6 +1078,57 @@ int bounce_visual_assets_draw_tile(
     }
 }
 
+/*
+ * G3 -- THE POST-BALL FRONT-TILE PASS, ART LAYER.
+ *
+ * e.java:172 calls b.CreateTiles(g, ...) AFTER a() has drawn the ball, and
+ * that overload (b.java:577-613) draws only tiles 13-28 -- the hoop set --
+ * and only their second sprite, d.b[] (the front rim).  The first sprite
+ * d.a[] and the background fill belong to the per-cell pass that paints the
+ * tile layer UNDER the ball; redrawing just the rim here is what makes the
+ * ball pass BEHIND the near rim of a hoop instead of over it.
+ *
+ * This function is the single-tile primitive of that pass: for a tile in
+ * 13..28 it draws tile_back_sprites[] (the native table is verified equal
+ * to d.b, see the reconciliation above the table); for every other value it
+ * draws nothing and returns success, exactly like the Java range test.
+ *
+ * THE 0x80 MASK.  b.java:591 masks only the water bit (~0x40), because i()
+ * (b.java:609-623) already cleared every visible dirty bit before q() runs
+ * the front pass.  Native has no incremental repaint (G9): dirty bits can
+ * still be set when this pass reads, so both bits are cleared here, matching
+ * what draw_tile already does.  Same output as the Java sequence.
+ *
+ * NO fillRect AND NO d.a[]: the pixels under the rim were composed by
+ * draw_tile + draw_player_ball a moment ago, and Java redraws the rim
+ * sprite on top of them unchanged.
+ */
+int bounce_visual_assets_draw_tile_front_rim(
+    BounceRenderer *renderer,
+    const BounceVisualAssets *assets,
+    uint16_t tile_value,
+    int destination_x,
+    int destination_y
+)
+{
+    uint32_t base_tile = (uint32_t)tile_value;
+    int offset;
+
+    if (renderer == NULL || assets == NULL)
+        return -1;
+    base_tile &= ~0x40u;
+    base_tile &= ~0x80u;
+    if (base_tile < 13u || base_tile > 28u)
+        return 0;
+    offset = (int)base_tile - 13;
+    return visual_draw_sprite(
+        renderer,
+        assets->sprites[tile_back_sprites[offset]],
+        destination_x,
+        destination_y
+    );
+}
+
 int bounce_visual_assets_draw_regular_ball(
     BounceRenderer *renderer,
     const BounceVisualAssets *assets,

@@ -32,6 +32,19 @@ int bounce_visual_assets_draw_tile(
 );
 
 /*
+ * G3 -- draw ONLY the front rim (d.b / tile_back_sprites) of a hoop tile
+ * 13..28, over the already-composed scene; no-op for every other tile.
+ * The post-ball pass of e.java:172 / b.java:577-613.
+ */
+int bounce_visual_assets_draw_tile_front_rim(
+    BounceRenderer *renderer,
+    const BounceVisualAssets *assets,
+    uint16_t tile_value,
+    int destination_x,
+    int destination_y
+);
+
+/*
  * Original player draw, e.java:209-219. spriteCurrentBall is a pure
  * function of ballSize (f.java:169-171, f.java:210-212) and the destination
  * offset is the live p (e.java:217), so both are supplied by the caller and

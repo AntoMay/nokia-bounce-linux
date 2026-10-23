@@ -7268,6 +7268,104 @@ static int draw_player_ball(
     return draw_fallback_regular_ball(renderer, app);
 }
 
+/*
+ * G3 -- THE POST-BALL FRONT-TILE PASS (b.java:577-613 via e.java:172).
+ *
+ * JAVA ORDER in q() (e.java:158-172): the E tile layer is blitted, then
+ * a(X, v) -- the ball and nothing else (e.java:209-218) -- then
+ * CreateTiles(this.X, aq.TODO_unkX, aq.TODO_unkY, aq.p, this.v), the
+ * Graphics overload, which walks the BALL'S BOUNDING BOX in tile units and
+ * draws only tiles 13-28 and only their d.b sprite: the front rim of a
+ * hoop.  That single redraw is what lets the ball pass BEHIND the near rim
+ * of a ring instead of floating over it.
+ *
+ * Native rendered grid -> door -> thorns -> ball -> HUD, so the rim could
+ * never be repainted after the ball.  This pass runs directly after
+ * draw_player_ball() while draw_level_grid()'s 128x96 clip is still the
+ * active clip -- the same viewport q() runs its own front pass under.
+ *
+ * The loop bounds are the Java ones, tile-quantised:
+ *
+ *     i  = (unkX - p) / 12            j  = (unkY - p) / 12
+ *     k  = (unkX + p - 1) / 12 + 1    m  = (unkY + p - 1) / 12 + 1
+ *
+ * clamped to the level on both sides (b.java:582-590); C and Java both
+ * truncate division toward zero.  The screen mapping is
+ * app_world_to_screen(), which is the same expression as the Java
+ * `(n - l) * 12 + v`, `(i1 - k) * 12`.  The art layer
+ * (bounce_visual_assets_draw_tile_front_rim) decides which tiles are hoops
+ * and draws nothing for the rest, mirroring the Java range test.
+ */
+static int draw_hoop_rims_over_ball(
+    BounceRenderer *renderer,
+    const BounceApp *app
+)
+{
+    int32_t first_column;
+    int32_t first_row;
+    int32_t last_column;
+    int32_t last_row;
+    int32_t level_width;
+    int32_t level_height;
+    int32_t column;
+    int32_t row;
+
+    if (renderer == NULL || app == NULL || app->runtime == NULL)
+        return -1;
+    first_column = (app->player.TODO_unkX - app->player.p)
+        / BOUNCE_TILE_SIZE;
+    first_row = (app->player.TODO_unkY - app->player.p)
+        / BOUNCE_TILE_SIZE;
+    last_column = (app->player.TODO_unkX + app->player.p - 1)
+        / BOUNCE_TILE_SIZE + 1;
+    last_row = (app->player.TODO_unkY + app->player.p - 1)
+        / BOUNCE_TILE_SIZE + 1;
+    if (first_column < 0)
+        first_column = 0;
+    if (first_row < 0)
+        first_row = 0;
+    level_width = (int32_t)bounce_runtime_level_tiles_width(app->runtime);
+    level_height = (int32_t)bounce_runtime_level_tiles_height(app->runtime);
+    if (last_column > level_width)
+        last_column = level_width;
+    if (last_row > level_height)
+        last_row = level_height;
+
+    for (row = first_row; row < last_row; ++row) {
+        for (column = first_column; column < last_column; ++column) {
+            uint16_t value;
+            int32_t screen_x;
+            int32_t screen_y;
+
+            if (bounce_runtime_level_tiles_get(
+                    app->runtime,
+                    (int)column,
+                    (int)row,
+                    &value
+                ) != 0)
+                return -1;
+            if (app_world_to_screen(
+                    app,
+                    column * BOUNCE_TILE_SIZE,
+                    row * BOUNCE_TILE_SIZE,
+                    &screen_x,
+                    &screen_y
+                ) != 0)
+                return -1;
+            if (app->visuals != NULL
+                && bounce_visual_assets_draw_tile_front_rim(
+                        renderer,
+                        app->visuals,
+                        value,
+                        (int)screen_x,
+                        (int)screen_y
+                    ) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 /* TEMPORARY NATIVE INPUT DIAGNOSTIC — NOT ORIGINAL UI PARITY. */
 #define INPUT_DIAG_HEADER_Y 100
 #define INPUT_DIAG_LEFT_LABEL_X 4
@@ -7649,7 +7747,12 @@ static int render_gameplay_scene(
     if (draw_level_grid(renderer, app) != 0
         || draw_exit_door(renderer, app) != 0
         || draw_dyn_thorns(renderer, app) != 0
-        || draw_player_ball(renderer, app) != 0)
+        || draw_player_ball(renderer, app) != 0
+        /*
+         * G3 -- e.java:172 redraws the hoop rims over the ball, inside the
+         * same 128x96 clip, before the HUD band is drawn.
+         */
+        || draw_hoop_rims_over_ball(renderer, app) != 0)
         return -1;
     /* e.java:174-189, after the game viewport and before presentation. */
     if (draw_hud(renderer, app) != 0)
