@@ -675,21 +675,20 @@ int bounce_game_initialize_player_entry(BounceGame *game)
      * f.java:127-131 selects the ball constructor from the same `ballSize`
      * argument: `if (ballSize == 12) UseRegularBall(); else UseBigBall();`.
      * `isBigBall` is the header field that argument is derived from
-     * (level.c:221-223), so this is that exact branch. UseBigBall() is a
-     * constructor step, so it belongs here rather than in a later gameplay
-     * stage. The original runs it against the LevelTiles bytes LoadLevelId has
-     * just written (e.java:121 -> e.java:127), which is exactly the pristine
-     * BounceLevel owned here: no runtime copy exists at this boundary and none
-     * is built.
+     * (level.c:221-223).
      *
-     * The probe reads only TODO_unkX/TODO_unkY, which the composition above did
-     * not move, so running it after that composition yields the same constructor
-     * inputs. The record order remains probe -> aq.l/aq.o -> camera, because
-     * camera initialization is not performed here.
+     * THE WALK IS NO LONGER RUN HERE (G8 constructor sub-item). Java orders
+     * the constructor as `this.n.CreateTiles(this)` (f.java:126) and THEN
+     * UseBigBall() (f.java:130), so the original's constructor walk already
+     * runs against the MUTABLE tile runtime and reports through the same f.a()
+     * dispatch the in-game walks use. The native counterpart of that constructor
+     * half is bounce_game_initialize_runtime_entry(), which now runs
+     * bounce_player_use_big_ball() against the freshly created runtime copy
+     * with the app-level consumer forwarded. This stage keeps only what the
+     * source does before CreateTiles: header conversion and constructor
+     * defaults, so a big-ball level leaves here with the header-derived
+     * 16/8/BIG player at the nominal spawn point, undisplaced.
      */
-    if (bounce_level_is_big_ball(game->level) != 0u
-        && bounce_player_use_big_ball_level(&new_player, game->level) != 0)
-        return -1;
 
     /*
      * STEP 12X-P4-C-D-C-B4-C -- establish the initial checkpoint here.
@@ -727,14 +726,18 @@ int bounce_game_initialize_player_entry(BounceGame *game)
     return 0;
 }
 
-int bounce_game_initialize_runtime_entry(BounceGame *game)
+int bounce_game_initialize_runtime_entry(
+    BounceGame *game,
+    BouncePlayerHazardCallback on_hazard,
+    void *hazard_context
+)
 {
     BounceRuntimeLevelTiles *new_runtime;
 
     if (game == NULL
         || game->flow.state != BOUNCE_APP_STATE_LEVEL_LOADED
         || game->level == NULL
-        /* The player constructor must already have read the pristine bytes. */
+        /* The player constructor must already have read the level header. */
         || !game->player.initialized
         /* Repeated initialization is rejected; the existing copy is preserved. */
         || game->runtime != NULL
@@ -748,8 +751,10 @@ int bounce_game_initialize_runtime_entry(BounceGame *game)
         return -1;
 
     /*
-     * The existing verified constructor already performs exactly the two
-     * source-derived initializations this seam needs, and nothing else:
+     * f.java:126 `this.n.CreateTiles(this)` -- the first half of the Java
+     * constructor this seam stands for. The existing verified constructor
+     * performs exactly the two source-derived initializations this seam needs,
+     * and nothing else:
      *   - copies every structural BounceLevel tile byte into a mutable
      *     uint16_t cell (b.java:243-247, which reads the same array it later
      *     mutates in place), and
@@ -770,13 +775,52 @@ int bounce_game_initialize_runtime_entry(BounceGame *game)
         return -1;
     }
 
-    if (bounce_app_flow_record_runtime_initialized(&game->flow) != 0) {
-        bounce_runtime_level_tiles_destroy(new_runtime);
+    /*
+     * INSTALL FIRST, then walk. The hazard consumer the caller supplies
+     * reaches the runtime through the app context, so the copy must already be
+     * in place before the constructor walk can report into it.
+     */
+    game->runtime = new_runtime;
+
+    /*
+     * G8 CONSTRUCTOR SUB-ITEM -- the second half of the Java constructor:
+     * f.java:127-131 `if (ballSize == 12) UseRegularBall(); else UseBigBall();`
+     * runs immediately after CreateTiles inside `new f(...)`. A regular ball
+     * takes UseRegularBall(), and there is nothing to do here because
+     * bounce_player_initialize_from_level() already left the player at the
+     * header-derived regular size. A big-ball level takes UseBigBall(), and
+     * THIS is that walk: the same bounce_player_use_big_ball() the pumper
+     * growth and the death respawn use, against the fresh mutable copy, with
+     * the app-level consumer forwarded. The constructor walk therefore now
+     * performs the tile consumption and the STEP 38/47-54 state writes exactly
+     * as the in-game walks do -- one walk implementation, matching the source's
+     * single f.a()/UseBigBall() pair -- instead of the discarded shadow view
+     * the previous constructor-boundary form walked.
+     *
+     * Java cannot fail here (its walk has no bounds checks to refuse with); the
+     * native -1 is the defensive bounds refusal, and it aborts the whole
+     * initialization: the copy is destroyed, the flow phase is not recorded,
+     * and the player keeps the header values the walk had not displaced.
+     */
+    if (bounce_level_is_big_ball(game->level) != 0u
+        && bounce_player_use_big_ball(
+            &game->player,
+            game->runtime,
+            on_hazard,
+            hazard_context
+        ) != 0) {
+        bounce_runtime_level_tiles_destroy(game->runtime);
+        game->runtime = NULL;
         return -1;
     }
 
-    /* Only the single runtime ownership slot changes. */
-    game->runtime = new_runtime;
+    if (bounce_app_flow_record_runtime_initialized(&game->flow) != 0) {
+        bounce_runtime_level_tiles_destroy(game->runtime);
+        game->runtime = NULL;
+        return -1;
+    }
+
+    /* The single runtime ownership slot was changed above. */
     return 0;
 }
 

@@ -213,12 +213,14 @@ int bounce_player_initialize_from_level(
  * stay collidable, so the walk re-reports them on every covering probe, which is
  * what the source's per-probe re-entry in f.a() does.
  *
- * A NULL callback is legal and makes the walk fully inert, which is what the
- * constructor-boundary form bounce_player_use_big_ball_level() still uses: at
- * e.java:127 the original runs the probe inside `new f(...)`, and this native
- * entry runs against pristine level bytes before the app-level consumer exists.
- * The runtime walks (death respawn, pumper growth) do supply the callback; the
- * NULL form remains a documented deferral in the parity audit.
+ * A NULL callback is legal and makes the walk fully inert; since G8 that form
+ * is reserved for hermetic unit callers. Every production walk -- the
+ * constructor's UseBigBall() at the runtime-initialization seam (G8), the
+ * pumper growth and the death respawn -- supplies the app-level consumer, so
+ * the source's ONE f.a() dispatch is native's one consumer for all three. The
+ * previous constructor-boundary deferral (walk against pristine bytes with a
+ * discarded shadow view and no consumer) is gone together with
+ * bounce_player_use_big_ball_level().
  */
 typedef void (*BouncePlayerHazardCallback)(
     void *context,
@@ -244,39 +246,6 @@ int bounce_player_use_big_ball(
     const BounceRuntimeLevelTiles *runtime,
     BouncePlayerHazardCallback on_hazard,
     void *hazard_context
-);
-
-/*
- * The same f.UseBigBall() algorithm, evaluated against the pristine BounceLevel
- * tile bytes. This is the constructor-boundary form: at e.java:127 the original
- * runs the probe inside `new f(...)`, where LevelTiles has just been written by
- * LoadLevelId and no runtime copy exists yet.
- *
- * The walk's accept/reject decision is still the pure
- * bounce_collision_query_level(), so the six-candidate geometry, the byte-
- * wrapped offset, and the absence of an iteration cap are unchanged. Layered
- * outside that pure verdict, the probe now also reproduces the A1 collision
- * state the source produces on the way through, because in the original the
- * verdict helper is f.TODO_CheckBallCollision -> f.a() and f.a() mutates the
- * player:
- *
- *   u   f.java:437, :440, :448, :454, :460
- *   v   f.java:444 (tile 2 blocking), :452 (tiles 34-37 blocking)
- *   l/o f.java:361 -> f.java:234-270, under the f.java:360 !m guard
- *
- * plus the deflater transition at f.java:618-621, which is required for
- * correctness rather than for its own sake: it changes p from 8 to 6 mid-search
- * and f.java:155-158 reads f.p, so every later candidate is tested with the
- * regular half size.
- *
- * DEFERRED, deliberately: hoops, crystals, the extra life, the gravity/jump/
- * speed power-ups, KillBall, level completion, TODO_somePowerUp1, audio, and
- * every LevelTiles rewrite. The level is never written; the short-lived tile
- * view this uses is created and destroyed here and is never retained.
- */
-int bounce_player_use_big_ball_level(
-    BouncePlayer *player,
-    const BounceLevel *level
 );
 
 #ifdef __cplusplus

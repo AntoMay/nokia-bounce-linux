@@ -184,26 +184,6 @@ static bool player_probe_runtime(
     );
 }
 
-/*
- * The constructor probe's own context.
- *
- * `level` is the pristine BounceLevel, which is what f.java:431 reads.  `view`
- * is a short-lived runtime tile copy of exactly those bytes, needed only because
- * bounce_collision_tile_overlaps() -- the already-verified single-tile
- * predicate -- takes a runtime owner.  It is created and destroyed inside
- * bounce_player_use_big_ball_level, is never retained, and is never written:
- * bounce_level_tile_value_from_raw() is the identity (level.c) and the
- * dynamic-thorn records come from the same bounce_level_dyn_thorn_record()
- * decode, so the view and the level agree tile for tile.  It exists so the
- * identification pass below can reuse the verified geometry rather than
- * duplicate the masks, the dispatch, and the traversal.
- */
-typedef struct PlayerConstructorProbeContext {
-    BouncePlayer *player;
-    const BounceLevel *level;
-    const BounceRuntimeLevelTiles *view;
-} PlayerConstructorProbeContext;
-
 static int32_t java_int32_negate(int32_t value)
 {
     uint32_t bits = UINT32_C(0) - (uint32_t)value;
@@ -316,10 +296,11 @@ static void player_apply_slope_response(
  *
  * The source helper mutates the player and returns a verdict, so the walk's
  * accept/reject decision and the player state are produced together.  Here the
- * verdict stays with the unchanged pure query in player_probe_constructor()
- * and this pass only writes state, so the two can never disagree about where
- * the walk stops: bounce_collision_tile_overlaps() and
- * bounce_collision_query_level() resolve the same tile through the same
+ * verdict stays with the unchanged pure query in the probe that calls this --
+ * player_probe_runtime() (the runtime query) for every walk since G8 -- and
+ * this pass only writes state, so the two can never disagree about where the
+ * walk stops: bounce_collision_tile_overlaps() and the pure queries resolve
+ * the same tile through the same
  * tile_has_static_collision() with the same masks and the same thorn records.
  *
  * REPRODUCED, the A1 collision state only:
@@ -334,10 +315,12 @@ static void player_apply_slope_response(
  * REPORTED TO THE OWNER, NOT PERFORMED HERE (STEP 38-P/Q/R/S): KillBall through
  * the hazard callback, the consumed pickups (crystal, hoops, extra life), the
  * non-blocking hoop 22, the exit door 9, and the three state-write power-up
- * producers 38 / 47-50 / 51-54.  The callback is optional: the
- * constructor-boundary form passes NULL and this pass is inert on that entry,
- * which is the remaining deferral recorded in the parity audit.  Two
- * consequences are worth stating plainly:
+ * producers 38 / 47-50 / 51-54.  The callback is optional: a NULL callback
+ * makes this pass inert on that entry, which only hermetic unit callers pass.
+ * Every production walk -- the constructor's level-start walk at the
+ * runtime-initialization seam since G8, the pumper growth and the death
+ * respawn -- supplies the app-level consumer, so no deferral remains on any
+ * production entry.  Two consequences are worth stating plainly:
  *
  *   - f.java:427-428 short-circuits every tile once z == 2.  The hazard arms
  *     report outward; z itself is written by the owner's app_kill_ball(), never
@@ -645,9 +628,10 @@ static void player_constructor_apply_collision_state(
                      * accumulating.
                      *
                      * This arm exists for every caller of
-                     * player_constructor_apply_collision_state(); the
-                     * constructor-boundary form still supplies no callback and
-                     * stays inert on that entry, exactly as before.
+                     * player_constructor_apply_collision_state(); a NULL
+                     * callback keeps it inert, which only hermetic unit callers
+                     * pass -- all three production walks supply the
+                     * app-level consumer (G8).
                      */
                     if (on_hazard != NULL) {
                         on_hazard(
@@ -760,47 +744,6 @@ static void player_constructor_apply_collision_state(
     }
 }
 
-static bool player_probe_constructor(
-    int32_t x,
-    int32_t y,
-    int32_t half_size,
-    const void *context
-)
-{
-    const PlayerConstructorProbeContext *probe_context = context;
-    bool fits;
-
-    if (probe_context == NULL
-        || probe_context->player == NULL
-        || probe_context->level == NULL
-        || probe_context->view == NULL)
-        return false;
-
-    /* The verdict is the unchanged pure level query, so the six-candidate walk
-     * keeps exactly the geometry it had before this side-effecting pass
-     * existed. */
-    fits = bounce_collision_query_level(
-        x, y, half_size, probe_context->level);
-    /* STEP 38-P/38-R/38-S: the constructor-boundary form is inert. At e.java:127
-     * the original runs the probe inside `new f(...)`, and this native entry
-     * still runs against pristine level bytes before the app-level consumer
-     * exists, so no callback is supplied and none of the reported arms -- the
-     * hazards, the consumed pickups, tile 22/9 and the STEP 38-S power-up
-     * producers -- are taken here. The runtime walks (death respawn and pumper
-     * growth) report through app_pumper_walk_hazard; that remaining deferral
-     * for this entry is recorded in the parity audit. */
-    player_constructor_apply_collision_state(
-        probe_context->player,
-        probe_context->view,
-        x,
-        y,
-        half_size,
-        NULL,
-        NULL
-    );
-    return fits;
-}
-
 /* STEP 14B-02 context for the production f.UseBigBall() resolver.
  *
  * f.java:175-206 drives the six-direction resolver through
@@ -828,15 +771,17 @@ typedef struct PlayerUseBigBallProbeContext {
     BouncePlayer *player;
     const BounceRuntimeLevelTiles *view;
     /* STEP 38-P: the reported hazard and its owner, for the two KillBall cases
-     * of f.a(). NULL for the constructor-boundary form. */
+     * of f.a(). NULL/NULL makes the walk inert; since G8 every production walk
+     * -- the constructor walk at the runtime seam, the pumper growth and the
+     * death respawn -- supplies the app-level consumer, and only hermetic unit
+     * callers pass NULL. */
     BouncePlayerHazardCallback on_hazard;
     void *hazard_context;
 } PlayerUseBigBallProbeContext;
 
-/* STEP 14B-02: the production resolver probe. Order matters and mirrors
- * player_probe_constructor() at pc:440 -- verdict first, then the walk -- so
- * the resolver's candidate acceptance cannot be perturbed by the side effects
- * it is being given. */
+/* STEP 14B-02: the production resolver probe. Order matters -- verdict first,
+ * then the walk -- so the resolver's candidate acceptance cannot be perturbed
+ * by the side effects it is being given. */
 static bool player_probe_use_big_ball(
     int32_t x,
     int32_t y,
@@ -1064,32 +1009,4 @@ int bounce_player_use_big_ball(
         player_probe_use_big_ball,
         &probe_context
     );
-}
-
-int bounce_player_use_big_ball_level(
-    BouncePlayer *player,
-    const BounceLevel *level
-)
-{
-    PlayerConstructorProbeContext probe_context;
-    BounceRuntimeLevelTiles *view;
-    int status;
-
-    if (player == NULL || level == NULL)
-        return -1;
-
-    view = bounce_runtime_level_tiles_create(level);
-    if (view == NULL)
-        return -1;
-
-    probe_context.player = player;
-    probe_context.level = level;
-    probe_context.view = view;
-    status = bounce_player_use_big_ball_probe(
-        player,
-        player_probe_constructor,
-        &probe_context
-    );
-    bounce_runtime_level_tiles_destroy(view);
-    return status;
 }

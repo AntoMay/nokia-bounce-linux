@@ -422,19 +422,37 @@ static int app_advance_level_loaded_to_player_initialized(BounceApp *app)
 }
 
 /*
- * Native runtime-initialization seam:
+ * NATIVE runtime-initialization seam:
  *   PLAYER_INITIALIZED -> mutable runtime tile copy + dynamic-thorn state
+ *   -> the f.java:126-131 constructor tail (big-ball UseBigBall() walk)
  *   -> RUNTIME_INITIALIZED -> STOP
  *
  * This is an implementation seam, not a recovered Java lifecycle step. It is
  * deterministic-only: no camera, timer, tick, PLAYING transition, or renderer
  * work is performed, so the X11 runtime stays on the UI 6 gameplay-entry screen.
+ *
+ * G8 CONSTRUCTOR SUB-ITEM: the game seam below runs the constructor's
+ * UseBigBall() against the fresh copy, so this driver hands it the PRODUCTION
+ * hazard consumer -- the same app_pumper_walk_hazard() the pumper-growth walk
+ * uses -- which is the native spelling of the source having ONE f.a() for the
+ * constructor walk and the in-game walks alike.
  */
+static void app_pumper_walk_hazard(
+    void *context,
+    int32_t tile_x,
+    int32_t tile_y,
+    uint32_t tile_id
+);
+
 static int app_advance_player_initialized_to_runtime_initialized(BounceApp *app)
 {
     if (app == NULL || app->flow.state != BOUNCE_APP_STATE_LEVEL_LOADED)
         return -1;
-    if (bounce_game_initialize_runtime_entry(app) != 0)
+    if (bounce_game_initialize_runtime_entry(
+            app,
+            app_pumper_walk_hazard,
+            app
+        ) != 0)
         return -1;
     if (bounce_app_flow_entry_runtime_tiles_created(&app->flow) == false) {
         bounce_runtime_level_tiles_destroy(app->runtime);
@@ -4155,15 +4173,12 @@ static int app_vertical_collision_info(
                  *
                  * REACHABLE FROM THE WALK TOO (STEP 38-S): the UseBigBall
                  * probes (f.java:177-200) also reach f.a() in the original, and
-                 * the runtime walks -- death respawn and pumper growth -- now
-                 * route that report through app_pumper_walk_hazard() into the
-                 * same helper. Still NOT REPRODUCED at the constructor-boundary
-                 * form (bounce_player_use_big_ball_level, game.c's level-start
-                 * entry): that probe is inert by the documented policy --
-                 * player.c's player_probe_constructor() resolves the verdict
-                 * through bounce_collision_query_level() plus its own local
-                 * player_constructor_apply_collision_state() with no callback.
-                 * That remaining gap is listed in the parity audit.
+                 * EVERY native walk now routes that report through
+                 * app_pumper_walk_hazard() into the same helper: the runtime
+                 * walks (death respawn, pumper growth) and, since G8, the
+                 * constructor's level-start walk at the runtime-initialization
+                 * seam. The old inert constructor-boundary form
+                 * (bounce_player_use_big_ball_level) is gone.
                  */
                 if (tile_id >= 51u && tile_id <= 54u) {
                     /*
@@ -4218,11 +4233,13 @@ static int app_vertical_collision_info(
                  * the vertical primary, the vertical diagonals, the horizontal
                  * primary and the horizontal diagonals.
                  *
-                 * REACHABLE FROM THE WALK TOO (STEP 38-S): the runtime walks
-                 * route this report through app_pumper_walk_hazard() into the
-                 * same helper. Still NOT REPRODUCED at the constructor-boundary
-                 * form, shared with the 47-50 and 51-54 producers; that
-                 * remaining gap is listed in the parity audit.
+                 * REACHABLE FROM THE WALK TOO (STEP 38-S): EVERY walk routes
+                 * this report through app_pumper_walk_hazard() into the
+                 * same helper -- the runtime walks (death respawn, pumper
+                 * growth) and, since G8, the constructor's level-start walk at
+                 * the runtime-initialization seam, shared with the 47-50 and
+                 * 51-54 producers. The old inert constructor-boundary form is
+                 * gone; no gap remains in the parity audit.
                  */
                 if (tile_id == 38u) {
                     /*
@@ -8472,9 +8489,11 @@ static int app_begin_canonical_gameplay(BounceApp *app)
      * The verified staged order, using only the existing seams and nothing else:
      * LEVEL_LOADED -> PLAYER_INITIALIZED -> RUNTIME_INITIALIZED ->
      * CAMERA_INITIALIZED -> GAMEPLAY_ACTIVATED -> TIMER_INITIALIZED. The Big
-     * Ball probe therefore still runs against the pristine level before any
-     * runtime copy exists, and the level id still comes from the recorded
-     * START_LEVEL(N) through the entry seam.
+     * Ball constructor walk runs inside the RUNTIME_INITIALIZED seam, against
+     * the fresh mutable copy and through the production hazard consumer (G8) --
+     * the same place in the order the Java constructor puts it, between
+     * CreateTiles and the camera init (f.java:126-131, e.java:132). The level
+     * id still comes from the recorded START_LEVEL(N) through the entry seam.
      *
      * G-R3-R1: the resume restore window below is the only addition to this
      * sequence.
@@ -11619,7 +11638,10 @@ typedef struct PlayerEntryExpectation {
     int32_t constructor_y;
     /*
      * The player position after the whole constructor, which for a big-ball
-     * level includes the f.UseBigBall() probe at f.java:130.
+     * level includes the f.UseBigBall() probe at f.java:130. Since G8 that
+     * probe runs at the RUNTIME_INITIALIZED seam (against the fresh copy, with
+     * the production consumer), so these two are asserted one stage after
+     * constructor_x/y, not at the same one.
      */
     int32_t world_x;
     int32_t world_y;
@@ -11677,6 +11699,7 @@ static int verify_player_initialization_route(
     BouncePlayerSpawn saved_spawn;
     unsigned long digest_before = 0UL;
     unsigned long digest_after = 0UL;
+    unsigned long digest_postwalk = 0UL;
     int result = -1;
 
     if (expect == NULL)
@@ -11702,31 +11725,13 @@ static int verify_player_initialization_route(
         goto cleanup;
 
     /*
-     * Trace the source-ordered constructor events. Camera initialization is
-     * deliberately not an event here: the original runs it at e.java:132,
-     * after `new f(...)` has already run UseBigBall() at e.java:127.
+     * The constructor-event trace moved to the runtime seam below (G8): the
+     * UseBigBall() events this used to print here now happen one stage later,
+     * against the fresh runtime copy. Camera initialization remains
+     * deliberately not an event: the original runs it at e.java:132, after
+     * `new f(...)` has completed -- and `new f(...)` itself now spans these
+     * two seams, CreateTiles at the runtime seam plus the walk inside it.
      */
-    if (expect->is_big_ball != 0u) {
-        printf(
-            "BIGBALL level=%d phase=%s order=UseBigBall-before-camera"
-            " initial=(%u,%u) constructor=(%d,%d) probe=(%d,%d)"
-            " ballSize=%d p=%d pristine=%016lx runtime=%s\n",
-            expect->level_id,
-            bounce_app_flow_entry_phase_name(
-                bounce_app_flow_entry_phase(&app.flow)
-            ),
-            (unsigned)expect->initial_x,
-            (unsigned)expect->initial_y,
-            expect->constructor_x,
-            expect->constructor_y,
-            app.player.TODO_unkX,
-            app.player.TODO_unkY,
-            app.player.ballSize,
-            app.player.p,
-            digest_after,
-            app.runtime == NULL ? "NULL" : "PRESENT"
-        );
-    }
 
     /*
      * Test D: a repeated initialization is rejected and the existing player is
@@ -11754,30 +11759,39 @@ static int verify_player_initialization_route(
         || app.state != BOUNCE_GAME_STATE_LEVEL_LOADED
         /* Source-derived constructor defaults. */
         || !app.player.initialized
-        /* The player owns the post-constructor position, probe included. */
-        || app.player.TODO_unkX != expect->world_x
-        || app.player.TODO_unkY != expect->world_y
+        /*
+         * G8 CONSTRUCTOR SUB-ITEM: this stage is now only the pre-walk half of
+         * the Java constructor (f.java:126's CreateTiles has not run yet at
+         * PLAYER_INITIALIZED), so the player sits at the header-derived
+         * constructor input for EVERY level. The UseBigBall() displacement the
+         * table's world_x/world_y describe is asserted at the
+         * RUNTIME_INITIALIZED seam below, after the walk has run against the
+         * fresh copy.
+         */
+        || app.player.TODO_unkX != expect->constructor_x
+        || app.player.TODO_unkY != expect->constructor_y
         /* The f constructor input is the header-derived tile center. */
         || expect->constructor_x != (int32_t)expect->initial_x * 12 + 6
         || expect->constructor_y != (int32_t)expect->initial_y * 12 + 6
-        /* A regular ball never enters UseBigBall(), so it cannot move. */
-        || (expect->is_big_ball == 0u
-            && (app.player.TODO_unkX != expect->constructor_x
-                || app.player.TODO_unkY != expect->constructor_y))
         /*
-         * The player's own size is the POST-probe value. ball_size/half_size/mode
-         * in the table describe the player after the whole f constructor, which
-         * for a big-ball level includes UseBigBall() at f.java:130 -- and that
-         * probe can deflate the ball at f.java:618-621, so a big-ball level no
-         * longer has to end the constructor at the header size. Only a regular
-         * ball is pinned to the header size, because it never enters the probe
-         * (f.java:127-128).
+         * Size and mode are the header-derived values
+         * bounce_player_initialize_from_level() installs -- f.java:127 branches
+         * on this very ballSize. The POST-walk values the table describes,
+         * including a possible deflate at f.java:618-621, are asserted at the
+         * runtime seam below.
          */
-        || app.player.ballSize != expect->ball_size
-        || (expect->is_big_ball == 0u
-            && app.player.ballSize != BOUNCE_REGULAR_BALL_SIZE)
-        || app.player.p != expect->half_size
-        || app.player.current_ball_mode != expect->mode
+        || app.player.ballSize
+            != (expect->is_big_ball == 0u
+                    ? BOUNCE_REGULAR_BALL_SIZE
+                    : BOUNCE_BIG_BALL_SIZE)
+        || app.player.p
+            != (expect->is_big_ball == 0u
+                    ? BOUNCE_REGULAR_BALL_P
+                    : BOUNCE_BIG_BALL_P)
+        || app.player.current_ball_mode
+            != (expect->is_big_ball == 0u
+                    ? BOUNCE_PLAYER_BALL_MODE_REGULAR
+                    : BOUNCE_PLAYER_BALL_MODE_BIG)
         /*
          * The spawn record stays the header-derived respawn point. The original
          * has no separate world spawn field: aq.a(initial_X, initial_Y) writes
@@ -11811,17 +11825,14 @@ static int verify_player_initialization_route(
         || app.player.C != 0
         || app.player.m
         /*
-         * f.java:437/:440 write u from inside the UseBigBall() probe itself, so
-         * a big-ball level can end the constructor with u == true. A regular
-         * ball never runs the probe, so only that case is pinned.
-         *
-         * STEP 43B-R2: level 011 no longer sweeps the level while searching.
-         * Under the f.java:175-205 control flow the walk ends on the first
-         * fitting candidate, which is (1710, 449) -- one pixel above the
-         * header-derived constructor point (1710, 450) -- so no further tile is
-         * visited after it.
+         * No probe has run at this stage, so u cannot be set for ANY level.
+         * f.java:437/:440 write u from inside the UseBigBall() probe; that
+         * assertion moved to the runtime seam below with the walk, where
+         * STEP 43B-R2 still holds: level 011's walk ends on its first fitting
+         * candidate (1710, 449), one pixel above the constructor point
+         * (1710, 450), so no further tile is visited after it.
          */
-        || (expect->is_big_ball == 0u && app.player.u)
+        || app.player.u
         || app.player.powerUpGravity != 0
         || app.player.TODO_somePowerUp3 != 0
         /* Isolation: level, runtime, camera, counters, and tick are untouched. */
@@ -11836,8 +11847,8 @@ static int verify_player_initialization_route(
         || app.next_player_tick_ms != INT64_C(4321)
         || app_update_game(&app) != 0
         || app.next_player_tick_ms != INT64_C(4321)
-        || app.player.TODO_unkX != expect->world_x
-        || app.player.TODO_unkY != expect->world_y
+        || app.player.TODO_unkX != expect->constructor_x
+        || app.player.TODO_unkY != expect->constructor_y
         || app.player.horizontal_velocity != 0
         || app.player.o != 0
         || app.player.t != 0
@@ -11846,6 +11857,61 @@ static int verify_player_initialization_route(
         || bounce_game_start_level(&app, BOUNCE_LEVEL001_PATH, 1, 3) == 0
         || app.next_player_tick_ms != INT64_C(4321))
         goto cleanup;
+
+    /*
+     * G8 CONSTRUCTOR SUB-ITEM -- THE WALK STAGE. Advance the staged chain one
+     * more seam: the mutable runtime copy is created, the constructor's
+     * UseBigBall() runs against it through the production hazard consumer, and
+     * only now do the post-walk facts the table describes hold. Camera
+     * initialization is still ahead, matching e.java:132 running e() after
+     * `new f(...)` has completed.
+     */
+    saved_player = app.player;
+    if (app_advance_player_initialized_to_runtime_initialized(&app) != 0)
+        goto cleanup;
+    /*
+     * The walk reads the runtime copy and reports through the consumer; the
+     * pristine BounceLevel whose discarded shadow view it used to walk must
+     * still be byte-identical.
+     */
+    if (level_pristine_tile_digest(app.level, &digest_postwalk) != 0
+        || digest_postwalk != digest_after)
+        goto cleanup;
+    if (bounce_app_flow_entry_phase(&app.flow)
+            != BOUNCE_GAMEPLAY_ENTRY_PHASE_RUNTIME_INITIALIZED
+        || app.runtime == NULL
+        /* A regular level's player is untouched by the walk-less seam. */
+        || (expect->is_big_ball == 0u
+            && memcmp(&app.player, &saved_player, sizeof app.player) != 0)
+        || (expect->is_big_ball != 0u
+            && (app.player.TODO_unkX != expect->world_x
+                || app.player.TODO_unkY != expect->world_y
+                || app.player.ballSize != expect->ball_size
+                || app.player.p != expect->half_size
+                || app.player.current_ball_mode != expect->mode)))
+        goto cleanup;
+
+    if (expect->is_big_ball != 0u) {
+        printf(
+            "BIGBALL level=%d phase=%s order=UseBigBall-inside-runtime-seam"
+            " initial=(%u,%u) constructor=(%d,%d) probe=(%d,%d)"
+            " ballSize=%d p=%d pristine=%016lx runtime=%s\n",
+            expect->level_id,
+            bounce_app_flow_entry_phase_name(
+                bounce_app_flow_entry_phase(&app.flow)
+            ),
+            (unsigned)expect->initial_x,
+            (unsigned)expect->initial_y,
+            expect->constructor_x,
+            expect->constructor_y,
+            app.player.TODO_unkX,
+            app.player.TODO_unkY,
+            app.player.ballSize,
+            app.player.p,
+            digest_after,
+            app.runtime == NULL ? "NULL" : "PRESENT"
+        );
+    }
 
     result = 0;
 
@@ -11867,6 +11933,10 @@ static int verify_player_initialization_boundary(void)
      * which for level 011 includes the f.UseBigBall() probe at f.java:130.
      * The big-ball values are produced by the source-derived algorithm over the
      * pristine level tiles; no original Java or Nokia runtime was executed.
+     * G8 CONSTRUCTOR SUB-ITEM: that probe now runs at the RUNTIME_INITIALIZED
+     * seam against the fresh runtime copy (which starts as those same pristine
+     * bytes) and through the production hazard consumer, so the table's
+     * post-probe facts are asserted one stage after the header facts.
      *
      * ball_size/half_size/mode are the POST-probe player values, and for level
      * 011 the probe never deflates. f.java:169-170 sets ballSize = 16 and
@@ -11998,7 +12068,10 @@ static int verify_runtime_initialization_boundary(void)
         static const int32_t constructor_y[2] = { 18, 450 };
         /*
          * Post-walk values, i.e. the state the whole f constructor leaves
-         * behind (f.java:109-131 including UseBigBall() at :130).
+         * behind (f.java:109-131 including UseBigBall() at :130). G8
+         * CONSTRUCTOR SUB-ITEM: since the walk runs at the runtime seam, these
+         * probe_* positions are asserted one stage after constructor_x/y, in
+         * the runtime-seam block below.
          *
          * STEP 43B-R4: this comment previously claimed that level 011's probe
          * "walks f.java:175-206 with p == 8 until it reaches a deflater tile,
@@ -12045,10 +12118,16 @@ static int verify_runtime_initialization_boundary(void)
                 &app, expect_id == 1 ? -1 : expect_id - 1, expect_id) != 0
             || app.runtime != NULL
             || app_advance_level_loaded_to_player_initialized(&app) != 0
-            /* The probe ran against the pristine level, before any copy exists. */
+            /*
+             * G8 CONSTRUCTOR SUB-ITEM: at PLAYER_INITIALIZED the walk has NOT
+             * run yet -- it moved to the runtime seam below -- so the player
+             * sits at the header-derived constructor input with the header
+             * size. probe_x/probe_y (the post-walk settle) are asserted one
+             * stage later, after the runtime seam has run the walk.
+             */
             || app.runtime != NULL
-            || app.player.TODO_unkX != probe_x[i]
-            || app.player.TODO_unkY != probe_y[i]
+            || app.player.TODO_unkX != constructor_x[i]
+            || app.player.TODO_unkY != constructor_y[i]
             || app.player.ballSize != ball_size[i]
             || app.player.p != half_size[i]) {
             /*
@@ -12078,20 +12157,21 @@ static int verify_runtime_initialization_boundary(void)
              * to the right. It never came from the source.
              *
              * Nothing is weakened by the removal: the four equality conjuncts
-             * above pin the exact post-constructor player -- position, size and
-             * half size. verify_player_initialization_boundary() makes the same
-             * equality, and "the big ball moved" is already implied by that
-             * equality differing from constructor_x/constructor_y.
+             * above pin the exact pre-walk player -- constructor input
+             * position, header size and half size. "The big ball moved" is now
+             * asserted at the runtime-seam block below, where the walk runs and
+             * probe_x/probe_y differ from constructor_x/constructor_y.
              */
             bounce_game_shutdown(&app);
             failures++;
             continue;
         }
-        /* Big ball moved from its constructor input; regular ball did not. */
-        if (expect_id == 1
-            && (app.player.TODO_unkX != constructor_x[i]
-                || app.player.TODO_unkY != constructor_y[i]))
-            failures++;
+        /*
+         * The "big ball moved from its constructor input" check moved to the
+         * runtime-seam block below (G8): the walk that moves it now runs
+         * there. A regular ball is pinned to its constructor input by the
+         * equality block above, which covers level 001 as well.
+         */
 
         level_digest_before = level_digest_value(app.level);
         player_before = app.player;
@@ -12120,8 +12200,14 @@ static int verify_runtime_initialization_boundary(void)
                 "RUNTIME_INITIALIZED") != 0
             || app.flow.state != BOUNCE_APP_STATE_LEVEL_LOADED
             || app.state != BOUNCE_GAME_STATE_LEVEL_LOADED
-            /* D: nothing else moved. */
-            || memcmp(&app.player, &player_before, sizeof app.player) != 0
+            /* D: nothing else moved -- except the walk this seam now runs. */
+            || (expect_id == 1
+                && memcmp(&app.player, &player_before, sizeof app.player) != 0)
+            || (expect_id == 11
+                && (app.player.TODO_unkX != probe_x[i]
+                    || app.player.TODO_unkY != probe_y[i]
+                    || app.player.ballSize != ball_size[i]
+                    || app.player.p != half_size[i]))
             || memcmp(&app.spawn, &spawn_before, sizeof app.spawn) != 0
             || app.l != saved_l || app.k != saved_k || app.v != saved_v
             || app.next_player_tick_ms != saved_tick
@@ -12320,13 +12406,21 @@ static int verify_runtime_initialization_boundary(void)
         BounceApp app;
         if (bounce_game_init(&app) != 0 || bounce_game_enter_menu(&app) != 0)
             return -1;
-        if (bounce_game_initialize_runtime_entry(NULL) != -1
-            || bounce_game_initialize_runtime_entry(&app) != -1
+        if (bounce_game_initialize_runtime_entry(NULL, NULL, NULL) != -1
+            || bounce_game_initialize_runtime_entry(
+                &app,
+                app_pumper_walk_hazard,
+                &app
+            ) != -1
             || app.runtime != NULL)
             failures++;
         if (drive_app_to_level_loaded(&app, -1, 1) != 0
             /* The player must be initialized first. */
-            || bounce_game_initialize_runtime_entry(&app) != -1
+            || bounce_game_initialize_runtime_entry(
+                &app,
+                app_pumper_walk_hazard,
+                &app
+            ) != -1
             || app.runtime != NULL)
             failures++;
         bounce_game_shutdown(&app);
@@ -12699,22 +12793,32 @@ static int verify_camera_initialization_boundary(void)
     static const struct {
         int level_id;
         int list_index;
+        /* The pre-walk constructor input (header formula), asserted at the
+         * PLAYER_INITIALIZED stage. */
+        int32_t constructor_x;
+        int32_t constructor_y;
+        /* The post-walk settle, asserted at the RUNTIME_INITIALIZED stage
+         * where the constructor walk now runs (G8); equal to constructor_*
+         * for a regular level, which never walks. */
         int32_t player_x;
         int32_t player_y;
         int32_t expected_l;
         int32_t expected_k;
         int32_t expected_v;
         int32_t expected_ball_size;
+        int is_big_ball;
     } cases[] = {
         /* 001: i = 30-64 -> 0, so l = 0, v = 0; y=18 needs no k step. */
-        {  1, -1,   30,  18,   0,  0,   0, 12 },
+        {  1, -1,   30,  18,   30,  18,   0,  0,   0, 12, 0 },
         /* 008: i = 1130, l = 94, v = -2; y=18 needs no k step. */
-        {  8,  7, 1194,  18,  94,  0,  -2, 12 },
-        /* 011: post-probe x=1710 -> i=1646, l=137, v=-2; y=449 -> k=35.
+        {  8,  7, 1194,  18, 1194,  18,  94,  0,  -2, 12, 0 },
+        /* 011: constructor input (1710, 450); the walk settles it one pixel
+         * up to post-probe x=1710 -> i=1646, l=137, v=-2; y=449 -> k=35.
          * STEP 43B-R2: the f.java:175-206 walk ends on its first fitting
          * candidate, so the constructor leaves the ball at (1710, 449) as a
-         * 16/8 big ball and the f.java:618-621 deflate is never reached. */
-        { 11, 10, 1710, 449, 137, 35,  -2, 16 }
+         * 16/8 big ball and the f.java:618-621 deflate is never reached.
+         * G8: that walk runs at the runtime seam, not at player-init. */
+        { 11, 10, 1710, 450, 1710, 449, 137, 35,  -2, 16, 1 }
     };
     size_t c;
     int failures = 0;
@@ -12743,11 +12847,11 @@ static int verify_camera_initialization_boundary(void)
             failures++;
             continue;
         }
-        /* C: the Big Ball probe already ran against the pristine level. */
+        /* C: the constructor walk has NOT run yet at this stage (G8). */
         if (app_advance_level_loaded_to_player_initialized(&app) != 0
             || app.runtime != NULL
-            || app.player.TODO_unkX != cases[c].player_x
-            || app.player.TODO_unkY != cases[c].player_y
+            || app.player.TODO_unkX != cases[c].constructor_x
+            || app.player.TODO_unkY != cases[c].constructor_y
             || app.player.ballSize != cases[c].expected_ball_size
             || bounce_app_flow_entry_camera_initialized(&app.flow)) {
             bounce_game_shutdown(&app);
@@ -12759,16 +12863,32 @@ static int verify_camera_initialization_boundary(void)
         spawn_before = app.spawn;
         digest_level = level_digest_value(app.level);
 
-        /* C: runtime becomes non-NULL, player/spawn and level unchanged. */
+        /*
+         * C: runtime becomes non-NULL, spawn and the pristine level unchanged.
+         * The player changes ONLY through the constructor walk this seam now
+         * runs (G8): a big-ball level settles to player_x/player_y, a regular
+         * level's walk-less seam leaves the player byte-identical.
+         */
         if (app_advance_player_initialized_to_runtime_initialized(&app) != 0
             || app.runtime == NULL
-            || memcmp(&app.player, &player_before, sizeof app.player) != 0
+            || (cases[c].is_big_ball == 0
+                && memcmp(&app.player, &player_before, sizeof app.player) != 0)
+            || (cases[c].is_big_ball != 0
+                && (app.player.TODO_unkX != cases[c].player_x
+                    || app.player.TODO_unkY != cases[c].player_y
+                    || app.player.ballSize != cases[c].expected_ball_size))
             || memcmp(&app.spawn, &spawn_before, sizeof app.spawn) != 0
             || level_digest_value(app.level) != digest_level) {
             bounce_game_shutdown(&app);
             failures++;
             continue;
         }
+        /*
+         * Re-base the player sample here: from this point on, "untouched"
+         * measures only the camera seam. The constructor walk (G8) has
+         * already had its documented say above.
+         */
+        player_before = app.player;
         digest_runtime = level_digest_value(app.level);
 
         /* C: trace the source-ordered staged sequence for observability. */
@@ -17320,7 +17440,17 @@ static int verify_big_ball_substep(void)
             ) != 0
             || app.player.ballSize != BOUNCE_BIG_BALL_SIZE
             || app.player.p != BOUNCE_BIG_BALL_P
-            || bounce_player_use_big_ball_level(&app.player, level) != 0) {
+            /*
+             * The runtime form with an INERT consumer: this physics test needs
+             * only the walk's player-side settle (size/position), not the tile
+             * effects the production consumer performs at the entry seam (G8).
+             */
+            || bounce_player_use_big_ball(
+                &app.player,
+                runtime,
+                NULL,
+                NULL
+            ) != 0) {
             fprintf(
                 stderr,
                 "big ball: level %d player initialization failed\n",
@@ -24349,8 +24479,8 @@ static int verify_arrival_is_playable(void)
  *   rather than "it fits according to a different rule".
  *
  * THE PRODUCTION PATH IS THE ONE DRIVEN. The session is built through the staged
- * entry chain, so this covers bounce_game_initialize_player_entry()'s call to
- * bounce_player_use_big_ball_level() rather than the legacy loader's.
+ * entry chain, so this covers the runtime-initialization seam's constructor
+ * UseBigBall() walk (G8), not the legacy loader, which has no walk at all.
  */
 static int verify_big_ball_spawn_fit(void)
 {

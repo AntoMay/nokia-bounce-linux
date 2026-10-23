@@ -753,7 +753,27 @@ int bounce_game_initialize_player_entry(BounceGame *game);
  * bounce_game_release_level() already destroys it before the BounceLevel. The
  * pristine BounceLevel is never modified.
  */
-int bounce_game_initialize_runtime_entry(BounceGame *game);
+/*
+ * Runtime-initialization step of the staged gameplay entry: f.java:126
+ * `this.n.CreateTiles(this)` followed by the f.java:127-131 ball-constructor
+ * branch, i.e. the WHOLE Java constructor `new f(...)` completed (G8
+ * constructor sub-item).
+ *
+ * on_hazard/hazard_context are the app-level hazard consumer
+ * (app_pumper_walk_hazard in the production chain) forwarded to the big-ball
+ * constructor walk, so a big-ball level's UseBigBall() consumes pickups and
+ * performs the STEP 38/47-54 state writes exactly as the in-game walks do.
+ * NULL/NULL makes the walk inert, which only hermetic unit callers use.
+ *
+ * The walk runs AFTER the copy is installed and BEFORE the flow phase is
+ * recorded, so a refused walk destroys the copy, leaves the phase unrecorded
+ * and returns -1 with the player at its header-derived state.
+ */
+int bounce_game_initialize_runtime_entry(
+    BounceGame *game,
+    BouncePlayerHazardCallback on_hazard,
+    void *hazard_context
+);
 
 /*
  * Gameplay-activation step of the staged gameplay entry: the native stand-in
