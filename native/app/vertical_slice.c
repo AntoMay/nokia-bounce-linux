@@ -7072,6 +7072,25 @@ static int app_timer_callback_dispatch(
                 app, level_path, app->flow.level_id);
         if (reload_failed != 0)
             return -1;
+
+        /*
+         * G8 + RESET_GATE -- Java's InitializeGame() (e.java:115-124) calls
+         * LoadLevelId() then the constructor a() which runs UseBigBall() for
+         * big-ball levels (f.java:127-131). The native bounce_game_load_level()
+         * only does the LoadLevelId half; the constructor walk is split to
+         * bounce_game_initialize_runtime_entry() in the staged chain. The
+         * RESET_GATE reload is a direct InitializeGame equivalent, so it must
+         * also run the big-ball resolver against the fresh runtime copy.
+         */
+        if (bounce_level_is_big_ball(app->level) != 0u
+            && bounce_player_use_big_ball(
+                    &app->player,
+                    app->runtime,
+                    app_pumper_walk_hazard,
+                    app) != 0) {
+            return -1;
+        }
+
         app->lives = lives_before_reload;
         /* e(): the camera, from the new level, after the load. */
         rc = app_update_camera(app);
