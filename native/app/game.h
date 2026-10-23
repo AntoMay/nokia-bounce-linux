@@ -204,33 +204,6 @@ typedef struct BounceGame {
      * yet.
      */
     int32_t score;
-    /*
-     * G11 -- HUD dirty flag `y` (e.java:55 `public boolean y`).
-     *
-     * Java's `e.y` gates the HUD redraw at e.java:174:
-     *
-     *     if (this.y) { this.y = false; draw HUD block }
-     *
-     * It is set by three producers in the source:
-     *   f.java:613  `this.n.y = true`  -- score changes (hoop +500, crystal +200,
-     *                                         crystal ball +1000, level complete +5000)
-     *   e.java:306  `this.y = true`    -- boostTimer changes (power-up timer active)
-     *   e.java:307  `this.y = true`    -- boostTimer == 1 (last tick of bar)
-     *
-     * Native currently redraws the HUD every frame (full-frame redraw loop),
-     * so the flag is an internal optimization that does not change output.
-     * Adding it completes the state tracking to match the source's model.
-     *
-     * Producers in native mirror the source:
-     *   - bounce_game_add_score()           -> score changes
-     *   - lives write (death, 1-up, new game) -> lives changes
-     *   - hoops_scored write                -> hoops change
-     *   - boost timer derivation in draw_hud -> boost timer changes
-     *
-     * The flag is one-shot: draw_hud() clears it after drawing.
-     * bounce_game_init's memset supplies false.
-     */
-    bool hud_dirty;
     bool level_complete;
     bool dead;
     bool respawn_requested;
