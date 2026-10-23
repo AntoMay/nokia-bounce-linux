@@ -1955,6 +1955,7 @@ static int app_collect_hoop(
     (void)bounce_game_add_score(app, 500);
 
     app->hoops_scored = java_int32_add(app->hoops_scored, 1);
+    app->hud_dirty = true;
 
     /*
      * TODO_EXITUNLOCKED PRODUCER - f's caller, e.java:284-285:
@@ -2074,6 +2075,7 @@ static void app_kill_ball(BounceApp *app)
         app->player.q = 7;
         app->player.z = 2;
         app->lives = java_int32_add(app->lives, -1);
+        app->hud_dirty = true;
         app->player.TODO_somePowerUp1 = 0;
         app->player.powerUpGravity = 0;
         app->player.TODO_somePowerUp3 = 0;
@@ -3312,7 +3314,7 @@ static int app_consume_extra_life(
     (void)bounce_game_add_score(app, 1000);
     if (app->lives < 5) {
         app->lives = java_int32_add(app->lives, 1);
-        /* f.java:613 this.n.y = true -- omitted, see the note in the original. */
+        app->hud_dirty = true;
     }
     if (bounce_runtime_level_tiles_set(
             app->runtime,
@@ -6604,10 +6606,51 @@ static int draw_level_banner(BounceRenderer *renderer, const BounceApp *app)
     );
 }
 
-static int draw_hud(BounceRenderer *renderer, const BounceApp *app)
+static int draw_hud(BounceRenderer *renderer, BounceApp *app)
 {
     int remaining;
     int index;
+
+    if (renderer == NULL || app == NULL)
+        return -1;
+    /*
+     * G11 -- HUD dirty flag `y` (e.java:55).
+     *
+     * Java gates the whole HUD block on `e.y` (e.java:174):
+     *
+     *     if (this.y) { this.y = false; draw HUD }
+     *
+     * Native mirrors this: only draw HUD when dirty, then clear the flag.
+     * Producers: score (bounce_game_add_score), lives (death/1-up/continue),
+     * hoops (app_collect_hoop), boost timer (any power-up active).
+     *
+     * If not dirty, skip the entire HUD draw -- the frame loop still runs,
+     * but the HUD band retains its previous pixels (surface not cleared here).
+     */
+    if (!app->hud_dirty)
+        return 0;
+
+    /*
+     * G11 -- boost timer dirties the HUD.
+     *
+     * Java: e.java:306-307 sets y when boostTimer % 30 == 0 || boostTimer == 1.
+     * Native: any active power-up (boost_timer > 0) dirties the HUD so the
+     * boost bar animates. This is a superset of the source's condition but
+     * ensures the bar animates while power-ups are active.
+     */
+    {
+        int boost_timer = 0;
+
+        if (app->player.TODO_somePowerUp1 > boost_timer)
+            boost_timer = app->player.TODO_somePowerUp1;
+        if (app->player.powerUpGravity > boost_timer)
+            boost_timer = app->player.powerUpGravity;
+        if (app->player.TODO_somePowerUp3 > boost_timer)
+            boost_timer = app->player.TODO_somePowerUp3;
+
+        if (boost_timer != 0)
+            app->hud_dirty = true;
+    }
 
     if (renderer == NULL || app == NULL)
         return -1;
@@ -6617,8 +6660,10 @@ static int draw_hud(BounceRenderer *renderer, const BounceApp *app)
      * visuals must still get its frame; the HUD simply contributes nothing. The
      * failure return is reserved for a NULL renderer, which is a real error.
      */
-    if (app->visuals == NULL || app->level == NULL)
+    if (app->visuals == NULL || app->level == NULL) {
+        app->hud_dirty = false;
         return 0;
+    }
 
     /* e.java:173 -- the HUD is drawn with the clip widened back to the full
      * 128x128 surface, undoing the 128x96 game window at e.java:161 and the
@@ -6768,6 +6813,12 @@ static int draw_hud(BounceRenderer *renderer, const BounceApp *app)
             return -1;
     }
 
+    
+    /*
+     * G11 -- clear the one-shot dirty flag after drawing.
+     */
+    app->hud_dirty = false;
+    
     return 0;
 }
 
@@ -7987,7 +8038,7 @@ static int render_gameplay_scene(
         || draw_hoop_rims_over_ball(renderer, app) != 0)
         return -1;
     /* e.java:174-189, after the game viewport and before presentation. */
-    if (draw_hud(renderer, app) != 0)
+    if (draw_hud(renderer, (BounceApp *)app) != 0)
         return -1;
     /* e.java:201-205, on top of the composed image, gated only on `p`. */
     if (draw_level_banner(renderer, app) != 0)

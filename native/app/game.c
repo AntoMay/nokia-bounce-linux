@@ -1554,6 +1554,7 @@ int bounce_game_add_score(BounceGame *game, int32_t amount)
     if (game == NULL)
         return -1;
     game->score = java_int32_add(game->score, amount);
+    game->hud_dirty = true;
     return 0;
 }
 
@@ -1562,6 +1563,7 @@ int bounce_game_reset_score(BounceGame *game)
     if (game == NULL)
         return -1;
     game->score = 0;
+    game->hud_dirty = true;
     return 0;
 }
 
