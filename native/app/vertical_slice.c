@@ -22279,9 +22279,65 @@ static int verify_volume_slider_pointer(void)
         ++bad;
     }
 
+    /*
+     * G7 -- THE CLICK EDGE COMMITS RECORD 6, the defect this block exists to
+     * pin. The shell seam above only moves flow->settings.volume; the commit
+     * lives in x11_dispatch_event, which samples the volume before the click
+     * and calls app_commit_volume_change() after it. That edge is reproduced
+     * here on the same fixture so the STORE is asserted, not just the flow:
+     * a click that moves the slider must leave record 6 at the clicked
+     * value, and a click that does not move it must leave the store
+     * untouched (the helper is edge-triggered, like the keyboard commit).
+     */
+    {
+        BounceApp app;
+        unsigned int before;
+        int32_t stored;
+
+        memset(&app, 0, sizeof app);
+        bounce_app_flow_init(&app.flow);
+        app.flow.state = BOUNCE_APP_STATE_SETTINGS;
+        app.flow.settings.page = BOUNCE_SETTINGS_PAGE_AUDIO;
+        app.flow.settings.selected_index = BOUNCE_SETTINGS_AUDIO_ROW_VOLUME;
+
+        before = bounce_app_flow_settings_volume(&app.flow);
+        (void)bounce_ui_shell_handle_click(&app.flow, track_right, 104);
+        app_commit_volume_change(&app, before);
+        stored = -1;
+        if (bounce_persistence_load_volume(&stored) != 0
+            || stored != (int32_t)BOUNCE_AUDIO_VOLUME_MAX) {
+            fprintf(stderr,
+                    "volume-slider: the click edge committed %ld, expected"
+                    " %d\n",
+                    (long)stored,
+                    (int)BOUNCE_AUDIO_VOLUME_MAX);
+            ++bad;
+        }
+
+        /*
+         * THE NEGATIVE HALF: with the store at a different value, a click
+         * that does not move the slider must not rewrite it.
+         */
+        if (bounce_persistence_save_volume(50) != 0) {
+            fprintf(stderr, "volume-slider: save_volume(50) failed\n");
+            ++bad;
+        }
+        before = bounce_app_flow_settings_volume(&app.flow);
+        (void)bounce_ui_shell_handle_click(&app.flow, track_right, 104);
+        app_commit_volume_change(&app, before);
+        stored = -1;
+        if (bounce_persistence_load_volume(&stored) != 0 || stored != 50) {
+            fprintf(stderr,
+                    "volume-slider: an unchanged click rewrote the store to"
+                    " %ld, expected it to stay at 50\n",
+                    (long)stored);
+            ++bad;
+        }
+    }
+
     (void)printf("  ends_map=yes overshoot_clamps=yes midpoint_mid=yes"
                  " all_values_on_step=yes click_moves_value=yes"
-                 " row_click_selects_only=yes %s\n",
+                 " row_click_selects_only=yes click_edge_commits=yes %s\n",
                  bad == 0 ? "PASS" : "FAIL");
     return bad == 0 ? 0 : -1;
 }
@@ -28398,6 +28454,8 @@ static int x11_dispatch_event(
                 app_persist_theme(app);
                 /* NATIVE ADDITION -- the keypad setting rides the same route. */
                 app_persist_t9_setting(app);
+                /* G7 -- and so does the volume, which is record 6. */
+                app_persist_volume(app);
                 context->running = 0;
             } else if (key == XK_Escape) {
                 bool was_canonical_gameplay;
@@ -28657,6 +28715,13 @@ static int x11_dispatch_event(
                     || app->flow.state == BOUNCE_APP_STATE_GAMEPLAY_ENTRY
                     /* STEP 12X-P4-B: mouse parity with the key path. */
                     || app->flow.state == BOUNCE_APP_STATE_GAME_END) {
+                    /*
+                     * BL-004 -- volume sampled before the click for the same
+                     * reason the keyboard edge samples it: so that a click
+                     * that does not move the slider writes nothing.
+                     */
+                    volume_before
+                        = bounce_app_flow_settings_volume(&app->flow);
                     (void)bounce_ui_shell_handle_click(
                         &app->flow,
                         (int)event->xbutton.x,
@@ -28665,6 +28730,18 @@ static int x11_dispatch_event(
                         context->failed = 1;
                         return 0;
                     }
+                    /*
+                     * G7 -- THE POINTER SLIDER EDGE COMMITS, mirroring the
+                     * keyboard LEFT/RIGHT edge below (app_commit_volume_change
+                     * at the KeyPress path). A slider click wrote
+                     * flow->settings.volume and nothing else, so the setting
+                     * looked applied, the runtime gain followed it on the next
+                     * frame, and record 6 still held the old value: the next
+                     * launch restored a volume the player had already moved
+                     * away from. Committing on the edge gives the pointer the
+                     * same durability the keyboard already had.
+                     */
+                    app_commit_volume_change(app, volume_before);
                 }
             } else if (event->xbutton.button == Button3) {
                 if (bounce_ui_shell_handle_click(
@@ -28730,6 +28807,8 @@ static int x11_dispatch_event(
                 app_write_resume_snapshot(app);
                 app_persist_theme(app);
                 app_persist_t9_setting(app);
+                /* G7 -- and the volume, same last-chance argument as above. */
+                app_persist_volume(app);
                 context->running = 0;
             }
         }
