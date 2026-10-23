@@ -201,6 +201,29 @@ uint32_t bounce_level_height(const BounceLevel *level)
     return level == NULL ? 0u : (uint32_t)level->height;
 }
 
+int bounce_level_patch_l8_unseal(BounceLevel *level)
+{
+    /* The four sealed shaft columns of J2MElvl.008, row y=7 (see level.h). */
+    static const int shaft_cols[4] = {91, 97, 102, 108};
+    size_t i;
+
+    if (level == NULL)
+        return -1;
+    /*
+     * Level 8 dimensions: width=156, height=36 (from the J2MElvl.008 header).
+     * The fix is keyed off the dimensions because BounceLevel carries no
+     * level id; any other level is rejected BEFORE any byte is written.
+     */
+    if (level->width != 156u || level->height != 36u)
+        return -1;
+
+    for (i = 0u; i < sizeof shaft_cols / sizeof shaft_cols[0]; ++i) {
+        size_t idx = (size_t)7u * level->width + (size_t)shaft_cols[i];
+        level->tiles[idx] = 0;  /* EMPTY -- the ball can now drop through. */
+    }
+    return 0;
+}
+
 int bounce_level_derive_initial_player_input(
     const BounceLevel *level,
     int *player_x_out,

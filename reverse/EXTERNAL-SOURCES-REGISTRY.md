@@ -68,6 +68,7 @@ and must NOT be resolved automatically.
 | EXT-002 | Bounce (2001) Remake by Mycron | REF / BEHAVIORAL / VISUAL | https://mycron.itch.io/bounce-remake | Behavioral and visual reference | Behavioral / Visual reference |
 | EXT-003 | Bounce Nokia Game Clone (anish-g) | REF | https://github.com/anish-g/Bounce-Nokia-Game-Clone | Implementation reference only | Implementation reference only |
 | EXT-004 | BouncEdit Documentation | DOC / REF / KNOW | https://chrismoyles.net/bounce/documentation.shtml | Contextual knowledge only | Secondary (knowledge only) |
+| EXT-005 | bounce-rl (PufferLib Ocean env) | REF / AUDIT | https://github.com/IlyaasK/bounce-rl | Cross-source physics audit, RL training reference, L8 unseal fix | Implementation reference / Cross-source evidence |
 | ASSET-001 | Noto Sans CJK SC / TC | ASSET | — (installed font, no URL recorded) | Glyph bitmaps in native/app/script_font.c | Asset source (licence declared by the font itself) |
 | ASSET-002 | Noto Sans Thai | ASSET | — (installed font, no URL recorded) | Glyph bitmaps in native/app/script_font.c | Asset source (licence declared by the font itself) |
 
@@ -139,6 +140,39 @@ and must NOT be resolved automatically.
 - **Notes:** It must NOT be treated as proof of original Nokia Bounce
   behavior, and it does NOT override BASE-001. A disagreement with BASE-001 is
   recorded as `CONFLICT` and is not resolved automatically.
+
+### EXT-005 — bounce-rl (PufferLib Ocean environment)
+
+- **Category:** REF / AUDIT
+- **URL:** https://github.com/IlyaasK/bounce-rl
+- **Classification:** REF / IMPLEMENTATION REFERENCE / CROSS-SOURCE EVIDENCE
+- **Role:** Cross-source physics audit and implementation reference. A C rewrite of Nokia Bounce as a PufferLib Ocean RL environment with line-by-line translation of f.java b() physics. Used to cross-verify physics constants, collision masks, tile dispatch logic, and the L8 unseal fix.
+- **Used for:** Implementation reference / Cross-source evidence
+- **Evidence class:** Implementation reference / Cross-source evidence
+- **Important qualifier:** This is a C rewrite from the same decompiled Java sources (BASE-001). It does NOT provide independent provenance. Its value is in having already translated and audited the Java physics into C, which can be used to cross-check this project's implementation.
+- **What was cross-checked / taken from it:**
+  - Physics constants: BOUNCE_R_SMALL=19, BOUNCE_R_BIG=26, BOUNCE_JUMP_SMALL=558, BOUNCE_GRAV=833, BOUNCE_VX=417, BOUNCE_DT=1/25
+  - Circle collision masks (OG_MASK_E 12×12, OG_MASK_X 16×16) — identical to BASE-001
+  - Slope collision mask (OG_FMASK 12×12) — identical to BASE-001
+  - Ring geometry: BOUNCE_RIM_SMALL=5, BOUNCE_RIM_BIG=6, arc_off calculations
+  - L8 unseal fix: 4 shaft tiles at row 7, cols 91/97/102/108 cleared to EMPTY
+  - Pad charge mechanic: +2 m/s per pad bounce, cap +10 m/s (tracked in OG field `t`)
+  - Power-up durations: gravity 12s, jump 10s, speed 10s (in 60Hz ticks)
+  - Portal gate: opens only when all rings collected (rings_left == 0)
+  - BFS waypoint cache: portal + per-ring BFS for path-aware observations
+- **What was NOT taken from it:**
+  - RL-specific code: observations (164-dim), rewards, curriculum, checkpointing
+  - PufferLib API bindings (puf_init, puf_step, etc.)
+  - Rendering code (raylib-based)
+  - Training configs (bounce.ini)
+- **Conflicts recorded:**
+  - **Checkpoints/extra lives disabled in bounce-rl.** bounce-rl disables checkpoints (tile 7) and extra lives (tile 29) for "speedrun" RL mode. This project keeps them enabled per BASE-001. No conflict — deliberate design difference.
+  - **Lives default.** bounce-rl defaults to 1 life/episode for tighter credit; this project uses 3 lives per BASE-001.
+  - **Score vs reward.** bounce-rl uses shaped rewards for RL; this project uses original scoring (500/ring, 500/checkpoint, 1000/life, 4000/portal).
+- **Notes:**
+  - The L8 unseal fix was ported from bounce-rl to this project (game.c + level.c).
+  - Future physics audits should compare against both BASE-001 and EXT-005 for cross-verification.
+  - This source is CLASSIFIED AS REFERENCE — it never overrides BASE-001.
 
 ---
 

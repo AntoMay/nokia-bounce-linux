@@ -94,6 +94,35 @@ uint32_t bounce_level_width(const BounceLevel *level);
 uint32_t bounce_level_height(const BounceLevel *level);
 
 /*
+ * L8 UNSEAL -- shipped-bug fix, from the EXT-005 (bounce-rl) cross-audit.
+ *
+ * The shipped J2MElvl.008 (byte-identical to the recovered original) seals
+ * the spawn pocket from the rest of the level. The pocket is the chamber
+ * around the spawn (99,1); its baffle (rows 3..6) carries the chamber's only
+ * vertical shafts, at columns 91/97/102/108, and those shafts dead-end on
+ * row y=7: exactly those four cells are slope tiles (raw values 33/32/33/32)
+ * while row 7's own openings sit offset, at x=92/96/103/107. The decompiled
+ * game has no tile-break mechanic, so with the shipped bytes the ball can
+ * never leave the spawn pocket: 0 of the 11 rings are reachable (EXT-005
+ * measured 11 of 11 with the same four tiles cleared).
+ *
+ * This function clears exactly those four row-7 tiles to EMPTY (0), letting
+ * the small ball (one 12-pixel tile wide) drop through the shafts the layout
+ * clearly intends. It is a deliberate in-memory deviation from the recovered
+ * bytes and must be applied at the game-load seam -- never written back to
+ * the resource file, and never inside bounce_level_parse() /
+ * bounce_level_load_file(), which stay byte-pristine so the --check fixtures
+ * can keep asserting the recovered data directly.
+ *
+ * Both native game loaders call it (bounce_game_load_level() and
+ * bounce_game_load_level_entry() in native/app/game.c), so every gameplay
+ * route installs an unsealed level 8. Returns 0 on success; -1 if level is
+ * NULL or its dimensions are not level 8's (156x36), in which case nothing
+ * is modified. Verified by verify_l8_unseal() in the --check suite.
+ */
+int bounce_level_patch_l8_unseal(BounceLevel *level);
+
+/*
  * Derive only the new-game f-constructor inputs from this level:
  * initial tile X/Y become initial pixel X/Y using 12-pixel tiles and offset 6;
  * isBigBall == 0 derives ball size 12, otherwise 16. This does not construct

@@ -14971,6 +14971,177 @@ static int verify_level_load_entry_integration(void)
     return 0;
 }
 
+/*
+ * EXT-005 L8 UNSEAL -- count the tile differences between a recovered level
+ * and an installed one, and police WHAT may differ.
+ *
+ * The only change any caller of the game loaders may make to recovered level
+ * bytes is clearing one of the four documented level-8 shaft cells (row 7,
+ * columns 91/97/102/108) to EMPTY. Anything else -- a differing cell outside
+ * those four, a shaft cell that is not EMPTY afterwards, or a level of a
+ * different shape -- makes this return (size_t)-1 instead of a count, so a
+ * test that expects N differences fails closed on a wrong-shaped difference.
+ */
+static size_t l8_unseal_diff_count(
+    const BounceLevel *expected,
+    const BounceLevel *installed
+)
+{
+    static const int shaft_x[4] = {91, 97, 102, 108};
+    size_t width;
+    size_t height;
+    size_t diffs = 0u;
+    size_t x;
+    size_t y;
+
+    if (expected == NULL || installed == NULL)
+        return (size_t)-1;
+    width = (size_t)bounce_level_width(expected);
+    height = (size_t)bounce_level_height(expected);
+    if (width != (size_t)bounce_level_width(installed)
+        || height != (size_t)bounce_level_height(installed))
+        return (size_t)-1;
+    for (y = 0u; y < height; ++y) {
+        for (x = 0u; x < width; ++x) {
+            uint8_t before;
+            uint8_t after;
+            size_t i;
+            int allowed = 0;
+
+            if (bounce_level_get_tile(expected, (int)x, (int)y, &before) != 0
+                || bounce_level_get_tile(installed, (int)x, (int)y, &after)
+                    != 0)
+                return (size_t)-1;
+            if (before == after)
+                continue;
+            for (i = 0u; i < sizeof shaft_x / sizeof shaft_x[0]; ++i) {
+                if ((int)x == shaft_x[i] && y == 7u) {
+                    allowed = 1;
+                    break;
+                }
+            }
+            if (allowed == 0 || after != 0u)
+                return (size_t)-1;
+            ++diffs;
+        }
+    }
+    return diffs;
+}
+
+/*
+ * EXT-005 L8 UNSEAL -- pin the shipped-bug fix at the game-load seam.
+ *
+ * The shipped J2MElvl.008 seals the spawn pocket; the rationale is documented
+ * at bounce_level_patch_l8_unseal() in native/level/level.h. This fixture
+ * asserts the whole contract:
+ *
+ *   A. the recovered file stays PRISTINE: bounce_level_load_file() still
+ *      sees the shipped seal (all four row-7 shaft cells non-zero), so the
+ *      byte-exact fixtures elsewhere in this suite keep their meaning;
+ *   B. BOTH game loaders install the unsealed level -- exactly four cells
+ *      differ from the recovered bytes, the four documented shaft cells, and
+ *      each is changed to EMPTY (l8_unseal_diff_count polices the shape);
+ *   C. the four shafts are continuous from the pocket interior: rows 1..7 of
+ *      every shaft column are EMPTY in the installed level, which is exactly
+ *      the opening the shipped bytes lacked;
+ *   D. the patch is total on its guards and level-8-only: NULL and a
+ *      non-8 parse are rejected WITHOUT writing a byte, and a full level-1
+ *      load shows zero tile differences against the recovered file.
+ */
+static int verify_l8_unseal(void)
+{
+    static const int shaft_x[4] = {91, 97, 102, 108};
+    BounceLevel *pristine = NULL;
+    BounceLevel *level1 = NULL;
+    BounceLevel *level1_again = NULL;
+    BounceApp game;
+    size_t diffs;
+    size_t i;
+    uint8_t tile;
+    int row;
+
+    /* A. The recovered file still carries the shipped seal. */
+    if (bounce_level_load_file(BOUNCE_LEVEL008_PATH, &pristine)
+            != BOUNCE_LEVEL_LOAD_OK
+        || pristine == NULL)
+        goto fail;
+    for (i = 0u; i < sizeof shaft_x / sizeof shaft_x[0]; ++i) {
+        if (bounce_level_get_tile(pristine, shaft_x[i], 7, &tile) != 0
+            || tile == 0u)
+            goto fail;
+    }
+
+    /* B1 + C. The staged-entry loader (the production route) installs it. */
+    if (bounce_game_init(&game) != 0 || bounce_game_enter_menu(&game) != 0)
+        goto fail;
+    if (bounce_game_load_level_entry(&game, 8) != 0 || game.level == NULL) {
+        bounce_game_shutdown(&game);
+        goto fail;
+    }
+    diffs = l8_unseal_diff_count(pristine, game.level);
+    for (i = 0u; diffs == 4u && i < sizeof shaft_x / sizeof shaft_x[0]; ++i) {
+        for (row = 1; row <= 7; ++row) {
+            if (bounce_level_get_tile(game.level, shaft_x[i], row, &tile) != 0
+                || tile != 0u) {
+                diffs = (size_t)-1;
+                break;
+            }
+        }
+    }
+    bounce_game_shutdown(&game);
+    if (diffs != 4u)
+        goto fail;
+
+    /* B2. The all-in-one loader (deferred-init / diagnostic route) too. */
+    if (bounce_game_init(&game) != 0
+        || bounce_game_load_level(&game, BOUNCE_LEVEL008_PATH, 8) != 0
+        || game.level == NULL) {
+        bounce_game_shutdown(&game);
+        goto fail;
+    }
+    diffs = l8_unseal_diff_count(pristine, game.level);
+    bounce_game_shutdown(&game);
+    if (diffs != 4u)
+        goto fail;
+
+    /* D. Total on the guards, and level-8-only. */
+    if (bounce_level_patch_l8_unseal(NULL) != -1
+        || bounce_level_load_file(BOUNCE_LEVEL001_PATH, &level1)
+            != BOUNCE_LEVEL_LOAD_OK
+        || level1 == NULL)
+        goto fail;
+    if (bounce_level_patch_l8_unseal(level1) != -1
+        || bounce_level_load_file(BOUNCE_LEVEL001_PATH, &level1_again)
+            != BOUNCE_LEVEL_LOAD_OK
+        || level1_again == NULL
+        || l8_unseal_diff_count(level1_again, level1) != 0u)
+        goto fail;
+    bounce_level_destroy(level1_again);
+    level1_again = NULL;
+    if (bounce_game_init(&game) != 0
+        || bounce_game_load_level(&game, BOUNCE_LEVEL001_PATH, 1) != 0
+        || game.level == NULL
+        || l8_unseal_diff_count(level1, game.level) != 0u) {
+        bounce_game_shutdown(&game);
+        goto fail;
+    }
+    bounce_game_shutdown(&game);
+    bounce_level_destroy(level1);
+    bounce_level_destroy(pristine);
+    printf(
+        "L8UNSEAL: shaft cells (91/97/102/108, row 7) cleared on both loaders;"
+        " 4 of %zu level-8 bytes changed to EMPTY; level 1 untouched\n",
+        (size_t)156u * 36u
+    );
+    return 0;
+
+fail:
+    bounce_level_destroy(level1_again);
+    bounce_level_destroy(level1);
+    bounce_level_destroy(pristine);
+    return -1;
+}
+
 static unsigned long token_to_x11_pixel(uint32_t token)
 {
     return ((unsigned long)((token >> 16) & 0xffu) << 16)
@@ -36849,6 +37020,15 @@ int main(int argc, char **argv)
     }
     if (verify_level_load_entry_integration() != 0) {
         fprintf(stderr, "level load entry integration verification failed\n");
+        goto cleanup;
+    }
+    /*
+     * EXT-005 L8 UNSEAL -- registered directly after the level-load fixture,
+     * the seam it exercises: both loaders under test are driven there too.
+     * Ordinary sequence member, nothing disabled, no other check moved.
+     */
+    if (verify_l8_unseal() != 0) {
+        fprintf(stderr, "level 8 unseal (EXT-005) verification failed\n");
         goto cleanup;
     }
     if (verify_player_initialization_boundary() != 0) {

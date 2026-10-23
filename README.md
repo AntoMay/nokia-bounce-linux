@@ -68,6 +68,8 @@ recorded in [`reverse/EXTERNAL-SOURCES-REGISTRY.md`](reverse/EXTERNAL-SOURCES-RE
 Attribution: the base repository and recovered Java/resources originate from
 [rndtrash/nokia-bounce-decomp](https://github.com/rndtrash/nokia-bounce-decomp).
 
+Cross-reference: [IlyaasK/bounce-rl](https://github.com/IlyaasK/bounce-rl) — a PufferLib Ocean RL environment with line-by-line C translation of the same decompiled Java physics. Used for cross-verification of physics constants, collision logic, and the L8 unseal fix. See [`reverse/EXTERNAL-SOURCES-REGISTRY.md`](reverse/EXTERNAL-SOURCES-REGISTRY.md#ext-005--bounce-rl-pufferlib-ocean-environment) for details.
+
 ## Building
 
 It builds with `gradlew build` but there is no point in that at the moment since I didn't implement any wrappers for MIDlet and Nokia APIs.

@@ -338,6 +338,16 @@ int bounce_game_load_level(
     if (status != BOUNCE_LEVEL_LOAD_OK || new_level == NULL)
         goto failure;
 
+    /*
+     * L8 UNSEAL (EXT-005 shipped-bug fix) -- the full rationale lives at
+     * bounce_level_patch_l8_unseal() in native/level/level.h. Patching here,
+     * BEFORE the runtime tile copy below, means the copy inherits the
+     * unsealed bytes; the resource file on disk and the pristine
+     * bounce_level_load_file()/bounce_level_parse() seam are untouched, which
+     * is what lets the --check fixtures keep asserting the recovered bytes.
+     */
+    (void)bounce_level_patch_l8_unseal(new_level);
+
     new_runtime = bounce_runtime_level_tiles_create(new_level);
     if (new_runtime == NULL
         || bounce_runtime_level_tiles_width(new_runtime)
@@ -531,6 +541,17 @@ int bounce_game_load_level_entry(BounceGame *game, int level_id)
         free(new_path);
         return -1;
     }
+
+    /*
+     * L8 UNSEAL (EXT-005 shipped-bug fix) -- the same seam as in
+     * bounce_game_load_level(); the full rationale is documented at
+     * bounce_level_patch_l8_unseal() in native/level/level.h. This is the
+     * production route (New Game, Level Select, post-completion Continue),
+     * and the runtime copy is built later, in
+     * bounce_game_initialize_runtime_entry(), from this very level, so it
+     * inherits the unsealed bytes.
+     */
+    (void)bounce_level_patch_l8_unseal(new_level);
 
     /* Only level ownership changes; nothing else in the context is written. */
     bounce_game_release_level_only(game);
