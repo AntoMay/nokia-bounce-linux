@@ -55,7 +55,7 @@ are **stale** — the code has since gained them (score wiring, boost bar, GodMo
 | # | Gap | Status | Evidence |
 |---|---|---|---|
 | G1 | **`K==1` live-session Continue** — Java Continue restarts the in-progress level when a live session exists; native only continues from persisted snapshot | NOT IMPLEMENTED | `BounceGame.java:116,223-224`; structural note `vertical_slice.c:8949-9015` |
-| G2 | **Second splash `nokiagames.png` never rendered** — loaded + dimension-checked but draw path only shows `bouncesplash.png`; splash is single-stage 30 ticks vs Java's two stages | PARTIAL | `e.java:59,227-253`; `visual_assets.c:704-715,1394-1402`, `ui_shell.c:2509-2522` |
+| G2 | ~~Second splash `nokiagames.png` never rendered~~ — **no effective gap**: the source is single-stage. The `e` constructor sets `SplashId = 1` (e.java:72), so only `bouncesplash.png` ever displays for 31 ticks (`splashTimer > 30`, e.java:231) and any key skips (e.java:331-332); the `case 0` stage at e.java:235-243 is **dead code** (no assignment of `SplashId = 0` anywhere in the tree). Native matches exactly (single stage, `>30` timing verified, key-skip). Drawing nokiagames would DEVIATE; the asset stays inventory-verified only, mirroring Java never loading SPLASHES[0] at runtime | RESOLVED (analysis; dead code deliberately not implemented) | `e.java:59,72,227-253,331-332`; `app_flow.c:355-366`, `ui_shell.c:2510-2536`, verify timing `vertical_slice.c:9983-9988` |
 | G3 | **Missing post-ball front-tile pass** — Java repaints tiles 13–28 (`d.b` rims) *after* the ball; native render order grid→door→thorns→ball→HUD → ball paints over near hoop rim | **RESOLVED** (`1ccd833`) | `e.java:172` → `b.java:577-600`; `vertical_slice.c:7299+` (`draw_hoop_rims_over_ball`), `visual_assets.c:1106+` |
 | G4 | **No locale autodetect / language never persisted** — Java reads `microedition.locale` each launch; native always boots English | NOT IMPLEMENTED | `Translation.java:39,55,57`; `locale.c:716`, `app_flow.h:313-318` |
 | G5 | **Cheat keys `1`/`3` (prev/next level)** — unconditional in Java (`d=true` even without af); entire arm af-gated in native → inert without af | DEVIATES | `e.java:339-348`; `vertical_slice.c:27764-27807` |
@@ -214,7 +214,7 @@ Escape/menu with persist superset (`vs:28299-28498`). QWERTY/mouse/digits/`q` = 
 | 6 sprite transforms, mirror ball, exit palette, thorn 24×24 composite, tile draw incl. water theme, front/back sprites | IMPLEMENTED | `visual_assets.c:38-46,289,335-408,865-1079,1468` |
 | Exit door animation (+4 → 24 → open flag) | IMPLEMENTED | `vs:6193-6257,6695-6699`, `visual_assets.c:1435` |
 | HUD band/lives/rings/score/boost geometry + colors exact | IMPLEMENTED | `vs:6395-6557` (`e.java:175-187`) |
-| **Second splash `nokiagames.png` never drawn; single 30-tick stage** | **PARTIAL (G2)** | `visual_assets.c:704-715,1394-1402`; `ui_shell.c:2509-2522` |
+| ~~Second splash `nokiagames.png` never drawn; single 30-tick stage~~ | **NO GAP (G2)** — source is effectively single-stage: `SplashId = 1` at e.java:72 makes the case-0 stage dead code; native single-stage 31-tick + key-skip matches | `e.java:72,227-253,331-332`; `app_flow.c:355-366`, `ui_shell.c:2510-2536` |
 | **Post-ball front-tile (hoop rim) pass** | **IMPLEMENTED (G3 resolved, `1ccd833`)** | `vs:7299+` vs `e.java:172` → `b.java:577-600` |
 | Dirty-tile incremental redraw, E staging, BRICK border | NOT IMPLEMENTED, deliberate (G9) | `vs:7047-7088` |
 | Device font glyphs | DEVIATES → placeholder 5×7 (G10) | `visual_assets.c:1288,1352` |
@@ -247,8 +247,8 @@ Extensions: mouse UI, `Escape`, `q`, T9 controller mode.
 
 ### Top rendering/audio gaps
 
-**G2** nokiagames splash · **G9** dirty-tile/E-buffer/border · **G10** fonts.
-*(G3 and G7 resolved: `1ccd833`, `f895aaf`.)*
+**G9** dirty-tile/E-buffer/border · **G10** fonts.
+*(G2 resolved as no-effective-gap: `e.java:72` makes the case-0 stage dead code. G3 and G7 resolved: `1ccd833`, `f895aaf`.)*
 
 ---
 
@@ -256,7 +256,7 @@ Extensions: mouse UI, `Escape`, `q`, T9 controller mode.
 
 | Priority | ID | Gap | Effort |
 |---|---|---|---|
-| 2 | G2 | Render `nokiagames.png` splash as first stage (30 ticks each) | Small |
+| 2 | G2 | ~~Render `nokiagames.png` splash as first stage~~ — **no effective gap**: source is single-stage (`SplashId = 1`, case-0 dead code); closed by analysis, anti-regression comment added | done (analysis) |
 | 2 | G1 | `K==1` live-session Continue route | Medium |
 | 2 | G4 | Locale autodetect (+ optional language persistence) | Small |
 | 3 | G5 | Un-gate `1`/`3` keys to match Java (`d=true` unconditional) | Small |

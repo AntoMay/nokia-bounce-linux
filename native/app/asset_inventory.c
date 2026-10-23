@@ -173,7 +173,7 @@ static const BounceAssetInventoryEntry inventory[] = {
         104u,
         16u,
         "e.SPLASHES and Image.createImage",
-        "PNG decoded; source splash asset identity verified, activation path not yet used",
+        "PNG decoded; identity verified; intentionally never drawn -- e.java:72 starts SplashId=1 so the case-0 stage (e.java:235-243) is dead code",
         0
     },
     {

@@ -2517,6 +2517,18 @@ int bounce_ui_shell_render_splash(
     if (bounce_surface_fill(surface, UINT32_C(0xff000000)) != 0
         || bounce_renderer_reset_clip(renderer) != 0)
         return -1;
+    /*
+     * SOURCE-FAITHFUL SINGLE STAGE. e.java:59 lists two splash assets
+     * (SPLASHES[0] = nokiagames.png, SPLASHES[1] = bouncesplash.png), but the
+     * e constructor sets SplashId = 1 (e.java:72), so the case-0 branch at
+     * e.java:235-243 that would load nokiagames.png is DEAD CODE: nothing in
+     * the source tree ever assigns SplashId = 0, and the switch at :234 only
+     * ever takes case 1 (SplashId -> -1, ShowMainMenu). The original therefore
+     * displays bouncesplash.png alone for 31 ticks (splashTimer > 30 at
+     * e.java:231) and any key skips it (e.java:331-332). This renders exactly
+     * that. Drawing nokiagames.png here as a "first stage" would be a parity
+     * REGRESSION, not a fix -- see the G2 row of the java-source parity audit.
+     */
     /* bouncesplash.png is already 128x128; this is an unscaled 1:1 blit. */
     return bounce_visual_assets_draw_splash(renderer, assets);
 }
