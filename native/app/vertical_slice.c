@@ -6812,7 +6812,8 @@ static int app_timer_callback_dispatch(
          * precondition "supplied as false" because it could prove that e.java:316
          * was the only reachable setter of `d` in the staged path. STEP 65-B2
          * makes the other two reachable -- e.java:340 ('1') and :345 ('3'), the
-         * af-gated level-skip keys -- so the slot now has a real producer.
+         * level-skip keys whose skip arithmetic is af-gated but whose request
+         * is not (G5) -- so the slot now has a real producer.
          *
          * NO OTHER ARGUMENT CHANGES. splash_active stays false because
          * SplashId is still -1 from e.java:246 onward; the camera gate keeps
@@ -6823,7 +6824,7 @@ static int app_timer_callback_dispatch(
          * its reload and camera have both succeeded, so it cannot be observed
          * true on a second consecutive tick.
          */
-        app->af_reload_requested,
+        app->level_reload_requested,
         false,
         app_camera_needs_update(app),
         app_player_physics_continuation,
@@ -7043,7 +7044,7 @@ static int app_timer_callback_dispatch(
          * bounce_game_start_level -> bounce_game_activate_loaded_level at
          * game.c:409, and the staged chain's stage 5 at game.c:761 -- so the
          * zeroing inside bounce_game_load_level is inert on both of them. The
-         * af reset gate is the one production path that reloads without
+         * level-reload reset gate is the one production path that reloads without
          * reinstalling, which is exactly where Java's silence has to be
          * reproduced.
          *
@@ -7076,7 +7077,7 @@ static int app_timer_callback_dispatch(
         rc = app_update_camera(app);
         if (rc != 0)
             return rc;
-        app->af_reload_requested = false;
+        app->level_reload_requested = false;
         return 0;
     }
     /*
@@ -7087,7 +7088,7 @@ static int app_timer_callback_dispatch(
      * bounce_game_tick_dispatch at game.c:926, which is BEFORE
      * timer_record_dispatch (game.c:970), BEFORE bounce_player_tick_entry
      * (game.c:982) and BEFORE the physics body (game.c:1001) -- so that path is
-     * a pre-physics consumer and it serves af_reload_requested, whose Java
+     * a pre-physics consumer and it serves level_reload_requested, whose Java
      * counterpart is e.java:222-226 (the top of Tick).
      *
      * Java's `e` consumer is the opposite: e.java:313 is the LAST statement
@@ -13709,13 +13710,13 @@ static int verify_tick_dispatch_boundary(void)
 
                 app.lives = expected_lives;
                 app.flow.level_id = level_target;
-                app.af_reload_requested = true;
+                app.level_reload_requested = true;
 
                 if (app_timer_callback_dispatch(&app, &af_branch) != 0
                     || af_branch != BOUNCE_TICK_DISPATCH_RESET_GATE
                     /* e.java:313 clears `d` inside LoadLevelId (b.java:213);
                      * native clears the one-shot latch after the work. */
-                    || app.af_reload_requested
+                    || app.level_reload_requested
                     /* THE ASSERTION: InitializeGame() never writes lives. */
                     || app.lives != expected_lives
                     /* The reload itself must still have happened in full. */
@@ -28628,9 +28629,26 @@ static int x11_dispatch_event(
                  * path is resolved in the consuming arm, from the existing
                  * bounce_game_level_resource_path().
                  */
-                if (app->af
-                    && (source == BOUNCE_INPUT_SOURCE_NUM1
-                        || source == BOUNCE_INPUT_SOURCE_NUM3)) {
+                /*
+                 * G5 -- THE AF GATE COVERS THE ARITHMETIC ONLY (e.java:339-348):
+                 *
+                 *     case 49:  this.d = true;                        e.java:340
+                 *               if (this.af && --this.level < 1)      e.java:341
+                 *                   this.level = 11;                   e.java:342
+                 *     case 51:  this.d = true;                        e.java:345
+                 *               if (this.af && ++this.level > 11)     e.java:346
+                 *                   this.level = 1;                    e.java:347
+                 *
+                 * `d = true` is UNCONDITIONAL in the source. `d` has exactly one
+                 * reader (e.java:222) which reloads the CURRENT level when
+                 * `level` did not move, so without af the observable effect of
+                 * either key is an instant restart of the level being played.
+                 * Before G5 this native block gated the request itself on `af`,
+                 * which made both keys dead without af -- the recorded G5
+                 * deviation. Only the level arithmetic stays behind `af`.
+                 */
+                if (source == BOUNCE_INPUT_SOURCE_NUM1
+                    || source == BOUNCE_INPUT_SOURCE_NUM3) {
                     /*
                      * STEP 65-B2 -- this block no longer reloads. It now only
                      * records the request, exactly as Java's key handler does:
@@ -28651,16 +28669,20 @@ static int x11_dispatch_event(
                      *
                      * THE ARITHMETIC IS UNCHANGED and still applied to the
                      * current level, so a second press before the consuming tick
-                     * accumulates exactly as Java's would.
+                     * accumulates exactly as Java's would -- and it accumulates
+                     * ONLY with af, which is the whole point of G5: without af
+                     * the level simply does not move and the request reloads it.
                      */
-                    if (source == BOUNCE_INPUT_SOURCE_NUM1) {
-                        app->flow.level_id--;
-                        if (app->flow.level_id < BOUNCE_APP_FIRST_LEVEL_ID)
-                            app->flow.level_id = BOUNCE_APP_LAST_LEVEL_ID;
-                    } else {
-                        app->flow.level_id++;
-                        if (app->flow.level_id > BOUNCE_APP_LAST_LEVEL_ID)
-                            app->flow.level_id = BOUNCE_APP_FIRST_LEVEL_ID;
+                    if (app->af) {
+                        if (source == BOUNCE_INPUT_SOURCE_NUM1) {
+                            app->flow.level_id--;
+                            if (app->flow.level_id < BOUNCE_APP_FIRST_LEVEL_ID)
+                                app->flow.level_id = BOUNCE_APP_LAST_LEVEL_ID;
+                        } else {
+                            app->flow.level_id++;
+                            if (app->flow.level_id > BOUNCE_APP_LAST_LEVEL_ID)
+                                app->flow.level_id = BOUNCE_APP_FIRST_LEVEL_ID;
+                        }
                     }
                     /*
                      * THE TARGET IS THIS EXISTING FIELD, not a new one. It is
@@ -28668,9 +28690,12 @@ static int x11_dispatch_event(
                      * treats flow.level_id as the current level (game.c:363), so
                      * mutating it here is the native form of e.java:341 / :346.
                      * The consuming arm reads the same field, which is why the
-                     * request needs to carry no payload of its own.
+                     * request needs to carry no payload of its own. Written
+                     * UNCONDITIONALLY (G5): it is e.java:340 / :345
+                     * `this.d = true`, the half of the arm Java does not gate
+                     * on `af`.
                      */
-                    app->af_reload_requested = true;
+                    app->level_reload_requested = true;
                 }
             }
             /*
@@ -31491,6 +31516,234 @@ static int verify_god_mode_cheat_activation(void)
     bounce_runtime_level_tiles_destroy(runtime);
     bounce_level_destroy(level);
 
+    return bad == 0 ? 0 : -1;
+}
+
+/*
+ * G5 -- the e.java:339-348 '1'/'3' consumers: the request is unconditional,
+ * the warp is not.
+ *
+ * WHAT THE SOURCE DOES. e.java:340 / :345 write `this.d = true` on every
+ * press, and `d`'s single reader (e.java:222, the top of Tick) reloads the
+ * current level -- `this.level` only moves behind `if (this.af)` (e.java:341,
+ * :346). So without af the observable effect of either key is an INSTANT
+ * RESTART of the level being played; with af it is a prev/next warp plus the
+ * same reload. Before G5 the native block gated the request itself on `af`,
+ * which made both keys dead without af.
+ *
+ * WHAT IS PROVEN HERE, through the real key dispatcher:
+ *   A  without af, '1'/'3' arm the request and the level does not move;
+ *   B  with af (armed by the real 7-8-7-8-9-9 sequence), the warp runs,
+ *      wraps at both ends, and two presses before the consuming tick
+ *      accumulate exactly as Java's would;
+ *   C/D the consuming tick: the armed request is a ONE-SHOT -- it selects
+ *      BOUNCE_TICK_DISPATCH_RESET_GATE, the level is reloaded (same id
+ *      without af, warped id with af), the latch is cleared, and lives are
+ *      carried across (verify_tick_dispatch_boundary owns that half).
+ *
+ * NOT REPEATED HERE. The reload body itself, the one-shot clear ordering and
+ * the lives carry are verify_tick_dispatch_boundary's (they drive the latch
+ * directly); this verifier only proves the KEY path arms and warps correctly
+ * and then closes the loop end-to-end.
+ */
+static int verify_cheat_level_keys(void)
+{
+    static const char *const path =
+        "src/main/resources/levels/J2MElvl.002";
+    /* e.java:374-378, armed through the dispatcher rather than by hand. */
+    static const KeySym af_terminal[6] = {
+        XK_7, XK_8, XK_7, XK_8, XK_9, XK_9
+    };
+    BounceLevel *level = NULL;
+    BounceRuntimeLevelTiles *runtime = NULL;
+    int bad = 0;
+
+    if (bounce_level_load_file(path, &level) != BOUNCE_LEVEL_LOAD_OK
+        || level == NULL)
+        return -1;
+    runtime = bounce_runtime_level_tiles_create(level);
+    if (runtime == NULL) {
+        bounce_level_destroy(level);
+        return -1;
+    }
+
+    /* --- A: without af the request arms and the level does not move. --- */
+    {
+        BounceApp app;
+        X11PresentationContext context;
+        XEvent event;
+        int level_before;
+
+        init_static_response_app(&app, runtime, 36, 240, 0, 0);
+        dispatch_fixture_context(&context);
+        /* A legal current level; the memset fixture starts at 0. */
+        app.flow.level_id = 2;
+        level_before = app.flow.level_id;
+        app.af = false;
+
+        fill_key_event(&event, KeyPress, 96u, 1u, 100u);
+        if (x11_dispatch_event(&context, &app, &event, XK_1) != 0
+            || !app.level_reload_requested
+            || app.flow.level_id != level_before) {
+            fprintf(stderr, "G5: '1' without af did not arm only the request\n");
+            bad++;
+        }
+        if (x11_dispatch_event(&context, &app, &event, XK_3) != 0
+            || !app.level_reload_requested
+            || app.flow.level_id != level_before) {
+            fprintf(stderr, "G5: '3' without af did not arm only the request\n");
+            bad++;
+        }
+        if (app.af || app.god_mode) {
+            fprintf(stderr, "G5: the keys armed af or GodMode on their own\n");
+            bad++;
+        }
+    }
+
+    /* --- B: with af the warp runs, wraps and accumulates. --- */
+    {
+        BounceApp app;
+        X11PresentationContext context;
+        XEvent event;
+        int g = -1;
+        bool god = false;
+        bool af = false;
+        int level_before;
+
+        init_static_response_app(&app, runtime, 36, 240, 0, 0);
+        dispatch_fixture_context(&context);
+        /* A legal current level; the memset fixture starts at 0. */
+        app.flow.level_id = 2;
+        level_before = app.flow.level_id;
+
+        if (god_press_sequence(
+                &context, &app, af_terminal, 6u, &g, &god, &af) != 0
+            || !af
+            || god) {
+            fprintf(stderr, "G5: the af terminal did not arm af alone\n");
+            bad++;
+        } else {
+            fill_key_event(&event, KeyPress, 96u, 1u, 100u);
+            /* '1': level - 1. */
+            if (x11_dispatch_event(&context, &app, &event, XK_1) != 0
+                || !app.level_reload_requested
+                || app.flow.level_id != level_before - 1) {
+                fprintf(stderr, "G5: af '1' did not warp to level - 1\n");
+                bad++;
+            }
+            /* A second '1' before the consuming tick accumulates, wrapping. */
+            if (x11_dispatch_event(&context, &app, &event, XK_1) != 0
+                || app.flow.level_id != BOUNCE_APP_LAST_LEVEL_ID) {
+                fprintf(stderr, "G5: af '1' did not accumulate and wrap\n");
+                bad++;
+            }
+            /* '3' brings it back: 11 -> 1. */
+            if (x11_dispatch_event(&context, &app, &event, XK_3) != 0
+                || app.flow.level_id != BOUNCE_APP_FIRST_LEVEL_ID) {
+                fprintf(stderr, "G5: af '3' did not wrap to the first level\n");
+                bad++;
+            }
+        }
+    }
+
+    /*
+     * --- C/D: end to end through the staged production fixture: press, then
+     * the consuming tick. The staged chain leaves flow in GAMEPLAY, so the
+     * dispatcher's gameplay gate admits the key exactly as in a real run.
+     * --- */
+    {
+        static const struct {
+            bool arm_af;
+            int expect_level; /* from the level-2 start */
+        } passes[] = {
+            { false, 2 }, /* no af: same level, an instant restart */
+            { true,  1 }  /* af: warped to level 1 */
+        };
+        size_t pass;
+
+        for (pass = 0u; pass < sizeof passes / sizeof passes[0]; ++pass) {
+            BounceApp app;
+            X11PresentationContext context;
+            XEvent event;
+            BounceTickDispatchBranch branch =
+                BOUNCE_TICK_DISPATCH_RESET_GATE;
+            int g = -1;
+            bool god = false;
+            bool af = false;
+            bool ok;
+
+            if (bounce_game_init(&app) != 0
+                || bounce_game_enter_menu(&app) != 0
+                || drive_app_to_level_loaded(&app, 1, 2) != 0
+                || app_advance_level_loaded_to_player_initialized(&app) != 0
+                || app_advance_player_initialized_to_runtime_initialized(&app)
+                    != 0
+                || app_advance_runtime_initialized_to_camera_initialized(&app)
+                    != 0
+                || app_advance_camera_initialized_to_activated(&app) != 0
+                || bounce_game_initialize_game_timer(&app) != 0) {
+                bounce_game_shutdown(&app);
+                bad++;
+                continue;
+            }
+            dispatch_fixture_context(&context);
+            if (passes[pass].arm_af
+                && (god_press_sequence(
+                        &context, &app, af_terminal, 6u, &g, &god, &af) != 0
+                    || !af)) {
+                bounce_game_shutdown(&app);
+                bad++;
+                continue;
+            }
+
+            fill_key_event(&event, KeyPress, 96u, 1u, 100u);
+            if (x11_dispatch_event(&context, &app, &event, XK_1) != 0
+                || !app.level_reload_requested
+                || app.flow.level_id != passes[pass].expect_level) {
+                bounce_game_shutdown(&app);
+                bad++;
+                continue;
+            }
+
+            /*
+             * The marker: bounce_game_load_level zeroes hoops_scored
+             * (game.c:367), so a zero afterwards is the reload having run,
+             * and the player being re-initialized is the rebuild half.
+             */
+            app.hoops_scored = 5;
+
+            ok = app_timer_callback_dispatch(&app, &branch) == 0
+                && branch == BOUNCE_TICK_DISPATCH_RESET_GATE
+                /* one-shot: the latch cannot survive its consuming tick */
+                && !app.level_reload_requested
+                && app.flow.level_id == passes[pass].expect_level
+                && app.level_id == passes[pass].expect_level
+                && app.level != NULL
+                && app.runtime != NULL
+                && app.player.initialized
+                && app.hoops_scored == 0;
+            if (!ok) {
+                fprintf(
+                    stderr,
+                    "G5: consuming tick (af=%d) branch=%d latch=%d"
+                    " flow_level=%d level_id=%d hoops=%d\n",
+                    passes[pass].arm_af ? 1 : 0,
+                    (int)branch,
+                    app.level_reload_requested ? 1 : 0,
+                    (int)app.flow.level_id,
+                    app.level_id,
+                    (int)app.hoops_scored);
+                bad++;
+            }
+            bounce_game_shutdown(&app);
+        }
+    }
+
+    bounce_runtime_level_tiles_destroy(runtime);
+    bounce_level_destroy(level);
+    if (bad == 0)
+        printf("G5-LEVELKEYS no-af=request-only af=warp-accumulate-wrap"
+               " e2e=reset-gate-reload latch=one-shot PASS\n");
     return bad == 0 ? 0 : -1;
 }
 
@@ -38099,6 +38352,14 @@ int main(int argc, char **argv)
     }
     if (verify_god_mode_cheat_activation() != 0) {
         fprintf(stderr, "god mode cheat activation verification failed\n");
+        goto cleanup;
+    }
+    /*
+     * G5 -- the '1'/'3' keys: the reload request is unconditional, only the
+     * level warp is af-gated (e.java:339-348).
+     */
+    if (verify_cheat_level_keys() != 0) {
+        fprintf(stderr, "cheat level keys verification failed\n");
         goto cleanup;
     }
     if (verify_numeric_keypad() != 0) {

@@ -298,8 +298,9 @@ typedef struct BounceGame {
      * (b.java:202), false at the head of LoadLevelId (b.java:213), and true in
      * the level-completion block (e.java:316, immediately before the
      * `this.level++` at :317). The two remaining `this.d = true` writes at
-     * e.java:340 and :345 belong to the af-gated debug level-skip keys and have
-     * no native counterpart.
+     * e.java:340 and :345 belong to the debug level-skip keys '1'/'3' -- their
+     * level warp is af-gated, their `d = true` is not (G5) -- and native
+     * models them as level_reload_requested, the field below.
      *
      * So it is a one-shot latch with a single producer and a single consumer:
      * completion arms it, the next tick that runs after control returns to the
@@ -318,12 +319,12 @@ typedef struct BounceGame {
      */
     bool deferred_init;
     /*
-     * STEP 65-B2 -- af_reload_requested, the e.java:340/:345 half of b.d.
+     * STEP 65-B2 -- level_reload_requested, the e.java:340/:345 half of b.d.
      *
-     * game.h:297-299 above records, for deferred_init, that "the two remaining
-     * `this.d = true` writes at e.java:340 and :345 belong to the af-gated
-     * debug level-skip keys and have no native counterpart". This field is the
-     * missing half of that statement. Java writes the SAME variable from all
+     * game.h:297-299 above records, for deferred_init, that the two remaining
+     * `this.d = true` writes at e.java:340 and :345 belong to the debug keys
+     * '1'/'3' (level warp af-gated, request not -- G5). This field is their
+     * native counterpart. Java writes the SAME variable from all
      * three producers:
      *
      *   e.java:316   this.d = true;   level completion          -> deferred_init
@@ -357,8 +358,10 @@ typedef struct BounceGame {
      * before the physics body (:1001). Only the producer was missing: the sole
      * production caller passed a literal false (vertical_slice.c:5626).
      *
-     * ONE-SHOT, like its Java counterpart. Armed by the af-gated '1'/'3'
-     * consumer, consumed by exactly one reset-gate dispatch, and cleared by
+     * ONE-SHOT, like its Java counterpart. Armed by the '1'/'3' consumer --
+     * unconditionally since G5, mirroring e.java:340/:345 `this.d = true`,
+     * with only the level warp staying af-gated -- consumed by exactly one
+     * reset-gate dispatch, and cleared by
      * that consumer once the reload and the camera have both succeeded. It is
      * cleared AFTER the work rather than before, because the clear inside
      * bounce_game_load_level()'s own lifecycle does not exist: that function
@@ -381,15 +384,15 @@ typedef struct BounceGame {
      * `app->flow.state == BOUNCE_APP_STATE_GAMEPLAY` gate in
      * x11_process_events, and its only consumer is inside the gameplay tick.
      */
-    bool af_reload_requested;
+    bool level_reload_requested;
     /*
      * STEP 65-H -- completion_requested, the e.java:407 half of e.e.
      *
      * THE FOURTH WRITER OF JAVA'S `e`, AND THE ONLY ONE WITH NO PRODUCER YET.
-     * game.h:297-299 above records that "the two remaining `this.d = true`
-     * writes at e.java:340 and :345 belong to the af-gated debug level-skip
-     * keys and have no native counterpart". Those two became af_reload_requested
-     * in STEP 65-B2. This field is the fourth `e` writer that remains:
+     * game.h:297-299 above records the two remaining `this.d = true` writes
+     * at e.java:340 and :345 (the debug keys '1'/'3'). Those two became
+     * level_reload_requested in STEP 65-B2. This field is the fourth `e`
+     * writer that remains:
      *
      *   e.java:407   if (this.af) this.e = true;    <- W1, getGameAction == 8
      *
@@ -405,14 +408,14 @@ typedef struct BounceGame {
      * timing genuinely differs from its trigger, so it is the one writer that
      * needs state.
      *
-     * WHY NOT af_reload_requested. That field is the same SHAPE -- written from
+     * WHY NOT level_reload_requested. That field is the same SHAPE -- written from
      * the input callback, consumed by the next tick, cleared after consumption
      * -- but a different MEANING, and STEP 65-G classified it B rather than A for
      * exactly this reason. It carries a target level id in flow.level_id and its
      * consumer performs a level reload. This field carries no payload and its
      * consumer performs the completion pipeline. Sharing one flag would force
      * either two meanings onto one boolean or the reload path to run completion
-     * as well. The timings also differ and must not be merged: af_reload_requested
+     * as well. The timings also differ and must not be merged: level_reload_requested
      * is consumed BEFORE that tick's physics (the RESET_GATE arm returns from
      * bounce_game_tick_dispatch at game.c:926, ahead of timer_record_dispatch at
      * :970 and the body at :1001), whereas this field is consumed AFTER physics,
@@ -439,7 +442,7 @@ typedef struct BounceGame {
      * it does not recover the mapping it stands in for.
      *
      * The memset in bounce_game_init (game.c:132) supplies the false initial
-     * value, the same path that supplies af and af_reload_requested, and
+     * value, the same path that supplies af and level_reload_requested, and
      * bounce_game_release_level clears level_complete beside it, so no stale
      * request can survive into a new level and no initialiser is added.
      */
