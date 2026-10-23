@@ -77,6 +77,10 @@ Provenance for every source consulted — the base repository this project deriv
 from, the external references, and the evidence hierarchy that ranks them — is
 recorded in [`reverse/EXTERNAL-SOURCES-REGISTRY.md`](reverse/EXTERNAL-SOURCES-REGISTRY.md).
 
+Full feature-parity audit of the native port against the recovered Java source
+(what is implemented, what deviates, what is missing) is recorded in
+[`audit/java-source-parity/audit-report.md`](audit/java-source-parity/audit-report.md).
+
 Attribution: the base repository and recovered Java/resources originate from
 [rndtrash/nokia-bounce-decomp](https://github.com/rndtrash/nokia-bounce-decomp).
 
