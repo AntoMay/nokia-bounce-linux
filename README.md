@@ -8,44 +8,56 @@
 
 ## Screenshots
 
+Every image is a render of the current native build (native output is
+128x128, shown here scaled to 2x), produced by
+`./native/app/bounce_vertical_slice --screenshots=DIR`. The self-test
+`README-SHOTS` fails `make check` if the gallery and the `screenshots`
+directory ever drift apart: a link that resolves to nothing, or a render the
+gallery never shows, both fail.
+
 ### Game
 
-![Title Screen](screenshots/title-screen.png)
-
-![Main Menu](screenshots/main-menu.png)
-
-![Level Select](screenshots/level-select.png)
-
-![Level Select with progress](screenshots/level-select-progress.png)
-
-![Instructions](screenshots/instructions.png)
-
-![Gameplay on Level 1](screenshots/gameplay-level-1.png)
-
-![High Score](screenshots/high-score.png)
+<table>
+  <tr>
+    <td align="center"><img src="screenshots/title-screen.png" width="256" alt="Title Screen"><br>Title Screen</td>
+    <td align="center"><img src="screenshots/main-menu.png" width="256" alt="Main Menu"><br>Main Menu</td>
+    <td align="center"><img src="screenshots/level-select.png" width="256" alt="Level Select"><br>Level Select</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="screenshots/level-select-progress.png" width="256" alt="Level Select with progress"><br>Level Select with progress</td>
+    <td align="center"><img src="screenshots/instructions.png" width="256" alt="Instructions"><br>Instructions</td>
+    <td align="center"><img src="screenshots/gameplay-level-1.png" width="256" alt="Gameplay on Level 1"><br>Gameplay on Level 1</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="screenshots/high-score.png" width="256" alt="High Score"><br>High Score</td>
+  </tr>
+</table>
 
 ### Settings
 
-![Settings Menu](screenshots/settings-menu.png)
-
-![Settings: Language](screenshots/settings-language.png)
-
-![Settings: Theme](screenshots/settings-theme.png)
-
-![Settings: Audio](screenshots/settings-audio.png)
-
-![Settings: Input and Keypad](screenshots/settings-input-keypad.png)
-
-![Reset to Default, awaiting confirmation](screenshots/settings-reset-confirm.png)
+<table>
+  <tr>
+    <td align="center"><img src="screenshots/settings-menu.png" width="256" alt="Settings Menu"><br>Settings Menu</td>
+    <td align="center"><img src="screenshots/settings-language.png" width="256" alt="Settings: Language"><br>Settings: Language</td>
+    <td align="center"><img src="screenshots/settings-theme.png" width="256" alt="Settings: Theme"><br>Settings: Theme</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="screenshots/settings-audio.png" width="256" alt="Settings: Audio"><br>Settings: Audio</td>
+    <td align="center"><img src="screenshots/settings-input-keypad.png" width="256" alt="Settings: Input and Keypad"><br>Settings: Input and Keypad</td>
+    <td align="center"><img src="screenshots/settings-reset-confirm.png" width="256" alt="Reset to Default, awaiting confirmation"><br>Reset to Default, awaiting confirmation</td>
+  </tr>
+</table>
 
 ### About
 
-![About](screenshots/about.png)
+<table>
+  <tr>
+    <td align="center"><img src="screenshots/about.png" width="256" alt="About"><br>About</td>
+  </tr>
+</table>
 
-Every image above is a render of the current native build, produced by
-`./native/app/bounce_vertical_slice --screenshots=DIR`. There is no separate
-standalone language screen in this build: language is chosen from
-Settings -> Language, which is the second Settings image above.
+There is no separate standalone language screen in this build: language is
+chosen from Settings -> Language, which is the second Settings image above.
 
 # Nokia Bounce Decomp
 
