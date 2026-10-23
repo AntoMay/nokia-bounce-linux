@@ -9153,41 +9153,33 @@ static void app_refresh_continue_availability(BounceApp *app)
         || app->flow.state != BOUNCE_APP_STATE_MENU
         || app->flow.menu.pending_action != BOUNCE_MENU_ACTION_NONE)
         return;
-    (void)bounce_persistence_load_record3(&record, &present);
+
     /*
-     * D-03/D-04 -- J == 1 OR J == 2, which is the source's own predicate.
+     * G1 -- K == 1 LIVE SESSION CONTINUE.
      *
-     * BounceGame.java:116 appends the Continue row when
+     * Java's Continue predicate: this.K == 1 || this.J == 1 || this.J == 2.
+     * J == 1 / J == 2 come from Record 3 (b1 == 1 / b1 == 2).
+     * K == 1 is the live session after focus loss -- no Record 3 entry exists,
+     * but the level IS loaded in memory (runtime, player, camera state intact).
      *
-     *     this.K == 1 || this.J == 1 || this.J == 2
-     *
-     * and LoadRecords() assigns J straight from the record's b1 byte
-     * (BounceGame.java:293, `this.J = recordDIS.readByte();`), zeroing it only if
-     * the trailing magic does not match (:330-331) or anything throws (:332-333).
-     * WriteToStore(3) is what chooses that byte, at BounceGame.java:354-359:
-     *
-     *     b1 = 0;
-     *     if (this.K == 1) {
-     *         b1 = 1;
-     *     } else if (this.K == 5) {
-     *         b1 = 2;
-     *     }
-     *
-     * So b1 == 1 is "written while playing a level" and b1 == 2 is "written on the
-     * level-complete screen", and BOTH of them make Java offer Continue.
-     * Before D-03 this tested b1 == 1 alone, so a b1 == 2 store showed a
-     * Continue row that could never work: the row was appended and the SELECT
-     * handler then refused the record.
-     *
-     * b1 == 0 is still refused, and that is correct rather than lenient: it is
-     * Java's J == 0, produced whenever K was neither 1 nor 5, and commandAction's
-     * `else if (this.J != 0)` has no branch for it.
+     * Native equivalent: a level is loaded (runtime != NULL, player.initialized)
+     * while in MENU state. This is set by app_apply_focus_lost() via
+     * live_session_resume flag.
      */
+    bool live_session = false;
+    if (app->level != NULL
+        && app->runtime != NULL
+        && app->player.initialized
+        && app->live_session_resume)
+        live_session = true;
+
+    (void)bounce_persistence_load_record3(&record, &present);
     (void)bounce_app_flow_menu_set_continue_available(
         &app->flow,
-        present && (record.b1 == BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL
-                    || record.b1
-                        == BOUNCE_PERSISTENCE_RECORD3_B1_LEVEL_COMPLETE)
+        live_session
+        || (present && (record.b1 == BOUNCE_PERSISTENCE_RECORD3_B1_IN_LEVEL
+                        || record.b1
+                            == BOUNCE_PERSISTENCE_RECORD3_B1_LEVEL_COMPLETE))
     );
 }
 
@@ -9277,6 +9269,44 @@ static int app_begin_resume_from_menu(BounceApp *app)
                 (int) record.lives
             ) != 0) {
             app->continue_record_pending = false;
+            return 1;
+        }
+        return 0;
+    }
+
+    /*
+     * G1 -- THE THIRD ROUTE, `K == 1` LIVE SESSION RESUME.
+     *
+     * Java's K == 1 branch (BounceGame.java:223-224):
+     *
+     *     if (this.K == 1) {
+     *         a(false, this.v.level);
+     *     }
+     *
+     * K == 1 means the app was backgrounded mid-level (hideNotify called
+     * ShowMainMenu()). The canvas outlives the menu, so Continue resumes the
+     * SAME canvas -- no level load, no position restore, no InitializeGame().
+     *
+     * Native's focus-loss route (app_apply_focus_lost) transitions to MENU but
+     * does NOT release the level -- the runtime tiles, player, camera and timer
+     * state remain in memory. The live_session_resume flag was armed by
+     * app_apply_focus_lost() when the level was loaded.
+     *
+     * This branch handles that case: we resume directly from the in-memory state,
+     * skipping the staged chain's level load, player init, runtime init and
+     * camera init. Only the timer is (re)started.
+     *
+     * The payload is the CURRENT in-memory state: level, runtime, player, score,
+     * lives, power-ups, dyn-thorns, camera position. No Record 3 load needed.
+     */
+    if (app->live_session_resume) {
+        app->live_session_resume = false;  /* one-shot */
+        if (bounce_app_flow_begin_live_session_entry(
+                &app->flow,
+                app->level_id,
+                app->lives,
+                app->score
+            ) != 0) {
             return 1;
         }
         return 0;
@@ -9632,6 +9662,28 @@ static int app_update_production_game(BounceApp *app)
         return -1;
     if (app_canonical_gameplay_active(app))
         return app_run_canonical_gameplay_tick(app);
+
+    /*
+     * G1 -- K == 1 LIVE SESSION RESUME.
+     *
+     * After bounce_app_flow_begin_live_session_entry(), the flow is at
+     * LEVEL_LOADED with phase GAMEPLAY_ACTIVATED, but the timer is not
+     * started and the state is LEVEL_LOADED (not GAMEPLAY). We need to
+     * initialize the timer and transition to GAMEPLAY state to start the
+     * canonical tick loop.
+     */
+    if (app->flow.state == BOUNCE_APP_STATE_LEVEL_LOADED
+        && app->flow.gameplay_entry.phase
+            == BOUNCE_GAMEPLAY_ENTRY_PHASE_ACTIVATED
+        && app->flow.gameplay_entry.gameplay_activated
+        && !bounce_game_timer_is_started(&app->game_timer)) {
+        if (bounce_game_initialize_game_timer(app) != 0)
+            return -1;
+        app->flow.state = BOUNCE_APP_STATE_GAMEPLAY;
+        app->canonical_next_tick_ms = 0;
+        return app_run_canonical_gameplay_tick(app);
+    }
+
     /*
      * CANONICAL GAMEPLAY HAS ENDED. Return without routing anywhere.
      *
@@ -28280,7 +28332,29 @@ static int app_apply_focus_lost(BounceApp *app)
      * Record 3 writer -- is reached from commandAction's
      * `display.getCurrent() == this.c` branch (BounceGame.java:256-258), which
      * focus loss never is. That is the point D-14 turns on.
+     *
+     * G1 -- LIVE SESSION K == 1.
+     *
+     * Java's hideNotify (e.java:473-480) calls ShowMainMenu() but does NOT
+     * destroy the canvas. K stays 1, and the canvas with its loaded level,
+     * mutable tiles, player position and timer state all survive behind the
+     * menu. When the player selects Continue, Java calls a(false, level)
+     * which resumes the SAME canvas -- no level load, no InitializeGame().
+     *
+     * Native's focus-loss route transitions to MENU via bounce_game_apply_event
+     * (which calls enter_menu() and stops the timer) but does NOT release the
+     * level -- the runtime tiles, player, camera and timer state remain in
+     * memory. This is the native equivalent of Java's K == 1.
+     *
+     * We arm live_session_resume here so that app_refresh_continue_availability()
+     * enables the Continue row, and app_begin_resume_from_menu() resumes directly
+     * from the in-memory state.
      */
+    if (app->level != NULL
+        && app->runtime != NULL
+        && app->player.initialized)
+        app->live_session_resume = true;
+
     if (bounce_game_apply_event(app, BOUNCE_APP_EVENT_MENU) != 0)
         return -1;
     return 1;

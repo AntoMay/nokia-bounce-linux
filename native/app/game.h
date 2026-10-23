@@ -562,6 +562,41 @@ typedef struct BounceGame {
      */
     bool continue_record_pending;
     /*
+     * G1 -- live_session_resume, the K == 1 one-shot latch.
+     *
+     * JAVA EVIDENCE. BounceGame.java:223-224:
+     *
+     *     if (this.K == 1) {
+     *         a(false, this.v.level);
+     *     }
+     *
+     * K == 1 means "the app was backgrounded mid-level and hideNotify called
+     * ShowMainMenu()". The canvas outlives the menu, so when the player selects
+     * Continue, the SAME canvas is brought back -- no level load, no position
+     * restore, no InitializeGame(). The game simply resumes from exactly where it
+     * left off, with the same mutable tiles, collected hoops, dyn-thorn offsets,
+     * player position, power-ups and timer state.
+     *
+     * NATIVE CONTEXT. The focus-loss route (app_apply_focus_lost) transitions to
+     * MENU but does NOT release the level -- the runtime tiles, player and camera
+     * state remain in memory. This is the native equivalent of Java's K == 1.
+     * However, the menu's Continue row is gated on `continue_available`, which is
+     * derived only from Record 3 (b1 == 1 or 2). The live session has no Record 3
+     * entry (focus loss is not destroyApp), so the row stays hidden.
+     *
+     * THIS FLAG bridges the gap. It is set by app_apply_focus_lost() when a level
+     * is loaded in memory, and consumed by the Continue handler to resume directly
+     * from the in-memory state -- skipping the staged chain's level load, player
+     * init, runtime init and camera init. Only the timer is (re)started.
+     *
+     * LIFECYCLE. Set by app_apply_focus_lost() when transitioning from GAMEPLAY
+     * to MENU with a live level. Consumed once by app_begin_resume_from_menu()
+     * and cleared there. bounce_game_init's memset supplies false. It is NOT
+     * cleared by bounce_game_release_level() -- the whole point is that the
+     * session survives the menu visit.
+     */
+    bool live_session_resume;
+    /*
      * e.TODO_ExitUnlocked - set once HoopsScored reaches HoopsTotal
      * (e.java:284-285). It is NOT completion: the source keeps four further
      * gates between this flag and the completion pipeline (e.java:286 window

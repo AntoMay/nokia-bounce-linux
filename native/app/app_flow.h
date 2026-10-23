@@ -1115,6 +1115,23 @@ int bounce_app_flow_begin_resume_entry(
     int lives
 );
 
+/*
+ * G1 -- K == 1 LIVE SESSION RESUME ENTRY.
+ *
+ * See bounce_app_flow_begin_live_session_entry() in app_flow.c for the
+ * full rationale. This re-enters the SAME canvas (level already loaded,
+ * player/runtime/camera initialized). Only the timer is initialized.
+ *
+ * Returns 0, or -1 for a NULL flow, a non-MENU state, a level outside
+ * 1..BOUNCE_APP_LAST_LEVEL_ID, or a negative score or lives.
+ */
+int bounce_app_flow_begin_live_session_entry(
+    BounceAppFlow *flow,
+    int level_id,
+    int lives,
+    int score
+);
+
 /* Read-only accessors for the recorded entry metadata. */
 int bounce_app_flow_entry_level_id(const BounceAppFlow *flow);
 int bounce_app_flow_entry_initial_score(const BounceAppFlow *flow);

@@ -1445,6 +1445,94 @@ int bounce_app_flow_begin_resume_entry(
     return 0;
 }
 
+/*
+ * G1 -- K == 1 LIVE SESSION RESUME ENTRY.
+ *
+ * Java's K == 1 branch (BounceGame.java:223-224):
+ *
+ *     if (this.K == 1) {
+ *         a(false, this.v.level);
+ *     }
+ *
+ * This re-enters the SAME canvas -- no level load, no position restore,
+ * no InitializeGame(). The timer is restarted (StartGameTimer() at :234).
+ *
+ * NATIVE IMPLEMENTATION. The focus-loss route leaves the level, runtime,
+ * player and camera state intact in memory. This function records the
+ * START_LEVEL event and advances the flow directly to the ACTIVATED phase,
+ * skipping the level load, player init, runtime init and camera init stages.
+ * Only the timer is initialized.
+ *
+ * The caller (app_begin_resume_from_menu) guarantees:
+ *   - app->level, app->runtime, app->player are all valid and initialized
+ *   - app->level_id, app->lives, app->score are current
+ *
+ * This function records the flow state to match the staged chain's final
+ * ACTIVATED phase, then initializes the timer.
+ */
+int bounce_app_flow_begin_live_session_entry(
+    BounceAppFlow *flow,
+    int level_id,
+    int lives,
+    int score
+){
+    if (flow == NULL
+        || flow->state != BOUNCE_APP_STATE_MENU
+        || level_id < BOUNCE_APP_FIRST_LEVEL_ID
+        || level_id > BOUNCE_APP_LAST_LEVEL_ID
+        || lives < 0
+        || score < 0)
+        return -1;
+
+    /*
+     * Record START_LEVEL to maintain the same flow invariants as the staged
+     * chain. The level_id and lives are recorded; score is stored in the
+     * gameplay_entry carrier for the staged chain's stage 5 to read.
+     */
+    bounce_app_flow_record_start_level(flow, level_id);
+    flow->state = BOUNCE_APP_STATE_ACTION_BOUNDARY;
+    flow->next_tick_ms = 0;
+
+    /*
+     * new_game_score_reset_pending is deliberately NOT set. It is the New Game
+     * and Level Selection signal, consumed at stage 5 to trigger
+     * bounce_game_reset_score(). Java's K == 1 branch does NOT reset score
+     * (e.java:234 calls a(false, level), which does not touch score).
+     * Leaving the flag clear preserves the live score.
+     */
+
+    /*
+     * Skip the staged chain entirely. Record the flow as if all stages
+     * completed successfully, matching the final ACTIVATED state of the
+     * staged chain. The level, runtime and player are already in place.
+     */
+    if (bounce_app_flow_begin_gameplay_entry(flow) != 0)
+        return -1;
+
+    /*
+     * The staged chain would normally record LEVEL_LOADED, PLAYER_INITIALIZED,
+     * RUNTIME_INITIALIZED, CAMERA_INITIALIZED, then GAMEPLAY_ACTIVATED.
+     * Since the level is already loaded and the player/runtime/camera are
+     * already initialized, we record these phases directly.
+     */
+    flow->gameplay_entry.phase = BOUNCE_GAMEPLAY_ENTRY_PHASE_ACTIVATED;
+    flow->gameplay_entry.level_loaded = true;
+    flow->gameplay_entry.player_created = true;
+    flow->gameplay_entry.runtime_tiles_created = true;
+    flow->gameplay_entry.camera_initialized = true;
+    flow->gameplay_entry.gameplay_activated = true;
+    flow->gameplay_entry.timer_started = false;
+
+    /* Re-apply lives and score after begin_gameplay_entry() writes its carrier. */
+    flow->gameplay_entry.initial_lives = lives;
+    flow->gameplay_entry.initial_score = score;
+
+    flow->state = BOUNCE_APP_STATE_LEVEL_LOADED;
+    flow->next_tick_ms = 0;
+
+    return 0;
+}
+
 int bounce_app_flow_record_level_loaded(BounceAppFlow *flow)
 {
     if (flow == NULL
