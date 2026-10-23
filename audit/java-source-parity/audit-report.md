@@ -61,7 +61,7 @@ are **stale** — the code has since gained them (score wiring, boost bar, GodMo
 | G5 | **Cheat keys `1`/`3` (prev/next level)** — unconditional in Java (`d=true` even without af); entire arm af-gated in native → inert without af | DEVIATES | `e.java:339-348`; `vertical_slice.c:27764-27807` |
 | G6 | **Fresh-install unlock count** — native defaults to 2 unlocked levels; Java starts `MaxLevels=0` (Continue hidden, no level select until first win) | DEVIATES — **accepted** (keep 2; owner decision 2026-10-23) | `BounceGame.java:270-286`; `app_flow.h:295`, `app_flow.c:235` |
 | G7 | **Mouse-slider volume edits not persisted** — slider click writes `flow->settings.volume` with no commit; `q`, window-close, `app_persist_records` also omit record 6. Only keyboard LEFT/RIGHT commits | **RESOLVED** (`f895aaf`) | `ui_shell.c:1983-1989`; commit edges `x11_dispatch_event` (Button1, `XK_q`, ClientMessage), `verify_volume_slider_pointer` store assertions |
-| G8 | **Big-ball settle walk side effects** — walk candidates firing tile 38/47-50/51-54/9 state writes are not reported through hazard callback; constructor walk is hazard- and pickup-inert (Java walk can trigger KillBall/crystal at spawn settle) | DEVIATES — **accepted** (keep inert; owner decision 2026-10-23) | `player.c:500-507,721-724`, `player.h:209-211`, `vertical_slice.c:3938-3947` |
+| G8 | **Big-ball settle walk side effects** — state-write tiles 38/47-50/51-54 now reported through the hazard callback and dispatched to shared producer helpers (STEP 38-S, `app_activate_gravity/jump/speed_powerup`); the runtime walks (death respawn, pumper growth, pumper recursion) reproduce Java's walk-side effects. **Remaining sub-item**: the level-start constructor form (`bounce_player_use_big_ball_level`, game.c) is still inert — closing it needs the walk moved into the entry chain after runtime creation (phase-fixture churn) | **RESOLVED for runtime walks**; constructor sub-item open | `player.c` (38-S arm), `player.h:201-212`, `vertical_slice.c` (helpers, consumer arms, `verify_settle_walk_powerup_side_effects`) |
 | G9 | **Dirty-tile incremental repaint / E-buffer staging / out-of-level BRICK border** — `0x80` bits written+masked but never drive incremental redraw (full redraw each frame); E parallax double-draw and border stamp absent | NOT IMPLEMENTED (output-equivalent, deliberate) | `b.java:401-404,609-623`, `e.java:162-170`; `vertical_slice.c:7047-7088` |
 | G10 | **Placeholder 5×7 fonts** instead of `Font.getFont(32,0,8)` device glyphs (layout/anchors match, shapes do not) | DEVIATES | `e.java:45`; `visual_assets.c:1288,1352` |
 | G11 | **HUD dirty flag `y`** has no counterpart; HUD redrawn every frame (state-incomplete, output-equivalent). Some native comments claiming score/boostbar missing are **stale** | PARTIAL (deliberate) | `f.java:223,613`, `e.java:174,188,306-307`; `vertical_slice.c:6304-6317` (stale) |
@@ -133,7 +133,7 @@ Rubber charge: `v` latch producers (`vs:3724` first-blocker), A1 landing `t += �
 
 ### 1.6 Top gameplay deviations
 
-1. **G8** — settle-walk side effects suppressed (tile 38/47-54/9 state writes not reported; constructor walk hazard-inert) — accepted (owner decision 2026-10-23). Reachable: crystal near L6 pumper, thorn near L8 pumper (`vs:4186-4190`).
+1. **G8** — runtime walks (death respawn, pumper growth, pumper recursion) now reproduce Java's walk-side effects including the power-up state writes (STEP 38-S, owner decision reversed 2026-10-23). **Remaining**: the level-start constructor form (`bounce_player_use_big_ball_level`) is still inert; closing it needs the walk moved into the entry chain after runtime creation. Reachable cases covered: crystal near L6 pumper, thorn near L8 pumper, gravity/jump/speed during growth (`vs:4186-4190`).
 2. **G11** — HUD dirty flag `y` not modeled; stale native comments claim score/boostbar missing (they exist).
 3. **G9** — E-buffer background wrap absent (rendering scope).
 4. **G12** — deferred timer stop (documented, same-frame equivalent).
@@ -261,7 +261,7 @@ Extensions: mouse UI, `Escape`, `q`, T9 controller mode.
 | 2 | G4 | Locale autodetect (+ optional language persistence) | Small |
 | 3 | G5 | Un-gate `1`/`3` keys to match Java (`d=true` unconditional) | Small |
 | 3 | G6 | ~~Fresh-install unlock count 2 → 0~~ — **decided: keep 2** (accepted deviation) | done (decision) |
-| 3 | G8 | ~~Settle-walk hazard/pickup side effects~~ — **decided: keep inert** (accepted deviation) | done (decision) |
+| 3 | G8 | Settle-walk side effects — runtime walks done (STEP 38-S: state-write tiles 38/47-54 reported → shared producer helpers; verify added); constructor form at level start still inert (needs entry-chain move) | done (runtime) / open (constructor) |
 | 4 | G13 | Escape-from-pause runtime case; wire `input.pause` consumer | Small |
 | 4 | G10 | Font glyph fidelity (device font recreation) | Large, cosmetic |
 | 5 | G9, G11, G12, G14 | Deliberate/structural deviations — document, likely accept | — |

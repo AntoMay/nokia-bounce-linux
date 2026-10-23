@@ -2157,6 +2157,34 @@ static int app_consume_extra_life(
     uint32_t tile_id
 );
 
+/*
+ * STEP 38-S -- the three STATE-WRITE power-up producer helpers. Extracted from
+ * the app_vertical_collision_info() chain VERBATIM (write, STEP 13E
+ * observation, STEP 14B-27 emission, in the original assignment order) so the
+ * settle-walk consumer below and the ordinary path share ONE implementation
+ * per producer, exactly as app_consume_crystal() / app_consume_extra_life()
+ * are shared with STEP 38-Q. Forward-declared here because the walk consumer
+ * at app_pumper_walk_hazard() precedes their definitions.
+ */
+static void app_activate_gravity_powerup(
+    BounceApp *app,
+    uint32_t tile_id,
+    int32_t tile_x,
+    int32_t tile_y
+);
+static void app_activate_jump_powerup(
+    BounceApp *app,
+    uint32_t tile_id,
+    int32_t tile_x,
+    int32_t tile_y
+);
+static void app_activate_speed_powerup(
+    BounceApp *app,
+    uint32_t tile_id,
+    int32_t tile_x,
+    int32_t tile_y
+);
+
 static void app_pumper_walk_hazard(
     void *context,
     int32_t tile_x,
@@ -2186,9 +2214,14 @@ static void app_pumper_walk_hazard(
      * app_collect_hoop() already takes, and a read failure leaves the tile
      * unconsumed rather than inventing a value.
      *
-     * Nothing else is dispatched. Ids 9, 38, 47-50 and 51-54 set a state field but
-     * write no tile, so they are not consumed and are never reported; 39-42 and
-     * 43-46 keep their own existing arms in the walk and never reach here.
+     * STEP 38-R AND 38-S EXTEND THIS DISPATCH, again through the same channel and
+     * again by reuse: tile 22 and the exit door 9 reach the existing hoop and
+     * completion sites below, and the three STATE-WRITE power-up producers -- 38,
+     * gravity 47-50 and jump 51-54 -- are dispatched to the SAME producer helpers
+     * app_vertical_collision_info() calls. None of these ids is consumed; the walk
+     * re-reports them on every covering probe, which is the source's per-probe
+     * re-entry in f.a(). Only 39-42 and 43-46 keep their own arms in the walk and
+     * never reach here.
      */
     if (tile_id == 7u) {
         (void)app_consume_crystal(app, (int)tile_x, (int)tile_y, tile_id);
@@ -2302,6 +2335,33 @@ static void app_pumper_walk_hazard(
                 tile_y
             );
             (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_UP);
+        }
+        return;
+    }
+    /*
+     * STEP 38-S -- the three STATE-WRITE power-up producers, dispatched to the
+     * SAME producer helpers app_vertical_collision_info() calls, so the walk
+     * route and the ordinary route share one implementation per producer, as
+     * STEP 38-Q did for the consumed pickups.
+     *
+     *   f.java:630-635  47-50 -> app_activate_gravity_powerup()
+     *   f.java:636-640  51-54 -> app_activate_jump_powerup()
+     *   f.java:641-645  38    -> app_activate_speed_powerup()
+     *
+     * Like tile 9 above and unlike the consumed pickups, these ids write no
+     * LevelTiles, so they are not consumed and the walk re-reports them on
+     * every covering probe -- the source's per-probe re-entry in f.a(), where
+     * each hit re-sets 300 rather than accumulating.
+     */
+    if (tile_id == 38u) {
+        app_activate_speed_powerup(app, tile_id, tile_x, tile_y);
+        return;
+    }
+    if (tile_id >= 47u && tile_id <= 54u) {
+        if (tile_id <= 50u) {
+            app_activate_gravity_powerup(app, tile_id, tile_x, tile_y);
+        } else {
+            app_activate_jump_powerup(app, tile_id, tile_x, tile_y);
         }
         return;
     }
@@ -3190,6 +3250,118 @@ static int app_consume_extra_life(
     return 0;
 }
 
+/*
+ * STEP 38-S -- the three STATE-WRITE power-up producers, extracted from the
+ * app_vertical_collision_info() chain so the settle-walk consumer
+ * (app_pumper_walk_hazard) and the ordinary path share ONE implementation per
+ * producer, exactly as app_consume_crystal() is shared with STEP 38-Q.
+ *
+ * GRAVITY, f.java:630-635 (tile ids 47-50):
+ *   f.java:631  this.powerUpGravity = 300;
+ *   f.java:632  sound = this.n.soundPickup;   (STEP 14B-27 emission)
+ *   f.java:633  this.m = false;
+ *   f.java:634  bool = false;                 (the pure predicate's verdict)
+ *
+ * The writes are unconditional (f.a() never reads m before :631) and are plain
+ * assignments, so re-entry re-sets 300 rather than accumulating. The STEP 13E
+ * observation follows the writes and the emission follows the observation, the
+ * exact order the inline site always had. The blocking verdict is NOT written
+ * here: it is produced by the pure predicates on both routes, as documented at
+ * the ordinary site.
+ */
+static void app_activate_gravity_powerup(
+    BounceApp *app,
+    uint32_t tile_id,
+    int32_t tile_x,
+    int32_t tile_y
+)
+{
+    app->player.powerUpGravity = 300;
+    app->player.m = false;
+    /* STEP 13E: observation only, after the effects above. */
+    bounce_debug_tile(
+        app_debug(app),
+        app,
+        BOUNCE_DEBUG_TILE_GRAVITY,
+        tile_id,
+        tile_x,
+        tile_y
+    );
+    /*
+     * STEP 14B-27 -- LAYER B AUDIO EVENT: gravity sound identity.
+     * e.java:69 maps soundPickup to "/sounds/pickup.ott"; the second distinct
+     * cause mapped onto the PICKUP identity. Synchronous; delivered in program
+     * order to whatever sink is installed.
+     */
+    (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_PICKUP);
+}
+
+/*
+ * JUMP, f.java:636-640 (tile ids 51-54):
+ *   f.java:637  this.TODO_somePowerUp3 = 300;
+ *   f.java:638  sound = this.n.soundPickup;   (STEP 14B-27 emission)
+ *   f.java:639  bool = false;                 (the pure predicate's verdict)
+ *
+ * No m assignment, unlike gravity: f.java:636-640 has none, so m is left
+ * exactly as the surrounding verdict code left it. The same unconditional
+ * plain-assignment and ordering properties as the gravity helper apply.
+ */
+static void app_activate_jump_powerup(
+    BounceApp *app,
+    uint32_t tile_id,
+    int32_t tile_x,
+    int32_t tile_y
+)
+{
+    app->player.TODO_somePowerUp3 = 300;
+    /* STEP 13E: observation only, after the effect above. */
+    bounce_debug_tile(
+        app_debug(app),
+        app,
+        BOUNCE_DEBUG_TILE_BOOST,
+        tile_id,
+        tile_x,
+        tile_y
+    );
+    /*
+     * STEP 14B-27 -- LAYER B AUDIO EVENT: jump sound identity. STEP 14B-04
+     * established there is no jump-SPECIFIC resource: the original reuses
+     * soundPickup, and this emission preserves that rather than inventing an
+     * identity. Third distinct cause mapped onto the PICKUP identity.
+     */
+    (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_PICKUP);
+}
+
+/*
+ * SPEED, f.java:641-645 (tile id 38):
+ *   f.java:642  this.TODO_somePowerUp1 = 300;
+ *   f.java:643  sound = this.n.soundPickup;   (STEP 14B-27 emission)
+ *   f.java:644  bool = false;                 (the pure predicate's verdict)
+ *
+ * No m assignment and no STEP 13E observation: f.java:641-645 has neither, and
+ * the ordinary site has never emitted one for 38, so this helper does not
+ * invent one either.
+ */
+static void app_activate_speed_powerup(
+    BounceApp *app,
+    uint32_t tile_id,
+    int32_t tile_x,
+    int32_t tile_y
+)
+{
+    (void)tile_id;
+    (void)tile_x;
+    (void)tile_y;
+    app->player.TODO_somePowerUp1 = 300;
+    /*
+     * STEP 14B-27 -- LAYER B AUDIO EVENT: boost sound identity. Fourth
+     * distinct cause mapped onto the PICKUP identity -- crystal, gravity,
+     * jump and boost all play the one resource. Emitted after the write,
+     * matching the assignment order.
+     */
+    (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_PICKUP);
+}
+
 static int app_vertical_collision_info(
     BounceApp *app,
     int32_t player_x,
@@ -3839,39 +4011,18 @@ static int app_vertical_collision_info(
                  *     event was raised, never that a sound was heard.
                  */
                 if (tile_id >= 47u && tile_id <= 50u) {
-                    app->player.powerUpGravity = 300;
-                    app->player.m = false;
-                    /* STEP 13E: observation only, after the effects above. */
-                    bounce_debug_tile(
-                        app_debug(app),
-                        app,
-                        BOUNCE_DEBUG_TILE_GRAVITY,
-                        tile_id,
-                        (int32_t)tile_x,
-                        (int32_t)tile_y
-                    );
                     /*
-                     * STEP 14B-27 -- LAYER B AUDIO EVENT: gravity sound identity.
-                     *
-                     * f.java:630-635, the unnamed
-                     * `case POWER_UP_GRAVITY_UP .. POWER_UP_GRAVITY_LEFT`:
-                     *   f.java:631  this.powerUpGravity = 300;
-                     *   f.java:632  sound = this.n.soundPickup;
-                     *   f.java:633  this.m = false;
-                     *   f.java:634  bool = false;
-                     * e.java:69 maps soundPickup to "/sounds/pickup.ott".
-                     *
-                     * Emitted after both writes above, so the relative position
-                     * matches the original's assignment order. Note the
-                     * per-probe repetition documented in the block comment: this
-                     * fires once per probe, which is faithful, because the
-                     * original's f.java:773-778 path re-probes and re-enters
-                     * a() without a break.
-                     *
-                     * Second distinct cause mapped onto the PICKUP identity.
-                     * Synchronous; no playback; no sink installed yet.
+                     * STEP 38-S: the two writes, the STEP 13E observation and
+                     * the STEP 14B-27 emission are extracted VERBATIM into
+                     * app_activate_gravity_powerup() so the settle-walk
+                     * consumer shares them instead of reimplementing them.
+                     * Every ordering property documented in the block comment
+                     * above -- unconditional write, plain assignment,
+                     * observation after the writes, emission last, one
+                     * emission per probe -- holds in the helper body unchanged.
                      */
-                    (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_PICKUP);
+                    app_activate_gravity_powerup(
+                        app, tile_id, (int32_t)tile_x, (int32_t)tile_y);
                 }
                 /*
                  * STEP: TILE 51-54 PRODUCER.
@@ -3935,46 +4086,29 @@ static int app_vertical_collision_info(
                  * write was vertical-seam-only; a dynamic probe of the horizontal
                  * path falsified that claim and it was corrected here.)
                  *
-                 * NOT REPRODUCED: the UseBigBall constructor probes
-                 * (f.java:177-200) also reach f.a() in the original, so the
-                 * original can produce TODO_somePowerUp3 from the constructor as
-                 * well. The native constructor probe is pure by the documented
-                 * policy -- player.c:459 resolves the verdict through
-                 * bounce_collision_query_level() plus its own local
-                 * player_constructor_apply_collision_state(), and does not route
-                 * through this helper. That gap is pre-existing, is shared with
-                 * the gravity 47-50 producer above, and is listed in player.h's
-                 * DEFERRED set; it is neither introduced nor widened here.
+                 * REACHABLE FROM THE WALK TOO (STEP 38-S): the UseBigBall
+                 * probes (f.java:177-200) also reach f.a() in the original, and
+                 * the runtime walks -- death respawn and pumper growth -- now
+                 * route that report through app_pumper_walk_hazard() into the
+                 * same helper. Still NOT REPRODUCED at the constructor-boundary
+                 * form (bounce_player_use_big_ball_level, game.c's level-start
+                 * entry): that probe is inert by the documented policy --
+                 * player.c's player_probe_constructor() resolves the verdict
+                 * through bounce_collision_query_level() plus its own local
+                 * player_constructor_apply_collision_state() with no callback.
+                 * That remaining gap is listed in the parity audit.
                  */
                 if (tile_id >= 51u && tile_id <= 54u) {
-                    app->player.TODO_somePowerUp3 = 300;
-                    /* STEP 13E: observation only, after the effect above. */
-                    bounce_debug_tile(
-                        app_debug(app),
-                        app,
-                        BOUNCE_DEBUG_TILE_BOOST,
-                        tile_id,
-                        (int32_t)tile_x,
-                        (int32_t)tile_y
-                    );
                     /*
-                     * STEP 14B-27 -- LAYER B AUDIO EVENT: jump sound identity.
-                     *
-                     * f.java:636-640, the unnamed `case 51, 52, 53, 54`:
-                     *   f.java:637  this.TODO_somePowerUp3 = 300;
-                     *   f.java:638  sound = this.n.soundPickup;
-                     *   f.java:639  bool = false;
-                     * e.java:69 maps soundPickup to "/sounds/pickup.ott".
-                     *
-                     * STEP 14B-04 established there is no jump-SPECIFIC sound
-                     * resource: the original reuses soundPickup here, and this
-                     * emission preserves that exactly rather than inventing a
-                     * distinct identity.
-                     *
-                     * Third distinct cause mapped onto the PICKUP identity.
-                     * Synchronous; no playback; no sink installed yet.
+                     * STEP 38-S: the write, the STEP 13E observation and the
+                     * STEP 14B-27 emission are extracted VERBATIM into
+                     * app_activate_jump_powerup() so the settle-walk consumer
+                     * shares them instead of reimplementing them. Every
+                     * ordering property documented in the block comment above
+                     * holds in the helper body unchanged.
                      */
-                    (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_PICKUP);
+                    app_activate_jump_powerup(
+                        app, tile_id, (int32_t)tile_x, (int32_t)tile_y);
                 }
                 /*
                  * STEP: TILE 38 PRODUCER.
@@ -4017,32 +4151,23 @@ static int app_vertical_collision_info(
                  * the vertical primary, the vertical diagonals, the horizontal
                  * primary and the horizontal diagonals.
                  *
-                 * NOT REPRODUCED: the UseBigBall constructor probes
-                 * (f.java:177-200) also reach f.a() in the original. That gap is
-                 * pre-existing, shared with the 47-50 and 51-54 producers, and
-                 * remains listed in player.h's DEFERRED set.
+                 * REACHABLE FROM THE WALK TOO (STEP 38-S): the runtime walks
+                 * route this report through app_pumper_walk_hazard() into the
+                 * same helper. Still NOT REPRODUCED at the constructor-boundary
+                 * form, shared with the 47-50 and 51-54 producers; that
+                 * remaining gap is listed in the parity audit.
                  */
                 if (tile_id == 38u) {
-                    app->player.TODO_somePowerUp1 = 300;
                     /*
-                     * STEP 14B-27 -- LAYER B AUDIO EVENT: boost sound identity.
-                     *
-                     * f.java:641-645, the unnamed `case 38`:
-                     *   f.java:642  this.TODO_somePowerUp1 = 300;
-                     *   f.java:643  sound = this.n.soundPickup;
-                     *   f.java:644  bool = false;
-                     * e.java:69 maps soundPickup to "/sounds/pickup.ott".
-                     *
-                     * Emitted after the write, matching the assignment order.
-                     * The braces are added ONLY because an emission statement
-                     * cannot be attached to a braceless `if`; the condition, the
-                     * single write, and the branch's reachability are unchanged.
-                     *
-                     * Fourth distinct cause mapped onto the PICKUP identity --
-                     * crystal, gravity, jump and boost all play the one resource.
-                     * Synchronous; no playback; no sink installed yet.
+                     * STEP 38-S: the write and the STEP 14B-27 emission are
+                     * extracted VERBATIM into app_activate_speed_powerup() so
+                     * the settle-walk consumer shares them instead of
+                     * reimplementing them. Every ordering property documented
+                     * in the block comment above holds in the helper body
+                     * unchanged.
                      */
-                    (void)bounce_audio_event_emit(BOUNCE_AUDIO_EVENT_PICKUP);
+                    app_activate_speed_powerup(
+                        app, tile_id, (int32_t)tile_x, (int32_t)tile_y);
                 }
                 /*
                  * STEP 13G-F: TILE 39-42 PRODUCER -- the Deflater shrink.
@@ -18013,6 +18138,78 @@ static int verify_tile_51_54_powerup(void)
             /* f.java:636-640 writes no powerUpGravity. */
             || app.player.powerUpGravity != 0
             || control_x != reach_x) {
+            bounce_runtime_level_tiles_destroy(rt);
+            return -1;
+        }
+        bounce_runtime_level_tiles_destroy(rt);
+    }
+
+    return 0;
+}
+
+/*
+ * STEP 38-S -- the settle-walk state-write power-up producers.
+ *
+ * The UseBigBall walk (f.java:168-206) runs f.a() for every probed footprint
+ * tile, so in the original a gravity / jump / speed tile merely COVERED by a
+ * candidate probe -- even a probe whose candidate is rejected -- activates its
+ * power-up during the walk. Until STEP 38-S the native runtime walks (death
+ * respawn, pumper growth) suppressed exactly those three producers. This
+ * verification drives the production entry point bounce_player_use_big_ball()
+ * with the production consumer app_pumper_walk_hazard and proves the state
+ * write now happens there.
+ *
+ * The tile sits at (1,1) and the ball at (30,30), so every offset-1 candidate
+ * covers row 1 and is rejected by the pure query (38 and 47-54 are blocking
+ * verdicts, collision_query.c:638-691), the reports fire during those probes,
+ * and the walk settles further up. Asserted per id:
+ *
+ *   - the producer's state field reached 300 -- the gameplay-visible effect;
+ *   - gravity only: m was true on entry and is false after, because
+ *     f.java:633 writes m and f.java:637/:642 do not;
+ *   - cross-field silence: 52 writes no powerUpGravity, 38 writes no
+ *     TODO_somePowerUp3;
+ *   - the tile is NOT consumed: f.java:630-645 write no LevelTiles;
+ *   - the walk still returned success, i.e. the side effects are reports and
+ *     disturbed neither the search verdict nor the termination.
+ */
+static int verify_settle_walk_powerup_side_effects(void)
+{
+    static const uint32_t ids[3] = { 47u, 52u, 38u };
+    int k;
+
+    for (k = 0; k < 3; ++k) {
+        uint8_t tiles[5u * 5u];
+        BounceRuntimeLevelTiles *rt = NULL;
+        BounceApp app;
+        uint16_t stored = 0u;
+
+        memset(tiles, 0, sizeof tiles);
+        tiles[1u * 5u + 1u] = (uint8_t)ids[k];
+        if (create_synthetic_runtime(5u, 5u, tiles, &rt) != 0)
+            return -1;
+        init_static_response_app(&app, rt, 30, 30, 0, 0);
+        /* bounce_player_use_big_ball_probe() requires the initialized flag. */
+        app.player.initialized = true;
+        /* Only the gravity case writes m (f.java:633). */
+        app.player.m = true;
+        if (bounce_player_use_big_ball(
+                &app.player, rt, app_pumper_walk_hazard, &app) != 0
+            /* f.java:174 the walk re-asserts the big ball. */
+            || app.player.ballSize != 16
+            || app.player.p != 8
+            /* f.java:631 / :637 / :642, per id. */
+            || (ids[k] == 47u
+                && (app.player.powerUpGravity != 300 || app.player.m))
+            || (ids[k] == 52u
+                && (app.player.TODO_somePowerUp3 != 300
+                    || app.player.powerUpGravity != 0))
+            || (ids[k] == 38u
+                && (app.player.TODO_somePowerUp1 != 300
+                    || app.player.TODO_somePowerUp3 != 0))
+            /* f.java:630-645 write no LevelTiles: the tile stays collidable. */
+            || bounce_runtime_level_tiles_get(rt, 1, 1, &stored) != 0
+            || stored != (uint16_t)ids[k]) {
             bounce_runtime_level_tiles_destroy(rt);
             return -1;
         }
@@ -37546,6 +37743,10 @@ int main(int argc, char **argv)
     }
     if (verify_tile_51_54_powerup() != 0) {
         fprintf(stderr, "f.java:636-640 tile 51-54 powerup failed\n");
+        goto cleanup;
+    }
+    if (verify_settle_walk_powerup_side_effects() != 0) {
+        fprintf(stderr, "STEP 38-S settle-walk powerup side effects failed\n");
         goto cleanup;
     }
     if (verify_static_wall_response() != 0) {

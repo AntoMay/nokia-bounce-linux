@@ -331,21 +331,26 @@ static void player_apply_slope_response(
  *   f.java:460  tiles 30-33 blocking       -> slope response, u
  *   f.java:618-621 tiles 39-42             -> deflate
  *
- * NOT REPRODUCED, deliberately, per the deferral list: hoops, crystals, the
- * extra life, the gravity/jump/speed power-ups, KillBall, level completion,
- * TODO_somePowerUp1, audio, and every LevelTiles rewrite.  Two consequences
- * are worth stating plainly:
+ * REPORTED TO THE OWNER, NOT PERFORMED HERE (STEP 38-P/Q/R/S): KillBall through
+ * the hazard callback, the consumed pickups (crystal, hoops, extra life), the
+ * non-blocking hoop 22, the exit door 9, and the three state-write power-up
+ * producers 38 / 47-50 / 51-54.  The callback is optional: the
+ * constructor-boundary form passes NULL and this pass is inert on that entry,
+ * which is the remaining deferral recorded in the parity audit.  Two
+ * consequences are worth stating plainly:
  *
- *   - f.java:427-428 short-circuits every tile once z == 2.  KillBall is not
- *     reproduced, so z cannot become 2 here; the guard is kept because it is
- *     the source's own and because this function's result is not used as a
- *     verdict.
- *   - Interaction tiles that the source blocks WITHOUT any geometry test --
- *     tile 38 at f.java:641-645, tiles 51-54 at :636-640, and the
- *     gravity power-up at :630-635 -- are not treated as blocking here, which
- *     matches the pure query this walk has always used and keeps the existing
- *     walk geometry unchanged.  Their side effects are deferred, so the only
- *     cost is that the walk passes through them, exactly as before.
+ *   - f.java:427-428 short-circuits every tile once z == 2.  The hazard arms
+ *     report outward; z itself is written by the owner's app_kill_ball(), never
+ *     here, so this function still cannot observe the source's short-circuit.
+ *     The guard is kept because it is the source's own and because this
+ *     function's result is not used as a verdict.
+ *   - The interaction tiles the source blocks WITHOUT any geometry test --
+ *     tile 38 at f.java:641-645, tiles 51-54 at :636-640, and the gravity
+ *     power-up at :630-635 -- are blocking here through the same pure
+ *     predicate the walk has always used: java_interaction_collision() returns
+ *     true for 38 and 47-54 (collision_query.c:638-691), so
+ *     bounce_collision_tile_overlaps() admits them and STEP 38-S reports them
+ *     in the same pass.  Their state writes and audio remain the owner's.
  */
 static void player_constructor_apply_collision_state(
     BouncePlayer *player,
@@ -594,6 +599,64 @@ static void player_constructor_apply_collision_state(
                             tile_id
                         );
                     }
+                } else if (tile_id == 38u
+                    || (tile_id >= 47u && tile_id <= 54u)) {
+                    /*
+                     * STEP 38-S -- the three STATE-WRITE power-up producers.
+                     *
+                     * f.java:630-645, in source order:
+                     *
+                     *   630  case POWER_UP_GRAVITY_UP .. _LEFT (47-50) ->
+                     *   631      this.powerUpGravity = 300;
+                     *   632      sound = this.n.soundPickup;
+                     *   633      this.m = false;
+                     *   636  case 51, 52, 53, 54 ->
+                     *   637      this.TODO_somePowerUp3 = 300;
+                     *   638      sound = this.n.soundPickup;
+                     *   641  case 38 ->
+                     *   642      this.TODO_somePowerUp1 = 300;
+                     *   643      sound = this.n.soundPickup;
+                     *
+                     * Each case then assigns `bool = false` (:634, :639, :644),
+                     * the blocking verdict, and that verdict is already
+                     * established here: java_interaction_collision() returns
+                     * true for 38 and 47-54 with no geometry test of its own
+                     * (collision_query.c:638-691), so the enclosing
+                     * bounce_collision_tile_overlaps() admits every footprint
+                     * cell holding one of these tiles and reaching this arm IS
+                     * f.java:634/:639/:644.
+                     *
+                     * REPORTED, NOT PERFORMED, for the same ownership reason
+                     * that governs tile 22 and tile 9: the state writes and the
+                     * audio emission are the owner's. The consumer
+                     * (app_pumper_walk_hazard, STEP 38-S) dispatches each id to
+                     * the SAME producer helper
+                     * app_vertical_collision_info() calls, so the walk route
+                     * and the ordinary route share one implementation per
+                     * producer, exactly as STEP 38-Q shared the consumed
+                     * pickups.
+                     *
+                     * NOT CONSUMED. Like tile 9 and unlike the consumed
+                     * pickups, these cases write no LevelTiles, so the tile
+                     * keeps its id on later probes and stays collidable. That
+                     * is what makes the source's per-probe re-entry faithful
+                     * here too: f.a() re-runs for every probe that covers the
+                     * tile and f.java:631/:637/:642 re-set 300 rather than
+                     * accumulating.
+                     *
+                     * This arm exists for every caller of
+                     * player_constructor_apply_collision_state(); the
+                     * constructor-boundary form still supplies no callback and
+                     * stays inert on that entry, exactly as before.
+                     */
+                    if (on_hazard != NULL) {
+                        on_hazard(
+                            hazard_context,
+                            tile_x,
+                            tile_y,
+                            tile_id
+                        );
+                    }
                 } else {
                     if (tile_id == 1u)
                         player->u = true;
@@ -718,10 +781,14 @@ static bool player_probe_constructor(
      * existed. */
     fits = bounce_collision_query_level(
         x, y, half_size, probe_context->level);
-    /* STEP 38-P: the constructor-boundary form is hazard-inert. At e.java:127 the
-     * original runs the probe inside `new f(...)`, where there is no app-level
-     * death state to write, so no callback is supplied and the two hazard arms
-     * are simply not taken. */
+    /* STEP 38-P/38-R/38-S: the constructor-boundary form is inert. At e.java:127
+     * the original runs the probe inside `new f(...)`, and this native entry
+     * still runs against pristine level bytes before the app-level consumer
+     * exists, so no callback is supplied and none of the reported arms -- the
+     * hazards, the consumed pickups, tile 22/9 and the STEP 38-S power-up
+     * producers -- are taken here. The runtime walks (death respawn and pumper
+     * growth) report through app_pumper_walk_hazard; that remaining deferral
+     * for this entry is recorded in the parity audit. */
     player_constructor_apply_collision_state(
         probe_context->player,
         probe_context->view,

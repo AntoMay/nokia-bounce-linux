@@ -194,25 +194,31 @@ int bounce_player_initialize_from_level(
  * This is the same one-indirection shape as BouncePlayerFreeSpaceProbe, for the
  * same reason: the algorithm exists once and the owner supplies the effect.
  *
- * CALLED AT MOST ONCE PER CANDIDATE, and only for the two hazard cases above. The
- * caller passes the existing app-level kill operation; this module neither
- * duplicates it nor decrements lives.
+ * CALLED AT MOST ONCE PER CANDIDATE, for exactly the ids the owner's
+ * app_pumper_walk_hazard() dispatches. The caller passes the existing app-level
+ * operation; this module neither duplicates it nor decrements lives.
  *
  * STEP 38-Q EXTENDS THIS CONTRACT, without changing its shape. The walk also
  * reaches the three CONSUMED pickup classes of f.a() -- the crystal (7), the hoop
  * family (13-16 and 21-24) and the extra life (29) -- and reports them through the
  * SAME callback. No second callback and no extra parameter is needed: the reported
- * tile id discriminates the two classes disjointly, since {3,4,5,6,10} and
- * {7,13,14,15,16,21,22,23,24,29} do not overlap, so the owner selects the operation
+ * tile id discriminates the classes disjointly, so the owner selects the operation
  * from tile_id. The 38-P hazard semantics above are unchanged.
  *
- * The ids that set a state field but write no tile -- 9, 47-50, 51-54, 38 -- are
- * NOT reported, because they are not consumed and stay collidable.
+ * STEP 38-R AND 38-S EXTEND IT ONCE MORE, again without changing its shape: the
+ * non-blocking hoop 22, the exit door 9, and the three STATE-WRITE power-up
+ * producers -- 38, the gravity family 47-50 and the jump family 51-54 -- are
+ * reported through the same channel, and the owner reuses the ordinary-path
+ * operation for each. None of these ids is consumed: they write no LevelTiles and
+ * stay collidable, so the walk re-reports them on every covering probe, which is
+ * what the source's per-probe re-entry in f.a() does.
  *
- * A NULL callback is legal and makes the walk hazard- and pickup-inert, which is
- * what the constructor-boundary form bounce_player_use_big_ball_level() uses: at
- * e.java:127 the original runs the probe inside `new f(...)`, where no app-level
- * death or collection state exists to write.
+ * A NULL callback is legal and makes the walk fully inert, which is what the
+ * constructor-boundary form bounce_player_use_big_ball_level() still uses: at
+ * e.java:127 the original runs the probe inside `new f(...)`, and this native
+ * entry runs against pristine level bytes before the app-level consumer exists.
+ * The runtime walks (death respawn, pumper growth) do supply the callback; the
+ * NULL form remains a documented deferral in the parity audit.
  */
 typedef void (*BouncePlayerHazardCallback)(
     void *context,
