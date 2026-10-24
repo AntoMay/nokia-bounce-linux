@@ -54,7 +54,7 @@ are **stale** — the code has since gained them (score wiring, boost bar, GodMo
 
 | # | Gap | Status | Evidence |
 |---|---|---|---|
-| G1 | **`K==1` live-session Continue** — Java Continue restarts the in-progress level when a live session exists; native only continues from persisted snapshot | NOT IMPLEMENTED | `BounceGame.java:116,223-224`; structural note `vertical_slice.c:8949-9015` |
+| G1 | **`K==1` live-session Continue** — Java Continue restarts the in-progress level when a live session exists; native only continues from persisted snapshot | **RESOLVED** (`0901030`) | `BounceGame.java:116,223-224`; structural note `vertical_slice.c:8949-9015` |
 | G2 | ~~Second splash `nokiagames.png` never rendered~~ — **no effective gap**: the source is single-stage. The `e` constructor sets `SplashId = 1` (e.java:72), so only `bouncesplash.png` ever displays for 31 ticks (`splashTimer > 30`, e.java:231) and any key skips (e.java:331-332); the `case 0` stage at e.java:235-243 is **dead code** (no assignment of `SplashId = 0` anywhere in the tree). Native matches exactly (single stage, `>30` timing verified, key-skip). Drawing nokiagames would DEVIATE; the asset stays inventory-verified only, mirroring Java never loading SPLASHES[0] at runtime | RESOLVED (analysis; dead code deliberately not implemented) | `e.java:59,72,227-253,331-332`; `app_flow.c:355-366`, `ui_shell.c:2510-2536`, verify timing `vertical_slice.c:9983-9988` |
 | G3 | **Missing post-ball front-tile pass** — Java repaints tiles 13–28 (`d.b` rims) *after* the ball; native render order grid→door→thorns→ball→HUD → ball paints over near hoop rim | **RESOLVED** (`1ccd833`) | `e.java:172` → `b.java:577-600`; `vertical_slice.c:7299+` (`draw_hoop_rims_over_ball`), `visual_assets.c:1106+` |
 | G4 | ~~No locale autodetect / language never persisted~~ — **RESOLVED** (owner decision: detect + persist). Boot now composes: persisted `records.bin` record 7 (present-flag loader, so stored EN is distinguishable from absent) > environment detection `LC_ALL`→`LC_MESSAGES`→`LANG` (`bounce_locale_language_from_string`: exact normalized zh-CN/zh-TW/th-TH/id-ID/en, bare-code convenience, `/lang.xx`-style EN fallback) > default EN. A Settings language change commits on the same press edge as theme/T9/volume (`app_commit_language_change`); reset-to-defaults writes 0; every other record writer preserves record 7. Java parity note: the detection half mirrors the per-launch `microedition.locale` derivation; the persisted record is a native extension, since Java never persists a language | IMPLEMENTED | `Translation.java:39,55,57`; `locale.c` (detect), `persistence.c` record 7, `app_flow.c restore_persisted_language`, `vs app_restore_persisted_settings`; verifies `LANG-DETECT/PERSIST/BOOT` |
@@ -64,7 +64,7 @@ are **stale** — the code has since gained them (score wiring, boost bar, GodMo
 | G8 | **Big-ball settle walk side effects** — state-write tiles 38/47-50/51-54 now reported through the hazard callback and dispatched to shared producer helpers (STEP 38-S, `app_activate_gravity/jump/speed_powerup`); all walks reproduce Java's walk-side effects: death respawn, pumper growth, pumper recursion, and — constructor sub-item closed 2026-10-23 — the level-start walk too, moved from `bounce_game_initialize_player` (pristine shadow view, effects discarded) into `bounce_game_initialize_runtime_entry`, which runs `bounce_player_use_big_ball` against the fresh runtime copy through the production consumer `app_pumper_walk_hazard` between copy installation and phase record, mirroring `f.java:126-131` (`CreateTiles` then `UseBigBall`); `bounce_player_use_big_ball_level` and `player_probe_constructor` removed — one walk and one consumer, the source's single `f.a()` | RESOLVED | `player.c`/`player.h` (38-S arm, single runtime probe), `game.c` `initialize_runtime_entry`, `vertical_slice.c` (consumer, entry-boundary verifies with `BIGBALL ... RUNTIME_INITIALIZED` prints) |
 | G9 | **Dirty-tile incremental repaint / E-buffer staging / out-of-level BRICK border** — `0x80` bits written+masked but never drive incremental redraw (full redraw each frame); E parallax double-draw and border stamp absent | NOT IMPLEMENTED (output-equivalent, deliberate) | `b.java:401-404,609-623`, `e.java:162-170`; `vertical_slice.c:7047-7088` |
 | G10 | **Placeholder 5×7 fonts** instead of `Font.getFont(32,0,8)` device glyphs (layout/anchors match, shapes do not) | DEVIATES | `e.java:45`; `visual_assets.c:1288,1352` |
-| G11 | **HUD dirty flag `y`** has no counterpart; HUD redrawn every frame (state-incomplete, output-equivalent). Some native comments claiming score/boostbar missing are **stale** | PARTIAL (deliberate) | `f.java:223,613`, `e.java:174,188,306-307`; `vertical_slice.c:6304-6317` (stale) |
+| G11 | **HUD dirty flag `y`** — **RESOLVED** (`b2bd3bf` revert of `2aed8d2`, then re-implemented state-only). Java `e.y` gates the HUD block over a retained offscreen buffer (`imageFullscreen`), so a skipped frame still shows the previous HUD. Native re-presents the whole 128x128 surface every frame (clearing it first), so gating on the flag blanked the band on frames no producer fired — the `2aed8d2` flicker, reverted `b2bd3bf`. The flag is now modelled as **state only**: every Java producer sets `game->hud_dirty` (load/restore, AddScore, boostTimer cadence, KillBall, 1-up), `draw_hud()` clears it (`e.java:188`), and **nothing reads it to gate drawing**. Lifecycle + output-equivalence asserted by `verify_hud_dirty_flag` (render with flag true vs false is pixel-identical, `render_divergence=0`). | RESOLVED (state-only; output-equivalent) | `f.java:223,613`, `e.java:174,188,306-307`; `game.h` (field contract), `game.c` (load/score producers), `vertical_slice.c` (`draw_hud`, `app_player_physics_continuation`, `app_kill_ball`, `app_consume_extra_life`, `verify_hud_dirty_flag`) |
 | G12 | **Timer stop deferred to tick end** on level-complete/game-over (Java stops synchronously inside tick) — same-frame observable, documented | DEVIATES (documented) | `game.c:1302-1312`, `vertical_slice.c:2826-2846` |
 | G13 | **Escape-from-PAUSE stale-runtime case** documented but not fixed; separate `input.pause` flag has no consumer (only `P` fires PAUSE) | PARTIAL | `vertical_slice.c:28340-28342`, `input_state.h:132`, `input_state.c:228` |
 | G14 | Hidden **"Read RMS"/"Write RMS" debug menu rows** | NOT IMPLEMENTED (low impact) | `BounceGame.java:248-253` |
@@ -134,7 +134,7 @@ Rubber charge: `v` latch producers (`vs:3724` first-blocker), A1 landing `t += �
 ### 1.6 Top gameplay deviations
 
 1. **G8** — **CLOSED** (2026-10-23). Runtime walks (death respawn, pumper growth, pumper recursion) reproduce Java's walk-side effects including the power-up state writes (STEP 38-S, owner decision reversed 2026-10-23), and the level-start constructor walk now runs inside `bounce_game_initialize_runtime_entry` against the fresh runtime copy with the production consumer `app_pumper_walk_hazard`, between copy installation and phase record — the native spelling of `f.java:126-131` (`CreateTiles` then `UseBigBall`). The inert pristine-shadow form (`bounce_player_use_big_ball_level`) is gone. Reachable cases covered: crystal near L6 pumper, thorn near L8 pumper, gravity/jump/speed during growth (`vs:4186-4190`), plus level-start walks on big-ball levels 3/5/11 (`BIGBALL ... phase=RUNTIME_INITIALIZED ... runtime=PRESENT`).
-2. **G11** — HUD dirty flag `y` not modeled; stale native comments claim score/boostbar missing (they exist).
+2. **G11** — HUD dirty flag `y` **CLOSED** (state-only). Stale native comments claiming score/boostbar missing were corrected (both exist).
 3. **G9** — E-buffer background wrap absent (rendering scope).
 4. **G12** — deferred timer stop (documented, same-frame equivalent).
 
@@ -156,7 +156,7 @@ terminal-form capture→persist→refresh→release order (`vs:28152-28190` = `B
 | 4 original rows (Continue/New Game/High Score/Instructions) | IMPLEMENTED | `ui_shell.c:32-35,510-519` |
 | Settings/About/Exit rows | DIFFERENT (extension) | `app_flow.h:136-147` |
 | Continue gate `J==1/J==2` legs | IMPLEMENTED | `vs:8804-8855`, `app_flow.c:1379,1404` |
-| **`K==1` live-session Continue** | **NOT IMPLEMENTED (G1)** | `vs:8949-9015` |
+| **`K==1` live-session Continue** | **RESOLVED (G1, `0901030`)** | `vs:8949-9015` |
 | Level select gate `>1` levels, unlock progression | IMPLEMENTED | `app_flow.c:487,1051` |
 | **Fresh-install unlock = 2 vs Java 0** | **DEVIATES (G6, accepted)** | `app_flow.h:295` vs `BounceGame.java:270-286` |
 | Hidden Read/Write RMS rows | NOT IMPLEMENTED (G14) | `BounceGame.java:248-253` |
@@ -204,7 +204,7 @@ Escape/menu with persist superset (`vs:28299-28498`). QWERTY/mouse/digits/`q` = 
 
 ### Top flow gaps
 
-**G1** K==1 Continue · (G4 resolved: detect + persist · G5 resolved: `1`/`3` request unconditional, warp af-gated · G6 decided: keep 2 · extensions: extra menu rows/settings/about — not gaps)
+**G1 resolved** (`0901030`, K==1 live-session Continue) · (G4 resolved: detect + persist · G5 resolved: `1`/`3` request unconditional, warp af-gated · G6 decided: keep 2 · extensions: extra menu rows/settings/about — not gaps)
 
 ---
 
@@ -261,22 +261,24 @@ Extensions: mouse UI, `Escape`, `q`, T9 controller mode.
 | Priority | ID | Gap | Effort |
 |---|---|---|---|
 | 2 | G2 | ~~Render `nokiagames.png` splash as first stage~~ — **no effective gap**: source is single-stage (`SplashId = 1`, case-0 dead code); closed by analysis, anti-regression comment added | done (analysis) |
-| 2 | G1 | `K==1` live-session Continue route | Medium |
+| 2 | G1 | ~~`K==1` live-session Continue route~~ — **done** (`0901030`) | done |
 | 2 | G4 | ~~Locale autodetect (+ optional language persistence)~~ — **done**: detect + persist (owner decision 2026-10-23), record 7 + boot precedence + `LANG-DETECT/PERSIST/BOOT` verifies | done |
 | 3 | G5 | ~~Un-gate `1`/`3` keys to match Java (`d=true` unconditional)~~ — **done** (2026-10-23): request unconditional, warp af-gated, latch renamed `level_reload_requested`, `verify_cheat_level_keys` proves it end to end | done |
 | 3 | G6 | ~~Fresh-install unlock count 2 → 0~~ — **decided: keep 2** (accepted deviation) | done (decision) |
 | 3 | G8 | Settle-walk side effects — **done**: runtime walks (STEP 38-S: state-write tiles 38/47-54 reported → shared producer helpers) and the constructor sub-item (level-start walk moved to the runtime-init seam with the production consumer; one walk/one consumer; entry-boundary verifies restructured to assert pre-walk at PLAYER_INITIALIZED and post-walk at RUNTIME_INITIALIZED) | done |
 | 4 | G13 | Escape-from-pause runtime case; wire `input.pause` consumer | Small |
 | 4 | G10 | Font glyph fidelity (device font recreation) | Large, cosmetic |
-| 5 | G9, G11, G12, G14 | Deliberate/structural deviations — document, likely accept | — |
+| 5 | G9, G12, G14 | Deliberate/structural deviations — document, likely accept | — |
 
 **Resolved since previous backlog (verified this audit):** BL-001 score wiring ✅,
 BL-002 max-lives cap ✅, BL-003 pickup sound ✅, BL-005 FPS setting → cancelled (correct, Java never had it) ✅,
 BL-006 volume 0–100 added + persisted ✅, BL-010 pause → wired via P ✅,
 BL-011 GodMode sequence → matches original Java digit-for-digit ✅ (old note compared against LKT Pro mod, not BASE).
 **Resolved in this pass:** G3 post-ball hoop-rim pass ✅ (`1ccd833`),
-G7 volume commit on slider/quit/close edges ✅ (`f895aaf`).
+G7 volume commit on slider/quit/close edges ✅ (`f895aaf`),
+G1 `K==1` live-session Continue ✅ (`0901030`),
+G11 HUD dirty flag `y` ✅ (revert `b2bd3bf`, re-implemented state-only + `verify_hud_dirty_flag`).
 
 **Notes**
 - Old `audit/lkt-pro-parity/` compares against the *LKT Pro mod* reference; this audit compares against **BASE-001 original Java**. Differences called out there (invincibility cheat, profiling, QWERTY mapping, FPS, 156×96 buffer) are mod/platform matters, not original-source parity gaps.
-- Several native comments claiming score/boostbar/"no native counterpart" are stale (`vs:6304-6317`) — code implements them; comment cleanup is worthwhile.
+- ~~Several native comments claiming score/boostbar/"no native counterpart" are stale (`vs:6304-6317`)~~ — comment block corrected in the G11 pass; score, boost bar and the `y` flag all exist and are documented as implemented.
