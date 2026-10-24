@@ -66,7 +66,7 @@ are **stale** — the code has since gained them (score wiring, boost bar, GodMo
 | G10 | **Placeholder 5×7 fonts** instead of `Font.getFont(32,0,8)` device glyphs (layout/anchors match, shapes do not) | DEVIATES | `e.java:45`; `visual_assets.c:1288,1352` |
 | G11 | **HUD dirty flag `y`** — **RESOLVED** (`b2bd3bf` revert of `2aed8d2`, then re-implemented state-only). Java `e.y` gates the HUD block over a retained offscreen buffer (`imageFullscreen`), so a skipped frame still shows the previous HUD. Native re-presents the whole 128x128 surface every frame (clearing it first), so gating on the flag blanked the band on frames no producer fired — the `2aed8d2` flicker, reverted `b2bd3bf`. The flag is now modelled as **state only**: every Java producer sets `game->hud_dirty` (load/restore, AddScore, boostTimer cadence, KillBall, 1-up), `draw_hud()` clears it (`e.java:188`), and **nothing reads it to gate drawing**. Lifecycle + output-equivalence asserted by `verify_hud_dirty_flag` (render with flag true vs false is pixel-identical, `render_divergence=0`). | RESOLVED (state-only; output-equivalent) | `f.java:223,613`, `e.java:174,188,306-307`; `game.h` (field contract), `game.c` (load/score producers), `vertical_slice.c` (`draw_hud`, `app_player_physics_continuation`, `app_kill_ball`, `app_consume_extra_life`, `verify_hud_dirty_flag`) |
 | G12 | **Timer stop deferred to tick end** on level-complete/game-over (Java stops synchronously inside tick) — same-frame observable, documented | DEVIATES (documented) | `game.c:1302-1312`, `vertical_slice.c:2826-2846` |
-| G13 | **Escape-from-PAUSE stale-runtime case** documented but not fixed; separate `input.pause` flag has no consumer (only `P` fires PAUSE) | PARTIAL | `vertical_slice.c:28340-28342`, `input_state.h:132`, `input_state.c:228` |
+| G13 | **Escape-from-PAUSE stale-runtime case** documented but not fixed; separate `input.pause` flag has no consumer (only `P` fires PAUSE) | PARTIAL | `vertical_slice.c:29817-29819` (stale-runtime note), `:29978-29990` (`P` pause/resume), `input_state.h:130-136,157,171`, `input_state.c:227-237` |
 | G14 | Hidden **"Read RMS"/"Write RMS" debug menu rows** | NOT IMPLEMENTED (low impact) | `BounceGame.java:248-253` |
 
 ---
@@ -234,9 +234,9 @@ resolved in `f895aaf`.
 
 ### 3.3 Pause — wired (native extension)
 
-`P` → PAUSE event → flow/game state → ticks stop (`vs:8064-8069`) → overlay (`vs:7694,7980`) →
-`P` resumes (`vs:28500-28512`). **G13:** `input.pause` flag has no consumer; Escape-from-pause
-stale-runtime documented (`vs:28340-28342`). Java has no pause at all (`Bounce.java:20` stub).
+`P` → PAUSE event → `game.c:1269` sets `BOUNCE_GAME_STATE_PAUSED` → tick dispatch routes PAUSED to a no-op (no physics runs, `vs:5822-5833`) → pause overlay (`vs:8160+`) →
+`P` resumes (`vs:29981-29990`), which restarts the tick cadence via `app_begin_player_ticks` (`vs:5633`, called at `vs:29988`). **G13:** `input.pause` flag (`input_state.h:171`) has no consumer — `P` fires PAUSE via a temporary direct handler (`vs:29978-29980`), bypassing the flag; Escape-from-pause
+stale-runtime documented (`vs:29817-29819`). Java has no pause at all (`Bounce.java:20` stub).
 
 ### 3.4 Input device — IMPLEMENTED
 
