@@ -414,6 +414,24 @@ int bounce_game_load_level(
     game->l = 0;
     game->k = 0;
     game->v = 0;
+    /*
+     * G11 -- the HUD dirty flag on a level load, e.java:102 and e.java:120.
+     *
+     * Both Java level-init entry points set `y = true` right after the level
+     * and its countdown are armed:
+     *
+     *   e.java:102  the Record 3 resume restore `a(int,int)`, after LoadLevelId
+     *   e.java:120  InitializeGame(), after LoadLevelId and HoopsScored = 0
+     *
+     * bounce_game_load_level() is the native counterpart of that LoadLevelId
+     * phase on every entry route (the staged chain, the RESET_GATE reload and
+     * the legacy diagnostic start), exactly as it already owns e.java:119's
+     * countdown arm above, so the one write covers both source sites.
+     *
+     * State-only: nothing reads the flag to decide whether to draw; see the
+     * field contract in game.h.
+     */
+    game->hud_dirty = true;
     return 0;
 
 failure:
@@ -641,6 +659,18 @@ int bounce_game_load_level_entry(BounceGame *game, int level_id)
      */
     game->door_image_offset = 0;
     game->door_open_flag = false;
+    /*
+     * G11 -- the HUD dirty flag on a level load, e.java:120.
+     *
+     * InitializeGame() sets `this.y = true` right after LoadLevelId and the
+     * HoopsScored/countdown resets. This function is the production counterpart
+     * of that LoadLevelId (see the deferred_init note above), on every staged
+     * entry route -- New Game, Level Select and post-completion Continue -- so
+     * the one write here plus the one in bounce_game_load_level() (the legacy
+     * and deferred-init loader) cover both native loaders exactly as both Java
+     * entry points (e.java:102 and e.java:120) set it. State-only; see game.h.
+     */
+    game->hud_dirty = true;
     return 0;
 }
 
@@ -1541,19 +1571,22 @@ int bounce_game_mark_level_complete(BounceGame *game)
 /*
  * STEP 12X-P4-C-D-B -- the native counterpart of e.java:153-156.
  *
- * Java is `this.score += paramInt;` plus `this.y = true;`. Only the mutation is
- * reproduced: `y` is the HUD dirty flag, and the HUD renders no score yet, so
- * setting it here would be a side effect with no reader.
+ * Java is `this.score += paramInt;` plus `this.y = true;`. Both halves are
+ * reproduced: the mutation, and the G11 HUD dirty flag (`y`), which is the
+ * e.java:155 producer for EVERY scoring event -- the hoop (+500), the
+ * checkpoint crystal (+200), the crystal ball (+1000) and the level
+ * completion bonus (+5000) all pass through here. The flag is state-only;
+ * see the field contract in game.h.
  *
  * There is deliberately no validation, no clamp, no saturation, no event and no
- * persistence, and no gameplay caller exists yet. The hoop, crystal, crystal ball
- * and level-completion integrations are separate milestones.
+ * persistence beyond what the callers perform.
  */
 int bounce_game_add_score(BounceGame *game, int32_t amount)
 {
     if (game == NULL)
         return -1;
     game->score = java_int32_add(game->score, amount);
+    game->hud_dirty = true;
     return 0;
 }
 
@@ -1562,6 +1595,16 @@ int bounce_game_reset_score(BounceGame *game)
     if (game == NULL)
         return -1;
     game->score = 0;
+    /*
+     * G11 -- a score write marks the HUD dirty, exactly as e.java:155 does for
+     * every AddScore. The reset is a native re-implementation of the new-game
+     * score zeroing (Java gets it from the fresh `e` object's field default),
+     * and it happens on the same lifecycle the source's InitializeGame covers,
+     * which also sets `y` (e.java:120, reproduced at bounce_game_load_level).
+     * Setting it here keeps the rule uniform -- score write implies dirty --
+     * instead of relying on route coverage. State-only; see game.h.
+     */
+    game->hud_dirty = true;
     return 0;
 }
 

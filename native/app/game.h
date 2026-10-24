@@ -197,13 +197,53 @@ typedef struct BounceGame {
      * InitializeGame() never touches score, which is why a level change cannot
      * reset it.
      *
-     * No gameplay event is connected to this field yet. The hoop (+500), the
-     * checkpoint crystal (+200), the crystal ball (+1000) and the level
-     * completion bonus (+5000) integrations are deliberately deferred, as is
-     * every read of this field: neither the HUD nor the Game End form reads it
-     * yet.
+     * The four source scoring events are wired: the hoop (+500) at
+     * app_collect_hoop(), the checkpoint crystal (+200) at the tile-19/23 arm,
+     * the crystal ball (+1000) at app_consume_extra_life() and the level
+     * completion bonus (+5000) at bounce_game_mark_level_complete(). The HUD
+     * reads the live value every frame (e.java:181-183, draw_hud's score row).
      */
     int32_t score;
+    /*
+     * G11 -- the HUD dirty flag `y` (e.java:55 `public boolean y`).
+     *
+     * Java's `e.y` gates the HUD block inside e.q() (e.java:174-188):
+     *
+     *     if (this.y) { ... draw band, lives, hoops, score, boost bar ...
+     *                   this.y = false; }
+     *
+     * and it is a REPAINT LATCH over a retained offscreen buffer: q() draws the
+     * world into `imageFullscreen`, whose pixels persist between frames, so a
+     * frame that skips the HUD block still shows the previous HUD. The flag can
+     * therefore gate in Java without the band ever going blank.
+     *
+     * Native re-presents the WHOLE 128x128 surface every loop iteration and
+     * render_gameplay_scene() clears it to COLOR_BACKGROUND first
+     * (vertical_slice.c bounce_surface_fill). Skipping the HUD draw here would
+     * leave the band at background colour -- lives, hoops, score and boost bar
+     * all vanishing except on frames a producer happened to fire. The first
+     * attempt at this flag (2aed8d2) gated the draw exactly like Java and
+     * produced that flicker; it was reverted (b2bd3bf).
+     *
+     * So the flag is modelled as STATE ONLY: every Java producer sets it, draw
+     * consumes and clears it as e.java:188 does, and NOTHING reads it to decide
+     * whether to draw. That keeps the state machine complete (the flag's
+     * lifecycle is now reproducible and testable) while the output stays
+     * byte-identical to the full-redraw loop.
+     *
+     * Producers, mirroring the source:
+     *   e.java:102  restore path `this.y = true`     -> bounce_game_load_level()
+     *   e.java:120  InitializeGame `this.y = true`   -> bounce_game_load_level()
+     *   e.java:155  AddScore `this.y = true`         -> bounce_game_add_score()
+     *   e.java:307  boostTimer cadence               -> tick body, after physics
+     *   f.java:223  KillBall `this.n.y = true`       -> app_kill_ball()
+     *   f.java:231  OnTouchHoop `this.n.y = true`    -> app_collect_hoop()
+     *   f.java:613  1-up `this.n.y = true`           -> app_consume_extra_life()
+     *
+     * Consumer: draw_hud() clears it, the e.java:188 `this.y = false;`.
+     * bounce_game_init's memset supplies the false initial value.
+     */
+    bool hud_dirty;
     bool level_complete;
     bool dead;
     bool respawn_requested;

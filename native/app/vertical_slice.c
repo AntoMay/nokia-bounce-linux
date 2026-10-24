@@ -1955,6 +1955,14 @@ static int app_collect_hoop(
     (void)bounce_game_add_score(app, 500);
 
     app->hoops_scored = java_int32_add(app->hoops_scored, 1);
+    /*
+     * G11 -- f.java:231 `this.n.y = true;` (OnTouchHoop, after HoopsScored++).
+     * Not re-written here: the AddScore(500) on the line above already sets
+     * hud_dirty through its e.java:155 producer, and the two source sets are
+     * the same boolean store -- Java redundantly sets `y` twice, native once.
+     * The flag is one-shot and nothing reads it to gate a draw (game.h), so a
+     * second store would be unobservable state churn.
+     */
 
     /*
      * TODO_EXITUNLOCKED PRODUCER - f's caller, e.java:284-285:
@@ -2074,6 +2082,14 @@ static void app_kill_ball(BounceApp *app)
         app->player.q = 7;
         app->player.z = 2;
         app->lives = java_int32_add(app->lives, -1);
+        /*
+         * G11 -- f.java:223 `this.n.y = true;`, right after the lives
+         * decrement and before the sound, the source's own position. The HUD
+         * band must show one fewer ball icon from this frame on; native draws
+         * it every frame, the flag only records that the HUD state moved.
+         * State-only; see game.h.
+         */
+        app->hud_dirty = true;
         app->player.TODO_somePowerUp1 = 0;
         app->player.powerUpGravity = 0;
         app->player.TODO_somePowerUp3 = 0;
@@ -3312,7 +3328,16 @@ static int app_consume_extra_life(
     (void)bounce_game_add_score(app, 1000);
     if (app->lives < 5) {
         app->lives = java_int32_add(app->lives, 1);
-        /* f.java:613 this.n.y = true -- omitted, see the note in the original. */
+        /*
+         * G11 -- f.java:613 `this.n.y = true;`, inside the same `lives < 5`
+         * guard as the increment: the extra ball icon appears only when a life
+         * was really gained. State-only; see game.h. (The AddScore(1000) above
+         * already set the flag through e.java:155, exactly as Java does; the
+         * source still writes it here too, and the write is reproduced because
+         * the guard makes this the one producer whose firing is CONDITIONAL on
+         * the cap.)
+         */
+        app->hud_dirty = true;
     }
     if (bounce_runtime_level_tiles_set(
             app->runtime,
@@ -6469,6 +6494,54 @@ static int app_player_physics_continuation(BounceGame *game, void *context)
         }
     }
 
+    /*
+     * G11 -- the boostTimer cadence producer, e.java:298-307.
+     *
+     * Inside Tick(), right after the dyn-thorn/exit-gate region and right
+     * BEFORE the LoadSpriteSheet hand-off at e.java:310 -- which is exactly
+     * where this sits: after the two physics steps (which decrement the three
+     * power-up timers, f.java:687-706 and :800-802) and before
+     * app_update_camera_horizontal(). Source, verbatim:
+     *
+     *     this.boostTimer = 0;
+     *     if (this.aq.TODO_somePowerUp1 != 0 || this.aq.powerUpGravity != 0
+     *             || this.aq.TODO_somePowerUp3 != 0) {
+     *         if (this.aq.TODO_somePowerUp1 > this.boostTimer)
+     *             this.boostTimer = this.aq.TODO_somePowerUp1;
+     *         if (this.aq.powerUpGravity > this.boostTimer)
+     *             this.boostTimer = this.aq.powerUpGravity;
+     *         if (this.aq.TODO_somePowerUp3 > this.boostTimer)
+     *             this.boostTimer = this.aq.TODO_somePowerUp3;
+     *         if (this.boostTimer % 30 == 0 || this.boostTimer == 1)
+     *             this.y = true;
+     *     }
+     *
+     * The derivation is the same running-maximum draw_hud() performs (STEP 40
+     * documents why native stores no boostTimer field); only the e.java:306-307
+     * side effect is being reproduced here, the flag set on the bar's repaint
+     * cadence -- every 30th tick of the countdown, plus the last one.
+     *
+     * The outer != 0 guard IS reproduced, unlike in draw_hud: boostTimer == 0
+     * makes `% 30 == 0` true, so without the guard an idle player would set the
+     * flag every tick. In Java the guard is what prevents that.
+     *
+     * State-only, like every G11 producer: the bar itself is drawn every frame
+     * by draw_hud() regardless; see game.h for the field contract.
+     */
+    {
+        int boost_timer = 0;
+
+        if (app->player.TODO_somePowerUp1 > boost_timer)
+            boost_timer = app->player.TODO_somePowerUp1;
+        if (app->player.powerUpGravity > boost_timer)
+            boost_timer = app->player.powerUpGravity;
+        if (app->player.TODO_somePowerUp3 > boost_timer)
+            boost_timer = app->player.TODO_somePowerUp3;
+
+        if (boost_timer != 0 && (boost_timer % 30 == 0 || boost_timer == 1))
+            app->hud_dirty = true;
+    }
+
     if (app_update_camera_horizontal(app) != 0)
         return -1;
     return 0;
@@ -6511,30 +6584,28 @@ static int app_player_physics_continuation(BounceGame *game, void *context)
  * Step 12I world window at :3800 -- and then drawing in surface coordinates.
  * BOUNCE_SURFACE_WIDTH/HEIGHT are both 128, the same as imageFullscreen.
  *
- * NOT IMPLEMENTED, and why -- no state is invented for any of these:
+ * IMPLEMENTED, all three, since the score/HUD milestone closed the deferral:
  *
  *   e.java:183  drawString(PadZeroes(this.score), 64, 100, TOP|LEFT)
- *       `score` has no native counterpart at all: there is no score field, no
- *       AddScore(), and none of the three real score sources
- *       (f.java:229 hoop +500, f.java:481 crystal +200, f.java:610 extra life
- *       +1000) nor e.java:318 (+5000 on completion) exists. Adding one would be
- *       new gameplay state, which this task forbids, and the HUD must read
- *       canonical state rather than keep a copy. DEFERRED with the score.
- *       e.java:45 `Font.getFont(32, 0, 8)` is an 8px system font that has no
- *       native equivalent either, so the digits could not be drawn faithfully
- *       even if a score existed.
+ *       `score` is the native game->score field (game.h), written by
+ *       bounce_game_add_score() from the four real score sources (hoop +500,
+ *       crystal +200, extra life +1000, completion +5000) and formatted by the
+ *       visual-assets HUD seam at the source's own (64, 100). The digits are the
+ *       placeholder 5x7 glyphs, matching the G10 font deviation.
  *
  *   e.java:184-187  the boostTimer bar
- *       `boostTimer` (e.java:298-308) has no native counterpart either. DEFERRED
- *       with the boost timers.
+ *       Drawn from the same running-maximum over the three power-up timers the
+ *       source computes (e.java:298-305); native stores no boostTimer field and
+ *       derives the height per frame (STEP 40 above documents why).
  *
  *   e.java:174 / e.java:188  the `this.y` dirty flag
- *       `y` is the game's score/HUD dirty flag and, as the Death Core audit
- *       recorded, the native has no `y` field. The source therefore redraws this
- *       band only when something changed. The native redraws it every frame, which
- *       is output-equivalent because the band's content is a pure function of
- *       lives, HoopsTotal and HoopsScored: no native producer sets a dirty bit
- *       for it, and adding one would mean adding the state this task forbids.
+ *       `y` is the HUD dirty flag, modelled as game->hud_dirty (game.h, the G11
+ *       contract). Every Java producer sets it; draw_hud() consumes and clears
+ *       it exactly as e.java:188 does. It is STATE ONLY and never gates this
+ *       draw: native re-presents the whole surface every frame (no retained
+ *       offscreen buffer), so gating would blank the band on frames no producer
+ *       fired -- the 2aed8d2 flicker, reverted b2bd3bf. The lifecycle is
+ *       asserted by verify_hud_dirty_flag().
  */
 /*
  * D-13 / J-01 -- THE LEVEL-START BANNER.
@@ -6604,7 +6675,44 @@ static int draw_level_banner(BounceRenderer *renderer, const BounceApp *app)
     );
 }
 
-static int draw_hud(BounceRenderer *renderer, const BounceApp *app)
+/*
+ * e.java:174-189 -- the HUD block, G11.
+ *
+ * Java gates the whole block on the dirty flag `y`:
+ *
+ *     174:  if (this.y) {
+ *     ...     band, lives, hoops, score, boost bar ...
+ *     188:      this.y = false;
+ *     189:  }
+ *
+ * THE GATE IS DELIBERATELY NOT REPRODUCED, and the CLEAR IS. That split is the
+ * whole of G11 and it is forced by an architectural difference, not by taste:
+ *
+ *   Java composes q() into `imageFullscreen`, a retained offscreen buffer whose
+ *   pixels SURVIVE between frames. Only the 128x96 game window is repainted per
+ *   tick (e.java:161-172); the HUD band at y>=97 keeps whatever the previous q()
+ *   left there. A frame that skips the block therefore still SHOWS the previous
+ *   HUD, which is what makes gating safe in the source.
+ *
+ *   Native render_gameplay_scene() clears the whole 128x128 surface to
+ *   COLOR_BACKGROUND at the top of every frame and redraws everything. A frame
+ *   that skipped this function would leave the band at background colour:
+ *   lives, hoops, score and boost bar all gone. The first attempt at G11
+ *   (2aed8d2) copied the gate verbatim and produced exactly that flicker; it
+ *   was reverted (b2bd3bf).
+ *
+ * So draw_hud draws UNCONDITIONALLY, and consumes the flag at the end with the
+ * e.java:188 `this.y = false;`. The flag exists as state (see game.h): every
+ * Java producer sets it, this function clears it, and nothing anywhere reads it
+ * to decide whether to draw. The full-redraw loop is the reader Java's retained
+ * buffer plays, and it is strictly stronger.
+ *
+ * The e.java:306-307 producer (boostTimer cadence) lives in the tick body,
+ * app_player_physics_continuation(), where Java has it -- inside Tick(), after
+ * the player physics that decrement the three timers and before LoadSpriteSheet
+ * -- not here.
+ */
+static int draw_hud(BounceRenderer *renderer, BounceApp *app)
 {
     int remaining;
     int index;
@@ -6616,6 +6724,10 @@ static int draw_hud(BounceRenderer *renderer, const BounceApp *app)
      * at :4090. A verification that renders without a loaded level or without
      * visuals must still get its frame; the HUD simply contributes nothing. The
      * failure return is reserved for a NULL renderer, which is a real error.
+     *
+     * The flag is NOT cleared here: nothing was drawn, so -- as in Java, whose
+     * q() cannot reach e.java:188 without a canvas to draw on -- nothing was
+     * consumed. The producer's write survives until a frame really draws.
      */
     if (app->visuals == NULL || app->level == NULL)
         return 0;
@@ -6664,10 +6776,12 @@ static int draw_hud(BounceRenderer *renderer, const BounceApp *app)
      * three rows do not overlap so the order is not visually load-bearing.
      *
      * The LIVE score is read here, exactly as the lives and hoop rows above read their own
-     * live state. There is no second copy and no invalidation: the source gates this block on
-     * `e.y` (e.java:174), but native redraws and re-presents the whole frame on every loop
-     * iteration (vertical_slice.c:16409-16422), so the value read now is the value displayed
-     * now. A dirty flag here would be a second, redundant invalidation model.
+     * live state. There is no second copy. The source gates this block on `y`
+     * (e.java:174); native redraws and re-presents the whole frame on every loop
+     * iteration (vertical_slice.c:16409-16422), so the value read now is the value
+     * displayed now. The flag itself is modelled as state -- see the function
+     * header above and the field contract in game.h -- but it never gates this
+     * draw, for the same reason.
      *
      * The origin is the source's own (64, 100), passed through unmodified; the seam never
      * re-centres or shifts it for the formatted length. Formatting, the 6px pitch and the
@@ -6715,9 +6829,13 @@ static int draw_hud(BounceRenderer *renderer, const BounceApp *app)
      * negative and the three `>` comparisons already leave boostTimer at 0
      * exactly when the source's guard would have skipped the whole block. The
      * e.java:306-307 side effect inside that block (`boostTimer % 30 == 0 ||
-     * boostTimer == 1 -> this.y = true`) is likewise absent: `y` is the HUD
-     * dirty flag, which has no native counterpart and which draw_hud's own
-     * comment above (:5218-5220) explains is redundant here.
+     * boostTimer == 1 -> this.y = true`) is the G11 producer that lives in the
+     * tick body, app_player_physics_continuation() -- Java has it in Tick(),
+     * not in q() -- and it sets the same hud_dirty this function clears at its
+     * end. The derivation is duplicated there on purpose: Java derives
+     * boostTimer once per Tick and q() re-reads the field, while native derives
+     * on demand and stores nothing (see STEP 40's "derived here rather than
+     * stored" note).
      *
      * THE BAR, e.java:184-187, verbatim:
      *
@@ -6767,6 +6885,16 @@ static int draw_hud(BounceRenderer *renderer, const BounceApp *app)
                ) != 0)
             return -1;
     }
+
+    /*
+     * G11 -- e.java:188 `this.y = false;`, the flag consumption.
+     *
+     * One-shot, exactly as in the source: the whole HUD block ran above, so the
+     * flag is cleared. Unlike Java, this does NOT end a gating window -- nothing
+     * reads the flag to decide whether to draw (see the function header) -- it
+     * completes the flag's lifecycle so its state is reproducible and testable.
+     */
+    app->hud_dirty = false;
 
     return 0;
 }
@@ -7986,8 +8114,12 @@ static int render_gameplay_scene(
          */
         || draw_hoop_rims_over_ball(renderer, app) != 0)
         return -1;
-    /* e.java:174-189, after the game viewport and before presentation. */
-    if (draw_hud(renderer, app) != 0)
+    /* e.java:174-189, after the game viewport and before presentation. The
+     * const is cast away for the G11 flag consumption only (draw_hud clears
+     * hud_dirty, the e.java:188 `this.y = false;`); the draw itself reads
+     * nothing that the full-redraw loop does not already re-present. See the
+     * draw_hud header for why the flag is state-only and never gates. */
+    if (draw_hud(renderer, (BounceApp *)app) != 0)
         return -1;
     /* e.java:201-205, on top of the composed image, gated only on `p`. */
     if (draw_level_banner(renderer, app) != 0)
@@ -20850,6 +20982,351 @@ failure:
     bounce_runtime_level_tiles_destroy(runtime);
     bounce_level_destroy(level);
     return -1;
+}
+
+/* ==========================================================================
+ * G11 -- the HUD dirty flag `y` (e.java:55), the contract self-test.
+ *
+ * WHY THIS EXISTS. The first attempt at this flag (commit 2aed8d2) copied the
+ * Java SHAPE -- gate the HUD block on the flag, exactly e.java:174 -- and it
+ * flickered: render_gameplay_scene() clears the whole 128x128 surface to
+ * COLOR_BACKGROUND every loop iteration, so a frame that skipped the HUD
+ * because the flag was false left the band at background colour (lives, hoops,
+ * score and boost bar all blank) until a producer happened to fire. Java can
+ * gate because its q() draws into the RETAINED offscreen `imageFullscreen`
+ * (e.java:171), whose pixels persist between frames; a skipped frame still
+ * shows the previous HUD. Native has no retained buffer, so gating is not
+ * equivalent. It was reverted (b2bd3bf).
+ *
+ * The corrected design keeps the flag as STATE ONLY: every Java producer sets
+ * it, draw_hud() consumes and clears it as e.java:188 does, and NOTHING reads
+ * it to decide whether to draw. The state machine is complete and testable,
+ * while the rendered output stays byte-identical to the full-redraw loop.
+ * See the field contract in game.h.
+ *
+ * This test therefore asserts the FLAG LIFECYCLE (producers set it, the
+ * consumer clears it) and, separately, that the flag cannot affect a single
+ * output pixel -- the regression that would have caught 2aed8d2.
+ */
+static int verify_hud_dirty_flag(const BounceVisualAssets *visuals)
+{
+    BounceApp app;
+    BounceLevel *saved_level;
+    BounceSurface *hud_surface = NULL;
+    BounceRenderer *hud_renderer = NULL;
+    BounceSurface *surface_dirty = NULL;
+    BounceSurface *surface_clean = NULL;
+    BounceRenderer *renderer_dirty = NULL;
+    BounceRenderer *renderer_clean = NULL;
+    BounceTickDispatchBranch branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+    int failures = 0;
+    int diff_count = 0;
+    int case_count;
+    int index;
+
+    /*
+     * The four cadence cases for the e.java:306-307 boostTimer producer, run
+     * through the CANONICAL timer path. The horizontal step (f.java:800-802)
+     * decrements TODO_somePowerUp1 BEFORE the cadence block reads it, so the
+     * value the cadence sees is (initial - 1) for a non-zero initial:
+     *
+     *   initial  after step  cadence predicate          sets flag
+     *      31        30      30 % 30 == 0               yes
+     *      32        31      31 % 30 == 1, != 1         no
+     *       2         1      1 == 1                     yes
+     *       0         0      outer != 0 guard fails     no
+     */
+    static const struct CadenceCase {
+        int32_t initial;
+        bool expect_dirty;
+    } cadence_cases[] = {
+        {31, true},
+        {32, false},
+        {2, true},
+        {0, false}
+    };
+
+    if (visuals == NULL)
+        return -1;
+
+    /*
+     * A. The false initial value. bounce_game_init() memsets the whole struct,
+     * so the flag starts clear exactly as Java's field default (`false`,
+     * e.java:55) does.
+     */
+    memset(&app, 0, sizeof app);
+    if (bounce_game_init(&app) != 0)
+        return -1;
+    if (app.hud_dirty) {
+        fprintf(stderr, "hud dirty: flag set immediately after init\n");
+        failures++;
+    }
+
+    /*
+     * B. The score producers: e.java:155 -> bounce_game_add_score(), and the
+     * native reset-score counterpart. Both are pure state writes and run in any
+     * state, so they are exercised here without a loaded level.
+     */
+    if (bounce_game_add_score(&app, 500) != 0 || !app.hud_dirty) {
+        fprintf(stderr, "hud dirty: add_score did not set the flag\n");
+        failures++;
+    }
+    app.hud_dirty = false;
+    if (bounce_game_reset_score(&app) != 0 || !app.hud_dirty) {
+        fprintf(stderr, "hud dirty: reset_score did not set the flag\n");
+        failures++;
+    }
+    bounce_game_shutdown(&app);
+
+    /*
+     * C. The lifecycle producers. There are two loaders, one per Java entry
+     * point, and each carries its own `this.y = true`:
+     *
+     *   e.java:102 (restore path) and e.java:120 (InitializeGame) both run
+     *     LoadLevelId, the native counterpart of which is
+     *     bounce_game_load_level() -- reached by the LEGACY route,
+     *     bounce_game_start_level();
+     *   bounce_game_load_level_entry() is the staged lifecycle loader (the
+     *     production InitializeGame route) and carries the same write.
+     *
+     * Both loaders must leave the flag set, so both routes are driven here.
+     */
+    memset(&app, 0, sizeof app);
+    if (bounce_game_init(&app) != 0
+        || bounce_game_enter_menu(&app) != 0
+        || bounce_game_start_level(&app, BOUNCE_LEVEL001_PATH, 0, 3) != 0) {
+        bounce_game_shutdown(&app);
+        return -1;
+    }
+    if (!app.hud_dirty) {
+        fprintf(stderr, "hud dirty: legacy load_level did not set it\n");
+        failures++;
+    }
+    bounce_game_shutdown(&app);
+
+    memset(&app, 0, sizeof app);
+    if (drive_app_to_level_loaded(&app, -1, 1) != 0) {
+        bounce_game_shutdown(&app);
+        return -1;
+    }
+    if (!app.hud_dirty) {
+        fprintf(stderr, "hud dirty: staged load_level_entry did not set it\n");
+        failures++;
+    }
+
+    /*
+     * D. Finish the staged lifecycle to PLAYING so the player-physics and tile
+     * producers below have a real runtime to run against.
+     */
+    if (app_advance_level_loaded_to_player_initialized(&app) != 0
+        || app_advance_player_initialized_to_runtime_initialized(&app) != 0
+        || app_advance_runtime_initialized_to_camera_initialized(&app) != 0
+        || app_advance_camera_initialized_to_activated(&app) != 0
+        || bounce_game_initialize_game_timer(&app) != 0) {
+        bounce_game_shutdown(&app);
+        return -1;
+    }
+    app.visuals = (BounceVisualAssets *)visuals;
+
+    /*
+     * E. f.java:223, app_kill_ball(). With GodMode OFF the death block runs and
+     * the flag is set; with GodMode ON (the f.java:216 guard is false) nothing
+     * runs and the flag must NOT be set.
+     */
+    app.god_mode = false;
+    app.hud_dirty = false;
+    app_kill_ball(&app);
+    if (!app.hud_dirty) {
+        fprintf(stderr, "hud dirty: kill_ball (mortal) did not set the flag\n");
+        failures++;
+    }
+    app.god_mode = true;
+    app.hud_dirty = false;
+    app_kill_ball(&app);
+    if (app.hud_dirty) {
+        fprintf(stderr, "hud dirty: kill_ball (godmode) set the flag\n");
+        failures++;
+    }
+    app.god_mode = false;
+
+    /*
+     * F. f.java:613, app_consume_extra_life(), the one producer whose firing is
+     * CONDITIONAL on the lives cap. Under the cap the increment arm runs and the
+     * flag is set. AddScore(1000) inside it also sets the flag through e.java:155,
+     * exactly as Java does, so the assertion is on the observable outcome: flag
+     * set AND a life gained. The cap itself is covered by the lives-ladder test;
+     * only the flag is asserted here.
+     */
+    app.lives = 4;
+    app.hud_dirty = false;
+    if (app_consume_extra_life(&app, 1, 1, 29u) != 0
+        || !app.hud_dirty
+        || app.lives != 5) {
+        fprintf(stderr, "hud dirty: consume_extra_life flag=%d lives=%d\n",
+                (int)app.hud_dirty, app.lives);
+        failures++;
+    }
+
+    /*
+     * G. The e.java:306-307 cadence producer, reached ONLY through the canonical
+     * timer path (app_player_physics_continuation). A fresh staged fixture per
+     * case keeps the first dispatch a PLAYER_TICK and the ball at the spawn, so
+     * each case observes exactly one decrement and one cadence read.
+     */
+    case_count = (int)(sizeof cadence_cases / sizeof cadence_cases[0]);
+    for (index = 0; index < case_count; ++index) {
+        int32_t initial = cadence_cases[index].initial;
+        bool expect_dirty = cadence_cases[index].expect_dirty;
+
+        bounce_game_shutdown(&app);
+        memset(&app, 0, sizeof app);
+        if (drive_app_to_level_loaded(&app, -1, 1) != 0
+            || app_advance_level_loaded_to_player_initialized(&app) != 0
+            || app_advance_player_initialized_to_runtime_initialized(&app) != 0
+            || app_advance_runtime_initialized_to_camera_initialized(&app) != 0
+            || app_advance_camera_initialized_to_activated(&app) != 0
+            || bounce_game_initialize_game_timer(&app) != 0) {
+            bounce_game_shutdown(&app);
+            return -1;
+        }
+        /* Only TODO_somePowerUp1 is exercised; the other two run at 0. */
+        app.player.TODO_somePowerUp1 = initial;
+        app.player.powerUpGravity = 0;
+        app.player.TODO_somePowerUp3 = 0;
+        app.hud_dirty = false;
+        branch = BOUNCE_TICK_DISPATCH_RESET_GATE;
+        if (app_timer_callback_dispatch(&app, &branch) != 0
+            || branch != BOUNCE_TICK_DISPATCH_PLAYER_TICK) {
+            fprintf(stderr, "hud dirty: cadence dispatch branch=%d\n",
+                    (int)branch);
+            bounce_game_shutdown(&app);
+            return -1;
+        }
+        if (app.hud_dirty != expect_dirty) {
+            fprintf(stderr, "hud dirty: cadence initial=%d got=%d want=%d\n",
+                    (int)initial, (int)app.hud_dirty, (int)expect_dirty);
+            failures++;
+        }
+    }
+
+    /*
+     * H. The consumer, e.java:188. draw_hud() clears the flag once it has drawn
+     * -- but ONLY when there was something to draw. The tolerant early return
+     * (absent visuals or absent level, draw_hud() :6734) must NOT clear it, or a
+     * verification frame without assets would silently consume the producer's
+     * write, exactly as Java's q() cannot reach e.java:188 without a canvas.
+     */
+    app.visuals = (BounceVisualAssets *)visuals;
+    hud_surface = bounce_surface_create();
+    if (hud_surface == NULL) {
+        bounce_game_shutdown(&app);
+        return -1;
+    }
+    hud_renderer = bounce_renderer_create(hud_surface);
+    if (hud_renderer == NULL) {
+        bounce_surface_destroy(hud_surface);
+        bounce_game_shutdown(&app);
+        return -1;
+    }
+    /* Tolerant arm, visuals NULL: returns 0, flag survives. */
+    app.visuals = NULL;
+    app.hud_dirty = false;
+    if (draw_hud(hud_renderer, &app) != 0 || app.hud_dirty) {
+        fprintf(stderr, "hud dirty: NULL-visuals arm cleared the flag\n");
+        failures++;
+    }
+    /* Tolerant arm, level NULL: returns 0, flag survives. */
+    saved_level = app.level;
+    app.visuals = (BounceVisualAssets *)visuals;
+    app.level = NULL;
+    app.hud_dirty = false;
+    if (draw_hud(hud_renderer, &app) != 0 || app.hud_dirty) {
+        fprintf(stderr, "hud dirty: NULL-level arm cleared the flag\n");
+        failures++;
+    }
+    app.level = saved_level;
+    /* The real arm: with assets and a level present, draw_hud() clears it. */
+    app.hud_dirty = true;
+    if (draw_hud(hud_renderer, &app) != 0 || app.hud_dirty) {
+        fprintf(stderr, "hud dirty: draw_hud did not clear the flag\n");
+        failures++;
+    }
+    bounce_renderer_destroy(hud_renderer);
+    bounce_surface_destroy(hud_surface);
+
+    /*
+     * I. THE OUTPUT-EQUIVALENCE REGRESSION -- the check that would have caught
+     * 2aed8d2. Render the same gameplay scene twice, once with the flag set and
+     * once with it clear. Because nothing reads the flag to gate drawing, the
+     * two frames MUST be pixel-identical. Had the draw been gated (the reverted
+     * design), the flag-clear frame would have dropped the HUD band and the two
+     * surfaces would differ.
+     */
+    surface_dirty = bounce_surface_create();
+    surface_clean = bounce_surface_create();
+    if (surface_dirty == NULL || surface_clean == NULL) {
+        if (surface_dirty != NULL)
+            bounce_surface_destroy(surface_dirty);
+        if (surface_clean != NULL)
+            bounce_surface_destroy(surface_clean);
+        bounce_game_shutdown(&app);
+        return -1;
+    }
+    renderer_dirty = bounce_renderer_create(surface_dirty);
+    renderer_clean = bounce_renderer_create(surface_clean);
+    if (renderer_dirty == NULL || renderer_clean == NULL) {
+        if (renderer_dirty != NULL)
+            bounce_renderer_destroy(renderer_dirty);
+        if (renderer_clean != NULL)
+            bounce_renderer_destroy(renderer_clean);
+        bounce_surface_destroy(surface_dirty);
+        bounce_surface_destroy(surface_clean);
+        bounce_game_shutdown(&app);
+        return -1;
+    }
+    app.hud_dirty = true;
+    if (render_gameplay_scene(surface_dirty, renderer_dirty, &app) != 0) {
+        bounce_renderer_destroy(renderer_dirty);
+        bounce_renderer_destroy(renderer_clean);
+        bounce_surface_destroy(surface_dirty);
+        bounce_surface_destroy(surface_clean);
+        bounce_game_shutdown(&app);
+        return -1;
+    }
+    /* render_gameplay_scene() cleared the flag via draw_hud(); force it false
+     * for the clean frame so the ONLY difference between the two renders is the
+     * incoming flag value. */
+    app.hud_dirty = false;
+    if (render_gameplay_scene(surface_clean, renderer_clean, &app) != 0) {
+        bounce_renderer_destroy(renderer_dirty);
+        bounce_renderer_destroy(renderer_clean);
+        bounce_surface_destroy(surface_dirty);
+        bounce_surface_destroy(surface_clean);
+        bounce_game_shutdown(&app);
+        return -1;
+    }
+    if (surface_pixel_diff_count(surface_dirty, surface_clean, &diff_count) != 0
+        || diff_count != 0) {
+        fprintf(stderr, "hud dirty: flag-dependent render divergence: %d "
+                "pixels\n", diff_count);
+        failures++;
+    }
+
+    bounce_renderer_destroy(renderer_dirty);
+    bounce_renderer_destroy(renderer_clean);
+    bounce_surface_destroy(surface_dirty);
+    bounce_surface_destroy(surface_clean);
+    bounce_game_shutdown(&app);
+
+    printf("HUD-DIRTY init=clear producers=score,reset,legacy-load,"
+           "staged-load,cadence(31,32,2,0) kill=mortal_only"
+           " consume=under_cap consumer=clears tolerant_keeps=yes"
+           " render_divergence=%d expected=0 %s\n",
+           diff_count, failures == 0 ? "PASS" : "FAIL");
+
+    if (failures != 0)
+        fprintf(stderr, "hud dirty flag: %d failures\n", failures);
+    return failures == 0 ? 0 : -1;
 }
 
 /*
@@ -38569,6 +39046,17 @@ int main(int argc, char **argv)
     }
     if (verify_gameplay_dispatch() != 0) {
         fprintf(stderr, "gameplay dispatch verification failed\n");
+        goto cleanup;
+    }
+    /*
+     * G11 -- the HUD dirty flag `y` (e.java:55). Placed after the dispatch and
+     * lifecycle verifications because it drives the staged lifecycle
+     * (drive_app_to_level_loaded + the four advance seams) and the canonical
+     * timer callback to reach the boostTimer cadence producer, exactly as the
+     * physics-continuation and dispatch tests already do.
+     */
+    if (verify_hud_dirty_flag(app.visuals) != 0) {
+        fprintf(stderr, "HUD dirty flag verification failed\n");
         goto cleanup;
     }
     if (verify_horizontal_movement() != 0) {
